@@ -1,0 +1,10 @@
+# Predictor compile-time config used by `make cbp`.
+# Default: predictor + template_args list.
+predictor: tage
+template_args: []
+trace: ./gcc_test_trace.gz
+trace_name: test
+warmup: 1000000
+measure: 40000000
+# Or override parameters
+# predictor_type: "tage<6,8,11,12,11,120,14,8>"
