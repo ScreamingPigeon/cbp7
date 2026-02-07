@@ -1,0 +1,14 @@
+# Build directories
+/build/
+
+# Local simulator/reference binaries
+/cbp
+/reference
+/test_harcom
+/a.out
+
+# Windows binaries
+*.exe
+
+# Run outputs
+*.out
