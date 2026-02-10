@@ -83,7 +83,7 @@ template <
     // Tage Predictor Default params
     u64 PRED_BLK_SIZE = 8, u64 NUM_TABLES = 5,
     std::array<u64, PRED_BLK_SIZE> T_TABLE_HIST_LEN = {8, 16, 32, 64, 128},
-    std::array<u64, PRED_BLK_SIZE> T_TABLE_HIST_SIZE = {8, 16, 32, 64, 128},
+    std::array<u64, PRED_BLK_SIZE> T_TABLE_HIST_SIZE = {128, 64, 32, 16, 16},
     u64 GLOBAL_HIST_LEN = 128, bool USE_PATH_HIST = false,
     u64 PATH_HIST_LEN = 16, bool SPLIT_KSPACE = false>
 class Custom : public predictor {
@@ -102,6 +102,17 @@ public:
   void update_cycle(instruction_info &block_end_info) {}
 
 private:
+  // TageTableTuple
+  template <std::size_t... Is>
+  static auto make_tables_impl(std::index_sequence<Is...>) {
+    return std::tuple{
+        TageTable<T_TABLE_HIST_SIZE[Is], T_TABLE_HIST_LEN[Is], T_TAG_WIDTH,
+                  T_CTR_WIDTH, T_USE_HYS, T_HYS_WIDTH>{}...};
+  }
+
+  // Tuple of tables
+  decltype(make_tables_impl(
+      std::make_index_sequence<NUM_TABLES>{})) tage_tables;
 };
 
 #endif // CUSTOM_HPP
