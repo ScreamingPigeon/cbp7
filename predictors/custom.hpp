@@ -107,7 +107,7 @@ private:
   static auto make_tables_impl(std::index_sequence<Is...>) {
     return std::tuple{
         TageTable<T_TABLE_HIST_SIZE[Is], T_TABLE_HIST_LEN[Is], T_TAG_WIDTH,
-                  T_CTR_WIDTH, T_USE_HYS, T_HYS_WIDTH>{}...};
+                  T_CTR_WIDTH, T_USE_HYS, T_HYS_WIDTH, PRED_BLK_SIZE>{}...};
   }
 
   // Tuple of tables
