@@ -10,6 +10,8 @@ COMMON_FLAGS := -std=c++20 -O3
 CBP_WARN_FLAGS := -Wall -Wextra -pedantic -Wold-style-cast -Werror -Wno-deprecated-declarations -Wno-mismatched-tags
 # Keep reference build less strict because upstream reference code is warning-heavy.
 REFERENCE_WARN_FLAGS := -Wall -Wextra -pedantic -Wno-deprecated-declarations -Wno-mismatched-tags
+EXTRA_COMMON_FLAGS ?=
+EXTRA_CBP_FLAGS ?=
 
 -include $(PREDICTOR_MK)
 PREDICTOR_TYPE ?= tage<>
@@ -34,6 +36,7 @@ help:
 	@echo "Variables you can override:"
 	@echo "  TRACE=... TRACE_NAME=... WARMUP=... MEASURE=..."
 	@echo "  (all default from $(PARAMS_FILE); CLI values still override)"
+	@echo "  EXTRA_COMMON_FLAGS=... EXTRA_CBP_FLAGS=..."
 	@echo "  PARAMS_FILE=... PREDICTOR_TYPE=... CXX=... PYTHON=..."
 
 $(BUILD_DIR):
@@ -45,10 +48,10 @@ $(PREDICTOR_MK): scripts/gen_predictor_config.py $(PARAMS_FILE) | $(BUILD_DIR)
 	$(PYTHON) scripts/gen_predictor_config.py --input $(PARAMS_FILE) --output $@
 
 cbp: cbp.cpp cbp.hpp branch_predictor.hpp trace_reader.hpp harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK)
-	$(CXX) $(COMMON_FLAGS) $(CBP_WARN_FLAGS) -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
 
 reference: reference.cpp trace_reader.hpp seznec_cbp2025.h
-	$(CXX) $(COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -o $@ reference.cpp -lz
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -o $@ reference.cpp -lz
 
 run-cbp: cbp
 	./cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
