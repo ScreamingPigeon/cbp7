@@ -2,9 +2,24 @@
 # Default: predictor + template_args list.
 predictor: tage
 template_args: []
+
+# Build/profile options (YAML-first compile tuning)
+build_type: release # release | debug | relwithdebinfo
+warnings_as_errors: true
+native_arch: false
+# Some extra flags to add to the predictor build (e.g., -DTAGE_VERBOSE)
+sanitize: none
+defines: []
+extra_include_dirs: []
+
 trace: ./gcc_test_trace.gz
 trace_name: test
 warmup: 1000000
 measure: 40000000
+
+# Escape hatch (appended as-is)
+extra_common_flags: ""
+extra_cbp_flags: ""
 # Or override parameters
 # predictor_type: "tage<6,8,11,12,11,120,14,8>"
+# extra_cbp_flags: "-DTAGE_VERBOSE"
