@@ -7,6 +7,12 @@
 /test_harcom
 /a.out
 
+# trace directory
+traces/*
+
+# trace logs
+out/*
+
 # Windows binaries
 *.exe
 

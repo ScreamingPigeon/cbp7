@@ -54,7 +54,7 @@ reference: reference.cpp trace_reader.hpp seznec_cbp2025.h
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -o $@ reference.cpp -lz
 
 run-cbp: cbp
-	./cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
+	./cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) > out/$(TRACE_NAME).out
 
 run-reference: reference
 	./reference $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
