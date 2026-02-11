@@ -1,6 +1,7 @@
 
 
 // Suppress warn
+#include <memory>
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #ifndef CUSTOM_HPP
@@ -60,6 +61,7 @@ using namespace hcm;
  *
  * T_HYS_WIDTH:       (u64) Hysterisis bit width
  * T_USE_HYS:         (bool) Use hysteresis btis
+ * T_DECAY_CTR:       num of accesses after which to decay u
  *
  * TODO:T_HASH_FUNC:  (enum[]) Hash function type for each table
  *                    (XOR, folded-XOR, etc.)
@@ -75,8 +77,8 @@ using namespace hcm;
  */
 template <
     // Tage Table Default params
-    u64 T_TAG_WIDTH = 7, u64 T_CTR_WIDTH = 3, u64 T_HYS_WIDTH = 2,
-    bool T_USE_HYS = true,
+    u64 T_TAG_WIDTH = 7, u64 T_U_WIDTH = 2, u64 T_CTR_WIDTH = 3,
+    u64 T_HYS_WIDTH = 2, bool T_USE_HYS = true, u64 T_DECAY_CTR = 1024,
     // Base Predictor Patameters
     // TODO
 
@@ -103,16 +105,14 @@ public:
 
 private:
   // TageTableTuple
+
   template <std::size_t... Is>
   static auto make_tables_impl(std::index_sequence<Is...>) {
-    return std::tuple{
-        TageTable<T_TABLE_HIST_SIZE[Is], T_TABLE_HIST_LEN[Is], T_TAG_WIDTH,
-                  T_CTR_WIDTH, T_USE_HYS, T_HYS_WIDTH, PRED_BLK_SIZE>{}...};
+    return std::make_tuple(
+        std::make_unique<TageTable<
+            std::get<Is>(T_TABLE_HIST_SIZE), std::get<Is>(T_TABLE_HIST_LEN),
+            T_TAG_WIDTH, T_CTR_WIDTH, T_U_WIDTH, T_USE_HYS, T_HYS_WIDTH,
+            PRED_BLK_SIZE, T_DECAY_CTR>>()...);
   }
-
-  // Tuple of tables
-  decltype(make_tables_impl(
-      std::make_index_sequence<NUM_TABLES>{})) tage_tables;
 };
-
 #endif // CUSTOM_HPP
