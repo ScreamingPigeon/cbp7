@@ -17,14 +17,13 @@ constexpr size_t clog2(std::uint64_t n) {
 }
 
 template <u64 TABLE_SIZE = 64, u64 TABLE_HIST = 64, u64 TAG_WIDTH = 7,
-          u64 CTR_WIDTH = 3, u64 U_WIDTH = 2, bool USE_HYS = true,
-          u64 HYS_WIDTH = 2, u64 PRED_BLK_SIZE = 8, u64 DECAY_CTR = 1024>
+          u64 CTR_WIDTH = 3, u64 U_WIDTH = 2, u64 PRED_BLK_SIZE = 8,
+          u64 DECAY_CTR = 1024>
 class TageTable {
 
-  static constexpr u64 BITS_PER_INST =
-      CTR_WIDTH + U_WIDTH + ((USE_HYS) ? HYS_WIDTH : 0);
+  static constexpr u64 BITS_PER_INST = CTR_WIDTH;
   static constexpr u64 BITS_PER_ENTRY =
-      TAG_WIDTH + PRED_BLK_SIZE * BITS_PER_INST;
+      TAG_WIDTH + PRED_BLK_SIZE * BITS_PER_INST + U_WIDTH;
 
 public:
   TageTable() {}
@@ -32,70 +31,75 @@ public:
 
   auto newRead(val<clog2(TABLE_SIZE)> idx, val<TAG_WIDTH> tag,
                val<clog2(PRED_BLK_SIZE)> slot_idx) {
-    val<BITS_PER_ENTRY> ram_read = table_ram.read(idx);
+    // Read entry from RAM
+    val<BITS_PER_ENTRY> entry = table_ram.read(idx);
 
-    auto [read_tag, pred_data] =
-        split<TAG_WIDTH, PRED_BLK_SIZE * BITS_PER_INST>(ram_read);
+    // Split entry into components (LSB to MSB): u || counters || tag
+    auto [u_bits, ctr_bits_combined, tag_bits] =
+        split<U_WIDTH, PRED_BLK_SIZE * CTR_WIDTH, TAG_WIDTH>(entry);
 
-    val<1> is_hit = (read_tag == tag);
-
-    // NOTE:
-    // This is an interesting case. As of this commit,
-    // I am fanning out is_hit and pred_data. To the cache_regs
-    // as well as to the predictor to facilitate a same cycle
-    // read. This means lower latency on newRead, but more
-    // power and comb delay due to fanout.
-    // An alternative could be to read through the cache_regs
-    // on the next cycle via reuseRead() - less power, but 1 extra cycle of
-    // latency.
-
-    // Convert to array for per-slot access
-    arr<val<BITS_PER_INST>, PRED_BLK_SIZE> pred_array =
-        pred_data.template makearray<val<BITS_PER_INST>>();
-
-    // Set regs
-    hit = is_hit;
-    tag_reg = tag;
+    // Store index and tag
     idx_reg = idx;
-    executeif(is_hit, [&]() { cache_regs = pred_array; });
+    tag_reg = tag;
 
-    // increment decay_ctr
-    decay_ctr = decay_ctr + 1;
+    // Store u-bit
+    u_reg = u_bits;
 
-    // Return the selected slot using .select()
-    return std::make_tuple(is_hit, pred_array.select(slot_idx));
+    // Extract and store individual counters
+    // Counter layout: ctr_regs[0] at LSB, ctr_regs[PRED_BLK_SIZE-1] at MSB
+    arr<val<CTR_WIDTH>, PRED_BLK_SIZE> ctrs;
+    static_loop<PRED_BLK_SIZE>([&]<int I>() {
+      constexpr u64 shift_amt = I * CTR_WIDTH;
+      val<PRED_BLK_SIZE * CTR_WIDTH> shifted =
+          ctr_bits_combined >> hard<shift_amt>{};
+      ctrs[I] = shifted; // Store in val array for return
+                         // Hopefully, the wires for I != slot_idx are opted out
+      ctr_regs[I] = shifted; // Cache in register for reuse
+    });
+
+    // Check if tags match
+    hit = (tag_bits == tag);
+
+    // Return from SRAM read result (not register) with fo2
+    return ctrs.select(slot_idx).fo2();
   }
   auto reuseRead(val<clog2(PRED_BLK_SIZE)> slot_idx) {
-    return cache_regs[slot_idx];
-    decay_ctr = decay_ctr + 1;
+    return ctr_regs[slot_idx];
   }
 
   auto writeReg(val<BITS_PER_INST> new_data,
                 val<clog2(PRED_BLK_SIZE)> slot_idx) {
-    cache_regs[slot_idx] = (new_data);
+    ctr_regs[slot_idx] = new_data;
   }
 
-  void updateRamFromRegs() {
-    val<PRED_BLK_SIZE * BITS_PER_INST> regs_data = cache_regs.concat();
-    // Combine tag and data into full entry
-    val<BITS_PER_ENTRY> full_entry = concat(tag_reg, regs_data);
-    // Write back to RAM
-    table_ram.write(idx_reg, full_entry);
+  void updateBlock(val<1> use_regs, val<TAG_WIDTH> tag,
+                   val<BITS_PER_ENTRY> new_entry) {
+    // Build entry from registers: tag_reg || ctr_regs || u_reg
+    auto ctr_bits = ctr_regs.concat();
+    val<BITS_PER_ENTRY> reg_entry = concat(u_reg, ctr_bits, tag_reg);
+
+    // Select between reg_entry and new_entry based on use_regs
+    val<BITS_PER_ENTRY> entry_to_write = select(use_regs, reg_entry, new_entry);
+
+    // Write to RAM
+    table_ram.write(idx_reg, entry_to_write);
   }
+
+  auto getUsefulness() { return u_reg; }
+  auto getHit() { return hit; }
 
 private:
   // Instantiate the Registers for caching
   hcm::ram<val<BITS_PER_ENTRY>, TABLE_SIZE> table_ram;
+
+  // Whether currently cached entry is a hit or not
   reg<1> hit;
 
-  reg<clog2(DECAY_CTR)> decay_ctr = 0;
+  // Tag and index of currently cached entry
   reg<TAG_WIDTH> tag_reg;
   reg<clog2(TABLE_SIZE)> idx_reg;
-  arr<reg<BITS_PER_INST>, PRED_BLK_SIZE> cache_regs;
-  val<BITS_PER_INST> getSlotFromEntry(val<BITS_PER_ENTRY> ram_entry) {}
 
-  void decayAllEntries() {
-    // decays U on all entries
-    // TODO:
-  }
+  // U/CTR of currently cached entries
+  reg<U_WIDTH> u_reg;
+  arr<reg<CTR_WIDTH>, PRED_BLK_SIZE> ctr_regs;
 };

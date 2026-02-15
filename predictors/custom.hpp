@@ -109,10 +109,10 @@ private:
   template <std::size_t... Is>
   static auto make_tables_impl(std::index_sequence<Is...>) {
     return std::make_tuple(
-        std::make_unique<TageTable<
-            std::get<Is>(T_TABLE_HIST_SIZE), std::get<Is>(T_TABLE_HIST_LEN),
-            T_TAG_WIDTH, T_CTR_WIDTH, T_U_WIDTH, T_USE_HYS, T_HYS_WIDTH,
-            PRED_BLK_SIZE, T_DECAY_CTR>>()...);
+        std::make_unique<
+            TageTable<std::get<Is>(T_TABLE_HIST_SIZE),
+                      std::get<Is>(T_TABLE_HIST_LEN), T_TAG_WIDTH, T_CTR_WIDTH,
+                      T_U_WIDTH, PRED_BLK_SIZE, T_DECAY_CTR>>()...);
   }
 };
 #endif // CUSTOM_HPP

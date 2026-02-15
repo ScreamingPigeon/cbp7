@@ -13,6 +13,9 @@ traces/*
 # trace logs
 out/*
 
+# Agent
+agent/hw_lib
+
 # Windows binaries
 *.exe
 
