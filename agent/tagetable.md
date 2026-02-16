@@ -21,7 +21,8 @@ template <u64 TABLE_SIZE = 64,      // Number of entries in the table
           u64 CTR_WIDTH = 3,        // Prediction counter width
           u64 U_WIDTH = 2,          // Useful counter width
           u64 PRED_BLK_SIZE = 8,    // Fetch block size (predictions per entry)
-          u64 DECAY_CTR = 1024>     // Decay period for useful counters
+          u64 DECAY_CTR = 1024,     // Decay period for useful counters
+          bool EN_N_BLK_RD = true>  // Enable newRead return value
 class TageTable;
 ```
 
@@ -36,6 +37,7 @@ class TageTable;
 | `U_WIDTH` | Width of useful counter | 1-3 bits (2 is typical) |
 | `PRED_BLK_SIZE` | Number of predictions per entry (fetch block size) | 4-16 instructions |
 | `DECAY_CTR` | Number of accesses before decaying u-bits | 256-4096 |
+| `EN_N_BLK_RD` | Enable return value from `newRead()` | true (standard), false (void) |
 
 ### Computed Constants
 
@@ -220,6 +222,102 @@ table_ram.write(idx_reg, entry)
   - Initializes tag, counters, and u-bit
 
 **RAM Cost**: 1 RAM write to `table_ram`
+
+---
+
+### 5. `getUsefulness()` — Read Useful Counter
+
+```cpp
+auto getUsefulness()
+```
+
+**Purpose**: Returns the cached useful counter value from the most recent `newRead()`.
+
+**Return Value**: `reg<U_WIDTH>` — The u-bit value for the currently cached entry
+
+**Usage Pattern**: Call after `newRead()` to check u-bit for allocation decisions
+
+**Example**:
+```cpp
+table->newRead(idx, tag, slot);
+val<U_WIDTH> u = table->getUsefulness();
+val<1> can_allocate = (u == 0);  // Only allocate if u-bit is 0
+```
+
+---
+
+### 6. `getHit()` — Read Tag Match Status
+
+```cpp
+auto getHit()
+```
+
+**Purpose**: Returns whether the most recent `newRead()` resulted in a tag match.
+
+**Return Value**: `reg<1>` — 1 if tag matched, 0 if miss
+
+**Usage Pattern**: Call after `newRead()` to determine if table provides a valid prediction
+
+**Example**:
+```cpp
+table->newRead(idx, tag, slot);
+val<1> hit = table->getHit();
+val<1> pred = select(hit, provider_pred, base_pred);  // Use table if hit
+```
+
+---
+
+### 7. `setThreshold()` — Configure Decay Threshold (TODO)
+
+```cpp
+auto setThreshold()
+```
+
+**Purpose**: Allows the predictor to set a dynamic threshold for probabilistic u-bit decay.
+
+**Status**: Not yet implemented (placeholder for LFSR-based decay feature)
+
+**Planned Usage**:
+```cpp
+// Adjust decay aggressiveness based on allocation failure rate
+val<4> new_threshold = compute_threshold(alloc_failure_rate);
+table->setThreshold(new_threshold);
+```
+
+See TageTable.hpp:97-100 for TODO notes.
+
+---
+
+### 8. `decrementU()` — Probabilistic U-bit Decay (TODO)
+
+```cpp
+auto decrementU()
+```
+
+**Purpose**: Implements probabilistic u-bit decay based on LFSR random number generation.
+
+**Status**: Not yet implemented (private method, invoked within `updateBlock()`)
+
+**Planned Behavior**:
+1. Generate random bits using LFSR
+2. Compare against threshold
+3. If below threshold, decrement u-bit on tag miss
+4. Otherwise, leave u-bit unchanged
+
+**Planned Implementation** (TageTable.hpp:117-122):
+```cpp
+auto decrementU() {
+  // Generate random bits from LFSR
+  val<4> rand = lfsr & hard<0xF>{};
+
+  // Probabilistic decay: decrement if rand < threshold
+  val<1> should_decay = (rand < decay_threshold);
+  val<U_WIDTH> decremented = select(u_reg == 0, u_reg, u_reg - 1);
+  return select(should_decay, decremented, u_reg);
+}
+```
+
+See the "Hardware RNG for Probabilistic Decay" section below for LFSR details.
 
 ---
 
@@ -422,15 +520,143 @@ execute_if(hit, [&]() {
 
 ---
 
+## Hardware RNG for Probabilistic Decay (Planned)
+
+### Overview
+
+TageTable.hpp:19-22 contains a TODO for implementing parameterized LFSR-based dynamic threshold probabilistic decay. This feature will adaptively decay u-bits based on allocation failure rate.
+
+### Planned Architecture
+
+```cpp
+template <u64 TABLE_SIZE = 64, ..., u64 LFSR_WIDTH = 16>
+class TageTable {
+private:
+  // LFSR for random number generation
+  reg<LFSR_WIDTH> lfsr;
+
+  // Dynamic decay threshold (adjusted by predictor)
+  reg<4> decay_threshold;  // 0-15 range
+
+  // Allocation tracking
+  reg<10> alloc_attempts;
+  reg<10> alloc_failures;
+};
+```
+
+### LFSR Implementation
+
+**16-bit maximal-length LFSR** (recommended):
+
+```cpp
+void tick_lfsr() {
+  // Taps at positions 16,14,13,11 for maximal period
+  val<1> feedback = lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10];
+  lfsr = concat(feedback, lfsr >> hard<1>{});
+}
+```
+
+**Hardware cost**: 16 flip-flops + 3 XOR gates (~10 fJ/tick)
+
+### Probabilistic Decay Logic
+
+```cpp
+auto decrementU() {
+  // Extract random bits from LFSR
+  val<4> rand_bits = lfsr;  // Bottom 4 bits
+
+  // Compare against dynamic threshold
+  val<1> should_decay = (rand_bits < decay_threshold);
+
+  // Conditionally decrement u-bit
+  val<U_WIDTH> decremented = select(u_reg == 0, u_reg, u_reg - 1);
+  return select(should_decay, decremented, u_reg);
+}
+```
+
+### Adaptive Threshold Adjustment
+
+The predictor adjusts `decay_threshold` based on allocation success rate:
+
+```cpp
+// In Custom predictor's update_cycle()
+val<10> failure_rate = alloc_failures << hard<10>{} / alloc_attempts;
+val<1> high_failure = (failure_rate > hard<512>{});  // >50%
+
+// Increase threshold if many failures (more aggressive decay)
+// Decrease threshold if few failures (less aggressive decay)
+val<4> new_thresh = select(high_failure,
+                           decay_threshold + 1,
+                           select(decay_threshold == 0,
+                                  val<4>{0},
+                                  decay_threshold - 1));
+
+table->setThreshold(new_thresh);
+```
+
+### Decay Probability Mapping
+
+| Threshold | Probability | Use Case |
+|-----------|-------------|----------|
+| 0 | 1/16 (6.25%) | Low allocation pressure |
+| 4 | 5/16 (31%) | Moderate pressure |
+| 8 | 9/16 (56%) | High pressure |
+| 15 | 16/16 (100%) | Critical pressure (always decay) |
+
+### Integration Points
+
+1. **newRead()**: Tick LFSR on every access
+   ```cpp
+   tick_lfsr();  // Advance RNG state
+   ```
+
+2. **updateBlock()**: Apply probabilistic decay on tag misses
+   ```cpp
+   val<1> is_miss = !hit;
+   val<U_WIDTH> new_u = select(is_miss, decrementU(), u_reg);
+   ```
+
+3. **setThreshold()**: Allow predictor to adjust aggressiveness
+   ```cpp
+   void setThreshold(val<4> new_threshold) {
+     decay_threshold = new_threshold;
+   }
+   ```
+
+### Benefits
+
+1. **Adaptive allocation**: Frees entries when tables are full
+2. **Low hardware cost**: Single 16-bit LFSR shared across all accesses
+3. **Tunable**: Predictor controls decay rate based on observed behavior
+4. **Deterministic**: Reproducible for debugging (fixed LFSR seed)
+
+### Alternative: PC-based Pseudo-Random
+
+Zero-cost alternative using existing values:
+
+```cpp
+auto decrementU() {
+  // XOR existing state for pseudo-randomness
+  val<4> pseudo_rand = (idx_reg ^ tag_reg);
+  val<1> should_decay = (pseudo_rand < decay_threshold);
+  // ... same decay logic ...
+}
+```
+
+**Tradeoff**: No area cost, but less random (correlated with address patterns).
+
+---
+
 ## Future Extensions
 
 Potential enhancements to the TageTable interface:
 
-1. **Accessor methods**: `get_hit()`, `get_u()` to expose internal state
+1. ✅ **Accessor methods**: `getHit()`, `getUsefulness()` implemented
 2. **Conditional update**: `updateBlock()` wrapped in `execute_if()` logic
-3. **Decay support**: Automatic u-bit decay every DECAY_CTR accesses
+3. ⏳ **LFSR-based decay**: Probabilistic u-bit decay (TODO, see above)
 4. **Statistical correction**: Additional state for SC predictor integration
 5. **Loop predictor support**: Iteration counter fields
+6. **Per-table regions**: HARCOM region hints for better floorplan
 
 ---
 

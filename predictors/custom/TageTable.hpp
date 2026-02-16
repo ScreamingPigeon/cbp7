@@ -16,9 +16,14 @@ constexpr size_t clog2(std::uint64_t n) {
   return r;
 }
 
+/* TODO:
+ * I need to implement a parameterized LSFR to do
+ * dynamic threshold probabilistic decay
+ */
+
 template <u64 TABLE_SIZE = 64, u64 TABLE_HIST = 64, u64 TAG_WIDTH = 7,
           u64 CTR_WIDTH = 3, u64 U_WIDTH = 2, u64 PRED_BLK_SIZE = 8,
-          u64 DECAY_CTR = 1024>
+          u64 DECAY_CTR = 1024, bool EN_N_BLK_RD = true>
 class TageTable {
 
   static constexpr u64 BITS_PER_INST = CTR_WIDTH;
@@ -61,7 +66,8 @@ public:
     hit = (tag_bits == tag);
 
     // Return from SRAM read result (not register) with fo2
-    return ctrs.select(slot_idx).fo2();
+    if (EN_N_BLK_RD)
+      return ctrs.select(slot_idx).fo2();
   }
   auto reuseRead(val<clog2(PRED_BLK_SIZE)> slot_idx) {
     return ctr_regs[slot_idx];
@@ -88,6 +94,11 @@ public:
   auto getUsefulness() { return u_reg; }
   auto getHit() { return hit; }
 
+  auto setThreshold() {
+    // TODO: Let the predictor set the new
+    // threshold for decrementing U
+  }
+
 private:
   // Instantiate the Registers for caching
   hcm::ram<val<BITS_PER_ENTRY>, TABLE_SIZE> table_ram;
@@ -102,4 +113,10 @@ private:
   // U/CTR of currently cached entries
   reg<U_WIDTH> u_reg;
   arr<reg<CTR_WIDTH>, PRED_BLK_SIZE> ctr_regs;
+
+  auto decrementU() {
+    // TODO: If tag is a miss, compute probabilistic decay
+    // if greater than threshold, return Ureg decrement.
+    // Invoke inside updateBlock, so we knowreplace reg_entry
+  };
 };
