@@ -197,7 +197,7 @@ struct perceptron : predictor {
         val<N> mispredicted_mask = mispredicted_onehot.fo1().fold_or();
 
         // Which banks are performing an update?
-        val<N> update_mask = mispredicted_mask.fo1() | (below_threshold.fo1().concat() & branches_mask.fo1());
+        val<N> update_mask = mispredicted_mask.fo1() | (below_threshold.concat() & branches_mask.fo1());
         update_mask.fanout(hard<3>{});
 
         // Is *any* bank performing an update?
