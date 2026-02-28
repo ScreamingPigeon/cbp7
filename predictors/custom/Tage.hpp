@@ -80,6 +80,100 @@ struct Empty {};
  * SC_TABLE_SIZES:    (const u64[]) Sizes for SC tables
  */
 
+
+/* ========== AHEAD MODE SELECTION ========== */
+/*
+ * AHEAD_EN:              (bool) Master enable for ahead.
+ *                        If false: behave like normal TAGE (no ahead pipeline).
+ *
+ * AHEAD_MODE:            (enum) Which ahead mode to use when AHEAD_EN==true.
+ *                        SEQ1   -> 1-cycle ahead for fall-through only (base+1), no banking.
+ *                        BANKED -> 1-cycle ahead with N+1 outcome banking (true ahead).
+ */
+
+
+/* ========== WHICH TABLES PARTICIPATE ========== */
+/*
+ * AHEAD_TABLE_MASK:      (u64 bitmask) Which tagged tables are read/prefetched in the ahead path.
+ *                        Bit i corresponds to table i (0..NUM_TABLES-1).
+ *                        1 => issue newRead() for table i on block start (prefetch/read stage).
+ *                        0 => table i is not read in the ahead stage (handled non-ahead).                     
+ */
+
+
+/* ========== VALIDATION / RECOVERY ========== */
+/*
+ * AHEAD_VALIDATE_BASE:   (bool) Validate that cached prefetched reads correspond to the current block.
+ *                        In Tage::new_block(inst_pc):
+ *                          base = block_addr(inst_pc)
+ *                          ahead_hit = pref_valid && (pref_base == base)
+ *
+ * AHEAD_MISS_POLICY:     (enum) What to do when ahead data is not available (pref_valid==0 or base mismatch).
+ *                        STALL    -> need_extra_cycle(1), issue reads for current base now, predict next cycle.
+ *                        FALLBACK -> return fallback prediction this cycle while issuing reads.
+ *
+ * AHEAD_FALLBACK_MODE:   (enum) Used only if AHEAD_MISS_POLICY == FALLBACK.
+ *                        BASE -> use base predictor p0 for this block/slot
+ *                        NT   -> always not-taken
+ */
+
+
+/* ========== SEQ1 INVALIDATION (USING next_pc) ========== */
+/*
+ * In SEQ1 mode, prefetch assumes fall-through. Invalidate prefetched data when control flow differs.
+ *
+ * AHEAD_INVALIDATE_ON_NONFALLTHRU: (bool) In update_cycle(block_end_info):
+ *                                  actual_next = block_addr(block_end_info.next_pc)
+ *                                  expected    = last_base + 1
+ *                                  if actual_next != expected -> pref_valid = 0
+ *
+ * AHEAD_INVALIDATE_ON_MISPRED:     (bool) If block_end_info indicates a mispredict, pref_valid = 0.
+ */
+
+
+/* ========== HISTORY SEMANTICS UNDER AHEAD ========== */
+/*
+ * AHEAD_HIST_MODE:       (enum) How to compute history for prefetched idx/tag.
+ *                        STALE     -> prefetch uses br_hist_reg as-of block start (minimal changes).
+ *                                    update_condbr() still updates history normally.
+ *                        BLOCKONLY -> update history only once per block in update_cycle();
+ *                                    update_condbr() does not change history.
+ *
+ * NOTE: USE_PATH_HIST and PATH_HIST_LEN already exist; this knob only controls whether
+ * the prefetched idx/tag uses the "current" history update model or a block-granular one.
+ */
+
+
+/* ========== TRUE AHEAD OUTCOME BANKING (BANKED MODE) ========== */
+/*
+ * Only used when AHEAD_MODE == BANKED.
+ *
+ * Banking provides N+1 candidate "next blocks" per current block, keyed by path_id:
+ *   path_id = 0  -> no conditional branch taken in this block
+ *   path_id = k  -> k-th conditional branch encountered in this block was taken (k = 1..N)
+ *
+ * AHEAD_N:               (u64) Max conditional branches tracked per block for banking.
+ *                        (Outcomes = AHEAD_N + 1; BANKS may be derived internally as pow2_ceil(outcomes).)
+ *
+ * AHEAD_PATH_ID_MODE:    (enum) How to generate path_id from update_condbr/update_cycle.
+ *                        FIRST_TAKEN_ORDINAL ->
+ *                          - maintain ord = number of conditional branches seen so far in this block
+ *                          - if a branch is taken (or block ends on taken), path_id = ord (clamp to N)
+ *                          - if none taken, path_id = 0
+ *
+ * AHEAD_BANK_IMPL:       (enum) How outcome banking is implemented per participating table.
+ *                        WIDE_ENTRY -> each RAM entry stores BANKS sub-entries (one per path_id).
+ *                                      One read returns all sub-entries; computePred selects by path_id.
+ *                        REPL_RAM   -> replicate the entire RAM BANKS times and read in parallel.
+ *
+ * AHEAD_BANKED_TABLE_MASK:(u64 bitmask) Which tables use outcome banking.
+ *                        Bit i=1 -> table i stores BANKS outcomes and selects by path_id.
+ *                        Bit i=0 -> table i is not banked (may still use SEQ1 ahead or no-ahead).
+ *
+ * AHEAD_BANK_SCRAMBLE_EN:(bool) Optional: scramble bank selection to reduce aliasing:
+ *                        bank_sel = path_id XOR xb, where xb is derived from base_addr/inst_pc bits.
+ */
+
 template <
     // Tage Table Default params
     u64 T_TAG_WIDTH = 7, u64 T_U_WIDTH = 2, u64 T_CTR_WIDTH = 3,
