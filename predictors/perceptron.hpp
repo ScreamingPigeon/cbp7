@@ -8,13 +8,13 @@ using namespace hcm;
 
 template <
     u64 LOGLB = 6,     // 64B fetch block
-    u64 NTABLES = 7,   // tuned: better VFS on current full trace set
-    u64 MAXHIST = 100, // maximum global history length
-    u64 MINHIST = 2,   // minimum global history length
+    u64 NTABLES = 6,   // tuned on quick24
+    u64 MAXHIST = 90,  // tuned on quick24
+    u64 MINHIST = 3,   // tuned on quick24
     u64 WBITS = 4,     // signed 4-bit weight (-8 to 7)
     u64 LOGTABLE = 13, // 32KB hashed perceptron for P2
     u64 LOGP1 = 14,    // 4KB gshare for P1
-    u64 GHIST1 = 6     // P1 gshare history length
+    u64 GHIST1 = 7     // tuned on quick24
     >
 struct perceptron : predictor
 {
