@@ -1,169 +1,244 @@
 # CBP Trace Analyzer Overview
 
-This document describes how `trace_analyzer.cpp` uses the provided `trace_reader.hpp` to analyze CBP trace files and what metrics are produced by the program.
+This document explains how `trace_analyzer.cpp` uses `trace_reader.hpp` to analyze CBP trace files and describes all metrics printed by the analyzer.
 
-## How the Analyzer Uses `trace_reader.hpp`
-
-The CBP traces are binary files (usually gzip-compressed) that contain instruction-level execution information. The file format itself is complex, so the provided `trace_reader.hpp` library handles all parsing and decoding.
-
-The analyzer interacts with the trace through the `trace_reader` class.
-
-Typical usage flow:
-
-1. The program constructs a `trace_reader` object with the trace file path and a name for the trace.
-
-   Example:
-
-   ```cpp
-   trace_reader reader(trace_path, "trace");
-   ```
-
-2. The analyzer repeatedly calls:
-
-   ```cpp
-   instruction inst = reader.next_instruction();
-   ```
-
-   Each call returns an `instruction` structure representing the next executed instruction in the trace.
-
-3. The returned `instruction` struct contains the following fields used by the analyzer:
-
-   - `pc`  
-     The program counter of the instruction.
-
-   - `next_pc`  
-     The next program counter after the instruction executes. For branches that are taken, this will be the branch target.
-
-   - `inst_class`  
-     The instruction classification (ALU, LOAD, STORE, branch types, etc.).
-
-   - `branch`  
-     Boolean indicating whether the instruction is a branch.
-
-   - `taken_branch`  
-     Boolean indicating whether the branch was taken.
-
-4. The analyzer updates counters and statistics for each instruction.
-
-5. When the trace reaches the end of file, `trace_reader` throws an `out_of_instructions` exception, which terminates the analysis loop.
-
-The analyzer itself does not interpret the binary trace format directly; it simply consumes decoded instructions provided by `trace_reader`.
+The analyzer processes instruction traces and extracts statistics about branch behavior, instruction distribution, and control-flow structure.
 
 ---
 
-## Metrics Produced by the Analyzer
+# How the Analyzer Uses `trace_reader.hpp`
 
-### Total Instruction Count
+CBP traces store instruction-level execution information in a compressed binary format. The provided `trace_reader.hpp` file handles decoding this format.
 
-The analyzer counts the total number of instructions processed from the trace.
+The analyzer interacts with the trace reader as follows:
 
-This metric represents the full execution length of the workload contained in the trace.
-
----
-
-### Total Branch Count
-
-For every instruction where `inst.branch == true`, the analyzer increments the branch counter.
-
-This measures how frequently control-flow instructions appear relative to total instructions.
-
----
-
-### Taken and Not-Taken Branch Counts
-
-For each branch instruction, the analyzer records whether it was taken or not.
-
-Counters maintained:
-
-- taken branches
-- not-taken branches
-
-These values describe the overall branch direction distribution.
-
----
-
-### Global Branch Taken Rate
-
-The global taken rate is computed as:
+1. A `trace_reader` object is created using the trace path.
 
 ```
-taken_branches / total_branches
+trace_reader reader(trace_path, "trace");
 ```
 
-This metric indicates whether branches in the program are generally biased toward taken or not-taken.
+2. The analyzer repeatedly requests instructions using:
+
+```
+instruction inst = reader.next_instruction();
+```
+
+3. Each instruction returned contains:
+
+- `pc` — program counter of the instruction
+- `next_pc` — next program counter after execution
+- `inst_class` — classification of instruction type
+- `branch` — whether the instruction is a branch
+- `taken_branch` — whether the branch was taken
+
+4. The analyzer updates statistics based on this information.
+
+5. When the end of the trace is reached, the reader throws an `out_of_instructions` exception which stops the analysis loop.
+
+The analyzer itself does not interpret the binary trace format; it only consumes decoded instructions produced by `trace_reader`.
 
 ---
 
-### Per-PC Branch Statistics
+# Window-Based Statistics
 
-The analyzer keeps a table indexed by branch program counter (PC).  
-For each branch PC, the analyzer tracks:
+The analyzer divides the execution stream into **fixed-size instruction windows** (for example 1M instructions per window). For each window it prints summary statistics.
 
-- number of times the branch executed
-- number of taken outcomes
-- number of not-taken outcomes
-
-Example conceptual structure:
+Example:
 
 ```
-branch_stats[pc]:
-    executions
-    taken
-    not_taken
+[Window 0] Branches: 197805 TakenRate: 0.5924 BranchDensity: 0.1978
 ```
 
-This information helps identify how individual branch instructions behave.
+These metrics describe how branch behavior changes over time.
+
+## Branches
+
+Number of branch instructions executed within that window.
+
+## Taken Rate
+
+Fraction of branches that were taken in that window.
+
+```
+TakenRate = taken_branches / total_branches
+```
+
+This indicates whether branches tend to be taken or not taken during that portion of execution.
+
+## Branch Density
+
+Fraction of instructions that are branches within that window.
+
+```
+BranchDensity = branches / total_instructions
+```
+
+Higher density means the program is performing frequent control flow changes.
 
 ---
 
-### Hot Branch Identification
+# Global Statistics
 
-After processing the entire trace, the analyzer sorts branch PCs by execution count.
+After processing the entire trace, the analyzer prints aggregate statistics.
 
-This reveals the most frequently executed branch instructions (often referred to as "hot branches"). These branches tend to dominate branch prediction performance because they appear most often in execution.
-
----
-
-### Instruction Class Distribution
-
-Using the `inst_class` field from the instruction structure, the analyzer counts how many instructions fall into each category, such as:
-
-- ALU operations
-- LOAD instructions
-- STORE instructions
-- BRANCH instructions
-- CALL / RETURN instructions
-- floating-point operations
-
-This produces a high-level view of the workload's instruction mix.
-
----
-
-## Typical Output
-
-When the analysis finishes, the program prints summary statistics similar to the following:
+Example:
 
 ```
-Total Instructions: <value>
-Total Branches: <value>
-Taken Branches: <value>
-Not Taken Branches: <value>
-Global Taken Rate: <value>
+==== GLOBAL STATS ====
+Total instructions: 3005000
+Total branches: 594405
+Branch density: 0.1978
+Taken rate: 0.6187
+Backward rate: 0.3883
+Unique branch PCs: 2083
 ```
 
-It may also output:
+## Total Instructions
 
-- instruction class distribution
-- most frequently executed branch PCs
-- per-PC branch execution counts
+Total number of instructions executed in the trace.
+
+## Total Branches
+
+Total number of branch instructions encountered.
+
+## Branch Density
+
+Fraction of instructions that are branches.
+
+```
+branch_density = total_branches / total_instructions
+```
+
+## Taken Rate
+
+Overall probability that a branch is taken.
+
+```
+taken_rate = taken_branches / total_branches
+```
+
+## Backward Rate
+
+Fraction of branches that jump **backward in the instruction stream**.
+
+```
+backward_branch = (next_pc < pc)
+```
+
+Backward branches are typically associated with **loops**.
+
+High backward rates often indicate loop-heavy programs.
+
+## Unique Branch PCs
+
+Number of distinct program counter values that correspond to branch instructions.
+
+This represents the number of unique branch sites in the program.
 
 ---
 
-## Purpose of the Analysis
+# Hot Branch Analysis
 
-These metrics provide a high-level characterization of the control-flow behavior of the program contained in the trace. This information is useful for:
+The analyzer identifies the most frequently executed branch instructions ("hot branches").
 
-- understanding branch behavior in the workload
-- identifying frequently executed branches
-- guiding branch predictor design and evaluation
-- understanding instruction mix and program structure
+Example:
+
+```
+==== TOP 10 HOT BRANCHES ====
+PC: 0xf02d88 Count: 35885 TakenRate: 0.8184 Entropy: 0.6835 FlipRate: 0.1428
+```
+
+Each entry represents a specific branch instruction address.
+
+## PC
+
+Program counter of the branch instruction.
+
+## Count
+
+Number of times this branch executed.
+
+Hot branches are important because they dominate predictor performance.
+
+## Taken Rate
+
+Probability that this specific branch is taken.
+
+```
+taken_rate = taken_count / execution_count
+```
+
+Values close to 0 or 1 indicate highly predictable branches.
+
+Values near 0.5 are difficult to predict.
+
+---
+
+# Entropy
+
+Entropy measures the **predictability of branch outcomes**.
+
+It is computed using binary entropy:
+
+```
+H = -(p log2 p + (1-p) log2 (1-p))
+```
+
+Where:
+
+```
+p = taken probability
+```
+
+Entropy ranges from:
+
+| Value | Meaning |
+|------|-------|
+0 | perfectly predictable |
+1 | maximally unpredictable |
+
+Examples:
+
+- `TakenRate ≈ 0 or 1` → low entropy
+- `TakenRate ≈ 0.5` → high entropy
+
+Entropy helps identify branches that are inherently difficult to predict.
+
+---
+
+# Flip Rate
+
+Flip rate measures **how often branch direction changes between consecutive executions**.
+
+```
+FlipRate = number_of_direction_changes / executions
+```
+
+Example sequence:
+
+```
+T T T N T N N
+```
+
+Direction changes:
+
+```
+T→N
+N→T
+T→N
+```
+
+# PC Region Histogram
+
+The analyzer groups branch PCs into **memory regions** and counts how many branches occur in each region.
+
+Example:
+
+```
+==== PC REGION HISTOGRAM (Top 8) ====
+Region 0x0 Count: 3001893
+Region 0xffff Count: 3107
+```
+
+This provides a coarse view of where instructions originate in memory.
