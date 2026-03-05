@@ -12,3 +12,7 @@
 
 # Run outputs
 *.out
+
+# Local training traces (large datasets)
+/cbp-ng_training_traces/
+/cbp-ng_training_traces.tar.gz
