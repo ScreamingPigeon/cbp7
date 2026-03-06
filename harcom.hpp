@@ -3309,6 +3309,9 @@ namespace hcm {
     // circular dependency with panel
     region();
     void enter();
+#ifdef ENABLE_REGION_PROFILING
+    std::string name = "";
+#endif
   };
 
 
@@ -3614,6 +3617,10 @@ namespace hcm {
     {
       return leakage_power_mW(xtor_fins(r),storage_sram(r));
     }
+
+#ifdef ENABLE_REGION_PROFILING
+    const auto& get_regions() const { return regions; }
+#endif
 
     void make_floorplan()
     {
