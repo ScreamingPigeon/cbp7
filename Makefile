@@ -21,8 +21,10 @@ TRACE ?= ./gcc_test_trace.gz
 TRACE_NAME ?= test
 WARMUP ?= 1000000
 MEASURE ?= 40000000
+REGION_SHIFT ?= 12
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions clean
+
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions clean
 
 all: cbp reference
 
@@ -37,16 +39,24 @@ help:
 	@echo "  make cbp-profile-acc-regions    Accuracy mode with per-region breakdown"
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
-	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
+	@echo "  make trace-analyze    Build trace analysis tool"
+	@echo "  make run-trace-analyze Run trace analyzer on TRACE"	
+  @echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
 	@echo "  make clean                  Remove generated build artifacts"
 	@echo
 	@echo "Variables you can override:"
-	@echo "  TRACE=... TRACE_NAME=... WARMUP=... MEASURE=..."
+	@echo "  TRACE=...            Trace file (default: $(TRACE))"
+	@echo "  REGION_SHIFT=...     PC region bit shift for analysis (default: $(REGION_SHIFT))"
+	@echo "                       12=4KB pages, 21=2MB, 30=1GB"
+	@echo "  TRACE_NAME=... WARMUP=... MEASURE=..."
 	@echo "  (all default from $(PARAMS_FILE); CLI values still override)"
 	@echo "  EXTRA_COMMON_FLAGS=... EXTRA_CBP_FLAGS=..."
 	@echo "  PARAMS_FILE=... PREDICTOR_TYPE=... CXX=... PYTHON=..."
 
 $(BUILD_DIR):
+	mkdir -p $@
+
+out:
 	mkdir -p $@
 
 predictor-config: $(PREDICTOR_MK)
@@ -60,11 +70,17 @@ cbp: cbp.cpp cbp.hpp branch_predictor.hpp trace_reader.hpp harcom.hpp $(wildcard
 reference: reference.cpp trace_reader.hpp seznec_cbp2025.h
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -o $@ reference.cpp -lz
 
+trace-analyze: trace_files/trace_analyzer.cpp trace_files/trace_reader.hpp
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -o $@ trace_files/trace_analyzer.cpp -lz
+
 run-cbp: cbp
 	./cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
 
 run-reference: reference
 	./reference $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
+
+run-trace-analyze: trace-analyze | out
+	./trace-analyze $(TRACE) $(REGION_SHIFT) | tee out/trace_analysis.txt
 
 out:
 	mkdir -p $@
@@ -90,5 +106,6 @@ cbp-profile-analyze-regions: out/cbp-profile
 
 clean:
 	rm -f cbp reference
-	rm -rf out/
+
 	rm -f $(PREDICTOR_MK)
+	rm -rf out/*
