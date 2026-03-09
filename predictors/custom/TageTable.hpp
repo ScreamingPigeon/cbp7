@@ -202,10 +202,234 @@ private:
   // USE_FF_CACHE=false: 1 counter per bank (current read result only)
   arr<reg<CTR_WIDTH>, CACHED_CTRS> ctr_regs[NUM_BANKS];
 
+  // ======== Private Helpers ========
+
+  // Unpack a bank entry into its component fields.
+  // Returns counter bits. Writes tag_reg/u_reg for this bank if applicable.
+  // bank_local: logical bank index within a stage [0..NUM_BANKS)
+  val<CTR_BITS> unpack_bank_entry(val<BANK_ENTRY_WIDTH> entry,
+                                  u64 bank_local) {
+    if constexpr (!SHARED_TAG && !SHARED_U && !U_STOR_FF) {
+      // [tag | ctrs | u]
+      auto [u_bits, ctr_bits, tag_bits] =
+          split<BANK_U_BITS, CTR_BITS, BANK_TAG_BITS>(entry);
+      tag_reg[bank_local] = tag_bits;
+      u_reg[bank_local] = u_bits;
+      return ctr_bits;
+    } else if constexpr (!SHARED_TAG && (SHARED_U || U_STOR_FF)) {
+      // [tag | ctrs]
+      auto [ctr_bits, tag_bits] = split<CTR_BITS, BANK_TAG_BITS>(entry);
+      tag_reg[bank_local] = tag_bits;
+      return ctr_bits;
+    } else if constexpr (SHARED_TAG && !SHARED_U && !U_STOR_FF) {
+      // [ctrs | u]
+      auto [u_bits, ctr_bits] = split<BANK_U_BITS, CTR_BITS>(entry);
+      u_reg[bank_local] = u_bits;
+      return ctr_bits;
+    } else {
+      // [ctrs] only
+      return entry;
+    }
+  }
+
+  // Extract individual counters from combined counter bits and store in regs.
+  void extract_counters(val<CTR_BITS> ctr_bits, u64 bank_local) {
+    static_loop<CACHED_CTRS>([&]<u64 I>() {
+      constexpr u64 shift_amt = I * CTR_WIDTH;
+      ctr_regs[bank_local][I] = ctr_bits >> hard<shift_amt>{};
+    });
+  }
+
+  // Pack counter regs back into combined counter bits for a bank.
+  val<CTR_BITS> pack_counters(u64 bank_local) {
+    return ctr_regs[bank_local].concat();
+  }
+
+  // Pack a full bank entry from components.
+  val<BANK_ENTRY_WIDTH> pack_bank_entry(val<CTR_BITS> ctr_bits,
+                                        val<TAG_WIDTH> tag,
+                                        val<U_WIDTH> u) {
+    if constexpr (!SHARED_TAG && !SHARED_U && !U_STOR_FF) {
+      return concat(u, ctr_bits, tag);
+    } else if constexpr (!SHARED_TAG && (SHARED_U || U_STOR_FF)) {
+      return concat(ctr_bits, tag);
+    } else if constexpr (SHARED_TAG && !SHARED_U && !U_STOR_FF) {
+      return concat(u, ctr_bits);
+    } else {
+      return ctr_bits;
+    }
+  }
+
+  // Probabilistic u-bit decay (SRAM mode only).
+  // Returns 1 with probability 1/DECAY_CTR.
+  val<1> should_decay() {
+    constexpr u64 DECAY_BITS = clog2(DECAY_CTR);
+    val<DECAY_BITS> rng{static_cast<unsigned>(std::rand())};
+    return rng == hard<0>{};
+  }
+
 public:
   TageTable() = default;
   ~TageTable() = default;
 
-  // Phase 2: read(), reuseRead(), write(), accessors
-  // Phase 2: reset_u() for FF mode
+  // ======== Read Interface ========
+
+  // Read all banks at index, compare tags, cache results.
+  // stage: ahead stage index (0 when USE_AHEAD=false)
+  void read(val<IDX_BITS> index, val<TAG_WIDTH> compare_tag,
+            u64 stage = 0) {
+    idx_reg = index;
+
+    // Read shared tag if applicable
+    if constexpr (SHARED_TAG) {
+      val<TAG_WIDTH> stored_tag = shared_tag_ram[stage].read(index);
+      tag_reg[0] = stored_tag;
+      hit_reg[0] = (stored_tag == compare_tag);
+    }
+
+    // Read shared u from SRAM if applicable
+    if constexpr (SHARED_U && !U_STOR_FF) {
+      u_reg[0] = shared_u_ram[stage].read(index);
+    }
+
+    // Read shared u from FFs if applicable
+    if constexpr (SHARED_U && U_STOR_FF) {
+      u_reg[0] = u_ff[0].select(index);
+    }
+
+    // Read each bank
+    u64 bank_base = stage * NUM_BANKS;
+    for (u64 b = 0; b < NUM_BANKS; b++) {
+      val<BANK_ENTRY_WIDTH> entry = bank_ram[bank_base + b].read(index);
+      val<CTR_BITS> ctr_bits = unpack_bank_entry(entry, b);
+      extract_counters(ctr_bits, b);
+
+      // Per-bank tag comparison (when !SHARED_TAG)
+      if constexpr (!SHARED_TAG) {
+        hit_reg[b] = (tag_reg[b] == compare_tag);
+      }
+
+      // Per-bank u from FFs (when !SHARED_U && U_STOR_FF)
+      if constexpr (!SHARED_U && U_STOR_FF) {
+        u_reg[b] = u_ff[b].select(index);
+      }
+    }
+
+    // SRAM u-bit probabilistic decay on tag miss
+    if constexpr (!U_STOR_FF) {
+      if constexpr (SHARED_U) {
+        // Decay shared u on miss
+        val<1> do_decay = ~hit_reg[0] & should_decay();
+        u_reg[0] = select(do_decay,
+            select(u_reg[0] == hard<0>{}, val<U_WIDTH>{0},
+                   val<U_WIDTH>{u_reg[0] - 1}),
+            val<U_WIDTH>{u_reg[0]});
+      } else {
+        // Decay per-bank u on per-bank miss
+        for (u64 b = 0; b < NUM_BANKS; b++) {
+          val<1> do_decay = ~hit_reg[b] & should_decay();
+          u_reg[b] = select(do_decay,
+              select(u_reg[b] == hard<0>{}, val<U_WIDTH>{0},
+                     val<U_WIDTH>{u_reg[b] - 1}),
+              val<U_WIDTH>{u_reg[b]});
+        }
+      }
+    }
+  }
+
+  // ======== Reuse Read (FF Cache) ========
+
+  // Return cached counter for a given bank and slot.
+  // Only valid when USE_FF_CACHE=true and a prior read() was done.
+  auto reuseRead(u64 bank, val<clog2(BPB)> slot) {
+    static_assert(USE_FF_CACHE, "reuseRead requires USE_FF_CACHE=true");
+    return ctr_regs[bank].select(slot);
+  }
+
+  // ======== Accessors ========
+
+  auto getHit(u64 bank = 0) {
+    if constexpr (SHARED_TAG) {
+      return hit_reg[0];
+    } else {
+      return hit_reg[bank];
+    }
+  }
+
+  auto getTag(u64 bank = 0) {
+    if constexpr (SHARED_TAG) {
+      return tag_reg[0];
+    } else {
+      return tag_reg[bank];
+    }
+  }
+
+  auto getCounter(u64 bank, u64 slot = 0) {
+    if constexpr (USE_FF_CACHE) {
+      return ctr_regs[bank][slot];
+    } else {
+      return ctr_regs[bank][0];
+    }
+  }
+
+  auto getU(u64 bank = 0) {
+    if constexpr (SHARED_U) {
+      return u_reg[0];
+    } else {
+      return u_reg[bank];
+    }
+  }
+
+  // ======== Write Interface ========
+
+  // Write a single bank entry back to SRAM.
+  // stage: ahead stage index (0 when USE_AHEAD=false)
+  void write(val<IDX_BITS> index, u64 bank, u64 stage,
+             val<TAG_WIDTH> tag,
+             val<CTR_BITS> ctr_bits,
+             val<U_WIDTH> u) {
+    u64 phys_bank = stage * NUM_BANKS + bank;
+    val<BANK_ENTRY_WIDTH> entry = pack_bank_entry(ctr_bits, tag, u);
+    bank_ram[phys_bank].write(index, entry);
+
+    // Write shared tag RAM if applicable
+    if constexpr (SHARED_TAG) {
+      shared_tag_ram[stage].write(index, tag);
+    }
+
+    // Write u-bit
+    if constexpr (SHARED_U && !U_STOR_FF) {
+      shared_u_ram[stage].write(index, u);
+    } else if constexpr (SHARED_U && U_STOR_FF) {
+      u_ff[0][index] = u;
+    } else if constexpr (!SHARED_U && U_STOR_FF) {
+      u_ff[bank][index] = u;
+    }
+    // When !SHARED_U && !U_STOR_FF, u is already packed in bank entry
+  }
+
+  // Convenience: write back from cached registers (for counter updates).
+  // Uses the index from the last read().
+  void writeBack(u64 bank, u64 stage, val<TAG_WIDTH> tag, val<U_WIDTH> u) {
+    val<CTR_BITS> ctr_bits = pack_counters(bank);
+    write(idx_reg, bank, stage, tag, ctr_bits, u);
+  }
+
+  // Update a single counter in the cache registers.
+  // Call before writeBack() to modify a counter value.
+  void writeReg(u64 bank, u64 slot, val<CTR_WIDTH> new_ctr) {
+    ctr_regs[bank][slot] = new_ctr;
+  }
+
+  // ======== U-bit Reset (FF mode only) ========
+
+  // Apply ResetFn to all u-bit flip-flops with the given mode.
+  void reset_u(val<ResetFn::MODE_BITS> mode) {
+    static_assert(U_STOR_FF, "reset_u requires U_STOR_FF=true");
+    for (u64 a = 0; a < U_FF_ARRAYS; a++) {
+      for (u64 i = 0; i < TABLE_SIZE; i++) {
+        u_ff[a][i] = ResetFn::template apply<U_WIDTH>(u_ff[a][i], mode);
+      }
+    }
+  }
 };
