@@ -12,88 +12,76 @@ Development plan for the parameterized `TageTable` class. Builds on design decis
 
 ---
 
-## Phase 1: Storage Primitives
+## Phase 1: Storage Primitives ✅ COMPLETE
 
 **Goal**: Declare all HARCOM private members, parameterized by the template parameter list. No logic yet — just storage.
 
-### 1.1 Template declaration and static_asserts
-- Full template parameter list (see `agent/tagetable_plan.md` for confirmed parameters)
-- Computed constants: `BPB = N / NUM_BANKS`, `PHYS_BANKS = NUM_BANKS * (USE_AHEAD ? 2 : 1)`, entry widths
-- All constraints:
-  - `N % NUM_BANKS == 0`
-  - `!SHARED_U || SHARED_TAG` (per-branch U requires per-bank tags)
-  - `!USE_FF_CACHE || BPB > 1` (caching only useful with multiple branches per bank)
+**Status**: All storage members declared. 14 parameter combinations compile with `-Werror`.
 
-### 1.2 SRAM storage
-- **Counter RAM**: `ram<val<BPB * CTR_WIDTH>, TABLE_SIZE>` per physical bank (or wider if tag/U packed in)
-- **Tag RAM**: depends on `SHARED_TAG`
-  - `SHARED_TAG = true`: tag stored once per entry (separate small RAM or packed into one bank)
-  - `SHARED_TAG = false`: tag packed per-bank entry
-- **U-bit RAM** (when `U_STORAGE = SRAM`): packed into entry alongside counters
-- Entry layout varies by parameter combination — use `if constexpr` to select packing
+**Completed**:
+- 1.1: Full template parameter list (13 params + ResetFn typename), all static_asserts, computed constants
+- 1.2: SRAM — `bank_ram[PHYS_BANKS]`, conditional `shared_tag_ram`, conditional `shared_u_ram`. Used `hcm::ram` to avoid namespace ambiguity. `std::conditional_t<..., EmptyMember>` for conditional elimination.
+- 1.3: FF — conditional `u_ff` arrays. Result/cache registers: `idx_reg`, `tag_reg`, `hit_reg`, `u_reg`, `ctr_regs` (depth = BPB when cached, 1 otherwise).
+- 1.4: Compile test (`tests/test_tagetable_compile.cpp`) with 14 instantiations. Makefile target `test-tagetable` added.
 
-### 1.3 FF storage
-- **U-bit FFs** (when `U_STORAGE = FF`):
-  - `SHARED_U = true`: `arr<reg<U_WIDTH>, TABLE_SIZE>`
-  - `SHARED_U = false`: `arr<arr<reg<U_WIDTH>, NUM_BANKS>, TABLE_SIZE>`
-- **Cache FFs** (when `USE_FF_CACHE = true`):
-  - Per-bank: `arr<reg<CTR_WIDTH>, BPB>` for cached counters
-  - `reg<TAG_WIDTH>` for cached tag (per bank or shared depending on `SHARED_TAG`)
-  - `reg<U_WIDTH>` for cached u-bit
-  - `reg<clog2(TABLE_SIZE)>` for cached index
-  - `reg<1>` for cached hit
-
-### 1.4 Deliverable
-- Compiles with all parameter combinations
-- No methods yet — just verify storage instantiation doesn't break HARCOM
+**Note**: `U_STORAGE` enum replaced with `U_STOR_FF` bool per user preference.
 
 ---
 
-## Phase 2: Accessors and Read/Write Interface
+## Phase 2: Accessors and Read/Write Interface — IN PROGRESS
 
 **Goal**: Implement the read/write methods and accessors. Build a test harness.
 
-### 2.1 Read path
+### 2.1 Read path ✅
 ```
-read(val<clog2(TABLE_SIZE)> index, val<TAG_WIDTH> compare_tag)
+read(val<IDX_BITS> index, val<TAG_WIDTH> compare_tag, u64 stage = 0)
 ```
-- Read all banks at `index`
-- Unpack entries: extract tag, counters, u-bit per bank
-- Compare stored tag(s) against `compare_tag`, store hit result
-- If `USE_FF_CACHE`: cache all fields in registers
+- Reads all bank RAMs at `index` for the given ahead stage
+- Unpacks entries via `if constexpr` based on SHARED_TAG/SHARED_U/U_STOR_FF layout
+- Extracts individual counters via `static_loop<CACHED_CTRS>` into `ctr_regs`
+- Compares stored tag(s) against `compare_tag`, stores in `hit_reg`
+- Reads u-bits from SRAM (packed or shared RAM) or FF arrays
+- SRAM mode: applies probabilistic u-bit decay on tag miss (`1/DECAY_CTR`)
 
-### 2.2 Reuse read (when `USE_FF_CACHE = true`)
+### 2.2 Reuse read ✅
 ```
-reuseRead(bank, slot) -> val<CTR_WIDTH>
+reuseRead(u64 bank, val<clog2(BPB)> slot) -> val<CTR_WIDTH>
 ```
-- Return cached counter from FFs, no RAM access
+- Returns cached counter from `ctr_regs` via `arr.select()`
+- `static_assert` enforces `USE_FF_CACHE=true`
 
-### 2.3 Accessors
-- `getHit(bank)` → `val<1>` (or just `getHit()` when `SHARED_TAG = true`)
-- `getTag(bank)` → `val<TAG_WIDTH>`
-- `getCounter(bank, slot)` → `val<CTR_WIDTH>`
-- `getU(bank)` → `val<U_WIDTH>` (or `getU()` when `SHARED_U = true`)
+### 2.3 Accessors ✅
+- `getHit(bank=0)` — respects `SHARED_TAG` (shared returns `hit_reg[0]`)
+- `getTag(bank=0)` — respects `SHARED_TAG`
+- `getCounter(bank, slot=0)` — respects `USE_FF_CACHE` (cached returns by slot, uncached returns slot 0)
+- `getU(bank=0)` — respects `SHARED_U`
 
-### 2.4 Write path
+### 2.4 Write path ✅
 ```
-write(val<clog2(TABLE_SIZE)> index, bank, val<TAG_WIDTH> tag,
-      arr<val<CTR_WIDTH>, BPB> counters, val<U_WIDTH> u)
+write(val<IDX_BITS> index, u64 bank, u64 stage, val<TAG_WIDTH> tag,
+      val<CTR_BITS> ctr_bits, val<U_WIDTH> u)
 ```
-- Pack fields into entry format
-- Write to specified bank at specified index
-- For `U_STORAGE = FF`: write u-bit to FF array instead
+- Packs entry via `pack_bank_entry()` using `if constexpr` for layout
+- Writes to `bank_ram[stage * NUM_BANKS + bank]`
+- Writes shared tag RAM / shared u RAM / u FFs as applicable
 
-### 2.5 U-bit reset (FF mode only)
-```
-reset_u(val<MODE_BITS> mode)
-```
-- Apply `ResetFn` to all FF u-bit entries with given mode
+Also:
+- `writeBack(bank, stage, tag, u)` — convenience write from cached `ctr_regs`
+- `writeReg(bank, slot, new_ctr)` — update single counter in cache before writeBack
 
-### 2.6 U-bit decay (SRAM mode only)
-- Probabilistic decrement on tag miss inside read path
-- Uses `std::rand()` with `1/DECAY_CTR` probability
+### 2.5 U-bit reset (FF mode) ✅
+```
+reset_u(val<ResetFn::MODE_BITS> mode)
+```
+- Iterates all u-bit FF arrays, applies `ResetFn::apply<U_WIDTH>(u, mode)`
+- `static_assert` enforces `U_STOR_FF=true`
 
-### 2.7 Test harness (`tests/test_tagetable.cpp`)
+### 2.6 U-bit decay (SRAM mode) ✅
+- `should_decay()` returns `val<1>` true with probability `1/DECAY_CTR` using `std::rand()`
+- Applied inside `read()` on tag miss: saturating decrement of `u_reg`
+- Shared vs per-bank decay handled via `if constexpr`
+
+### 2.7 Test harness — TODO
 
 Build a standalone test using the `harcom_superuser` pattern from `test_harcom.cpp`:
 
@@ -112,11 +100,7 @@ Build a standalone test using the `harcom_superuser` pattern from `test_harcom.c
 - Block reuse flow: `read()` → `reuseRead()` × (BPB-1)
 - Multi-bank flow: read all banks, check hits independently
 
-**Add to Makefile**:
-```makefile
-test-tagetable: tests/test_tagetable.cpp
-	$(CXX) $(CXXFLAGS) -o $@ $< -lz
-```
+**Makefile target**: `test-tagetable` ✅ (currently runs compile test; will be updated for runtime tests)
 
 ---
 
