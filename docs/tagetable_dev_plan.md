@@ -81,26 +81,39 @@ reset_u(val<ResetFn::MODE_BITS> mode)
 - Applied inside `read()` on tag miss: saturating decrement of `u_reg`
 - Shared vs per-bank decay handled via `if constexpr`
 
-### 2.7 Test harness — TODO
+### 2.7 Test harness ✅
 
-Build a standalone test using the `harcom_superuser` pattern from `test_harcom.cpp`:
+16 tests, 69 assertions, all passing. File: `tests/test_tagetable.cpp`.
 
-**Unit tests**:
-- Write an entry, read it back, verify all accessors return correct values
-- Test tag hit and miss
-- Test `reuseRead()` returns cached data
-- Test write-after-read (update flow)
-- Test U-bit decay triggers probabilistically
-- Test U-bit FF reset modes (reset, rshift, decrement)
-- Test with different parameter combinations (compile-time instantiations)
+**Unit tests** (all ✅):
+- Write/read/verify all accessors (test 1)
+- Tag hit and miss (tests 1, 2)
+- `reuseRead()` returns cached data (test 6)
+- Write-after-read update flow via direct `write()` (test 3)
+- U-bit SRAM decay on miss with `DECAY_CTR=1` (test 8)
+- U-bit SRAM per-bank decay (test 15)
+- U-bit FF reset modes: reset/rshift/decrement (test 9)
+- Multi-bank shared tag (test 4)
+- Per-bank tags + independent hit (tests 5, 13)
+- Ahead pipelining stages (test 7)
+- Everything combined: ahead + multibank + FF cache + per-bank (test 16)
 
-**Predictor-emulation patterns**:
-- Predict flow: `read()` → `getHit()` → `getCounter()` → cycle boundary → `write()` (update)
-- Allocation flow: `read()` → miss → `write()` with fresh entry
-- Block reuse flow: `read()` → `reuseRead()` × (BPB-1)
-- Multi-bank flow: read all banks, check hits independently
+**Predictor-emulation patterns** (all ✅):
+- Predict flow: `read()` → `getHit()` → `getCounter()` → cycle → `write()` (test 10)
+- Allocation flow: `read()` → miss → `write()` (test 11)
+- Block reuse flow: `read()` → `reuseRead()` × (BPB-1) (test 12)
+- Multi-bank hit: read all banks, check hits independently (test 13)
+- HARCOM timing: read/write on different cycles verified (test 14)
 
-**Makefile target**: `test-tagetable` ✅ (currently runs compile test; will be updated for runtime tests)
+**Latency reporting**: All read accessors print `(t=... ps, loc=...)` via HARCOM `.print()`.
+
+**Bugs found and fixed during testing**:
+- Accessors returned `reg<N>` by value (copy creates/destroys storage → HARCOM crash). Fixed: return `val<N>`.
+- `u_reg` double-write in SRAM decay path (read from RAM + decay in same cycle). Fixed: extract u from entry into local val, apply decay, write `u_reg` once.
+- `should_decay()` with `DECAY_CTR=1` produced `val<0>` (invalid). Fixed: `if constexpr (DECAY_CTR <= 1)` returns `val<1>{1}`.
+- `u_ff[0][index]` where `index` is `val<IDX_BITS>` — HARCOM `arr::operator[]` takes `u64`. Fixed: `write_u_ff()` helper with `execute_if` decode pattern.
+
+**Makefile targets**: `test-tagetable` (runtime, builds+runs), `test-tagetable-compile` (compile-only, 14 instantiations)
 
 ---
 

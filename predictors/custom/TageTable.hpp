@@ -1,6 +1,5 @@
 #pragma once
 
-#include "../../cbp.hpp"
 #include "../../harcom.hpp"
 
 using namespace hcm;
@@ -205,8 +204,15 @@ private:
   // ======== Private Helpers ========
 
   // Unpack a bank entry into its component fields.
-  // Returns counter bits. Writes tag_reg/u_reg for this bank if applicable.
+  // Returns counter bits. Writes tag_reg for this bank if applicable.
+  // For per-bank SRAM u-bits: extracts u bits into u_val_out instead of
+  // writing u_reg (caller applies decay before writing u_reg once).
   // bank_local: logical bank index within a stage [0..NUM_BANKS)
+  // Unpack a bank entry into its component fields.
+  // Returns counter bits. Writes tag_reg for this bank if applicable.
+  // For per-bank SRAM u (!SHARED_U && !U_STOR_FF): writes u_reg directly
+  // if apply_decay is false; if apply_decay is true, writes u_reg with
+  // probabilistic decay applied based on hit_reg.
   val<CTR_BITS> unpack_bank_entry(val<BANK_ENTRY_WIDTH> entry,
                                   u64 bank_local) {
     if constexpr (!SHARED_TAG && !SHARED_U && !U_STOR_FF) {
@@ -214,7 +220,7 @@ private:
       auto [u_bits, ctr_bits, tag_bits] =
           split<BANK_U_BITS, CTR_BITS, BANK_TAG_BITS>(entry);
       tag_reg[bank_local] = tag_bits;
-      u_reg[bank_local] = u_bits;
+      // u_reg written after tag comparison (see read())
       return ctr_bits;
     } else if constexpr (!SHARED_TAG && (SHARED_U || U_STOR_FF)) {
       // [tag | ctrs]
@@ -224,11 +230,26 @@ private:
     } else if constexpr (SHARED_TAG && !SHARED_U && !U_STOR_FF) {
       // [ctrs | u]
       auto [u_bits, ctr_bits] = split<BANK_U_BITS, CTR_BITS>(entry);
-      u_reg[bank_local] = u_bits;
+      // u_reg written after tag comparison (see read())
       return ctr_bits;
     } else {
       // [ctrs] only
       return entry;
+    }
+  }
+
+  // Extract per-bank u bits from a bank entry (only for !SHARED_U && !U_STOR_FF).
+  val<U_WIDTH> extract_u_from_entry(val<BANK_ENTRY_WIDTH> entry) {
+    static_assert(!SHARED_U && !U_STOR_FF,
+                  "extract_u_from_entry only for per-bank SRAM u");
+    if constexpr (!SHARED_TAG) {
+      // [tag | ctrs | u] — u is LSB
+      auto [u_bits, rest] = split<BANK_U_BITS, CTR_BITS + BANK_TAG_BITS>(entry);
+      return u_bits;
+    } else {
+      // [ctrs | u] — u is LSB
+      auto [u_bits, rest] = split<BANK_U_BITS, CTR_BITS>(entry);
+      return u_bits;
     }
   }
 
@@ -263,9 +284,22 @@ private:
   // Probabilistic u-bit decay (SRAM mode only).
   // Returns 1 with probability 1/DECAY_CTR.
   val<1> should_decay() {
-    constexpr u64 DECAY_BITS = clog2(DECAY_CTR);
-    val<DECAY_BITS> rng{static_cast<unsigned>(std::rand())};
-    return rng == hard<0>{};
+    if constexpr (DECAY_CTR <= 1) {
+      return val<1>{1}; // always decay
+    } else {
+      constexpr u64 DECAY_BITS = clog2(DECAY_CTR);
+      val<DECAY_BITS> rng{static_cast<unsigned>(std::rand())};
+      return rng == hard<0>{};
+    }
+  }
+
+  // Write a single entry in a u-bit FF array at a dynamic val index.
+  // Models a decoder driving each FF's write-enable.
+  void write_u_ff(u64 arr_idx, val<IDX_BITS> index, val<U_WIDTH> u) {
+    for (u64 i = 0; i < TABLE_SIZE; i++) {
+      execute_if(index == val<IDX_BITS>{static_cast<unsigned>(i)},
+                 [&]() { u_ff[arr_idx][i] = u; });
+    }
   }
 
 public:
@@ -287,17 +321,14 @@ public:
       hit_reg[0] = (stored_tag == compare_tag);
     }
 
-    // Read shared u from SRAM if applicable
-    if constexpr (SHARED_U && !U_STOR_FF) {
-      u_reg[0] = shared_u_ram[stage].read(index);
-    }
-
-    // Read shared u from FFs if applicable
+    // Read shared u from FFs if applicable (no decay for FFs)
     if constexpr (SHARED_U && U_STOR_FF) {
       u_reg[0] = u_ff[0].select(index);
     }
 
-    // Read each bank
+    // Read each bank: unpack entries, extract counters and tags.
+    // For per-bank SRAM u, we re-read the entry to extract u bits after
+    // tag comparison so we can apply decay based on hit/miss.
     u64 bank_base = stage * NUM_BANKS;
     for (u64 b = 0; b < NUM_BANKS; b++) {
       val<BANK_ENTRY_WIDTH> entry = bank_ram[bank_base + b].read(index);
@@ -313,27 +344,26 @@ public:
       if constexpr (!SHARED_U && U_STOR_FF) {
         u_reg[b] = u_ff[b].select(index);
       }
+
+      // Per-bank SRAM u: extract u bits, apply decay, write u_reg once
+      if constexpr (!SHARED_U && !U_STOR_FF) {
+        val<U_WIDTH> u_val = extract_u_from_entry(entry);
+        val<1> do_decay = ~hit_reg[b] & should_decay();
+        u_reg[b] = select(do_decay,
+            select(u_val == hard<0>{}, val<U_WIDTH>{0},
+                   val<U_WIDTH>{u_val - 1}),
+            u_val);
+      }
     }
 
-    // SRAM u-bit probabilistic decay on tag miss
-    if constexpr (!U_STOR_FF) {
-      if constexpr (SHARED_U) {
-        // Decay shared u on miss
-        val<1> do_decay = ~hit_reg[0] & should_decay();
-        u_reg[0] = select(do_decay,
-            select(u_reg[0] == hard<0>{}, val<U_WIDTH>{0},
-                   val<U_WIDTH>{u_reg[0] - 1}),
-            val<U_WIDTH>{u_reg[0]});
-      } else {
-        // Decay per-bank u on per-bank miss
-        for (u64 b = 0; b < NUM_BANKS; b++) {
-          val<1> do_decay = ~hit_reg[b] & should_decay();
-          u_reg[b] = select(do_decay,
-              select(u_reg[b] == hard<0>{}, val<U_WIDTH>{0},
-                     val<U_WIDTH>{u_reg[b] - 1}),
-              val<U_WIDTH>{u_reg[b]});
-        }
-      }
+    // Shared SRAM u-bit: read, apply probabilistic decay on miss, write once.
+    if constexpr (SHARED_U && !U_STOR_FF) {
+      val<U_WIDTH> u_val = shared_u_ram[stage].read(index);
+      val<1> do_decay = ~hit_reg[0] & should_decay();
+      u_reg[0] = select(do_decay,
+          select(u_val == hard<0>{}, val<U_WIDTH>{0},
+                 val<U_WIDTH>{u_val - 1}),
+          u_val);
     }
   }
 
@@ -347,36 +377,37 @@ public:
   }
 
   // ======== Accessors ========
+  // Return val<> (not reg<>) to avoid creating/destroying temporary registers.
 
-  auto getHit(u64 bank = 0) {
+  val<1> getHit(u64 bank = 0) {
     if constexpr (SHARED_TAG) {
-      return hit_reg[0];
+      return val<1>{hit_reg[0]};
     } else {
-      return hit_reg[bank];
+      return val<1>{hit_reg[bank]};
     }
   }
 
-  auto getTag(u64 bank = 0) {
+  val<TAG_WIDTH> getTag(u64 bank = 0) {
     if constexpr (SHARED_TAG) {
-      return tag_reg[0];
+      return val<TAG_WIDTH>{tag_reg[0]};
     } else {
-      return tag_reg[bank];
+      return val<TAG_WIDTH>{tag_reg[bank]};
     }
   }
 
-  auto getCounter(u64 bank, u64 slot = 0) {
+  val<CTR_WIDTH> getCounter(u64 bank, u64 slot = 0) {
     if constexpr (USE_FF_CACHE) {
-      return ctr_regs[bank][slot];
+      return val<CTR_WIDTH>{ctr_regs[bank][slot]};
     } else {
-      return ctr_regs[bank][0];
+      return val<CTR_WIDTH>{ctr_regs[bank][0]};
     }
   }
 
-  auto getU(u64 bank = 0) {
+  val<U_WIDTH> getU(u64 bank = 0) {
     if constexpr (SHARED_U) {
-      return u_reg[0];
+      return val<U_WIDTH>{u_reg[0]};
     } else {
-      return u_reg[bank];
+      return val<U_WIDTH>{u_reg[bank]};
     }
   }
 
@@ -401,9 +432,9 @@ public:
     if constexpr (SHARED_U && !U_STOR_FF) {
       shared_u_ram[stage].write(index, u);
     } else if constexpr (SHARED_U && U_STOR_FF) {
-      u_ff[0][index] = u;
+      write_u_ff(0, index, u);
     } else if constexpr (!SHARED_U && U_STOR_FF) {
-      u_ff[bank][index] = u;
+      write_u_ff(bank, index, u);
     }
     // When !SHARED_U && !U_STOR_FF, u is already packed in bank entry
   }
