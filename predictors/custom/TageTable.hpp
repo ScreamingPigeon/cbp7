@@ -5,7 +5,7 @@
 
 using namespace hcm;
 
-// Constexpr helper
+// Constexpr helper (kept for backward compatibility with Tage.hpp)
 constexpr size_t clog2(std::uint64_t n) {
   int r = 0;
   std::uint64_t v = 1;
@@ -16,107 +16,196 @@ constexpr size_t clog2(std::uint64_t n) {
   return r;
 }
 
-/* TODO:
- * I need to implement a parameterized LSFR to do
- * dynamic threshold probabilistic decay
- */
+// Empty type for conditional member elimination
+struct EmptyMember {
+  EmptyMember() = default;
+  EmptyMember(const char *) {}
+};
 
-template <u64 TABLE_SIZE = 64, u64 TABLE_HIST = 64, u64 TAG_WIDTH = 7,
-          u64 CTR_WIDTH = 3, u64 U_WIDTH = 2, u64 PRED_BLK_SIZE = 8,
-          u64 DECAY_CTR = 1024, bool EN_N_BLK_RD = true>
+// Default u-bit reset functor for FF mode
+// Mode 0: reset to zero
+// Mode 1: right shift by 1
+// Mode 2: saturating decrement by 1
+struct DefaultResetFn {
+  static constexpr u64 MODE_BITS = 2;
+
+  template <u64 W> static val<W> apply(val<W> u, val<MODE_BITS> mode) {
+    auto shifted = u >> hard<1>{};
+    auto decremented =
+        select(u == hard<0>{}, val<W>{0}, val<W>{u - 1});
+    return select(mode == hard<0>{}, val<W>{0},
+                  select(mode == hard<1>{}, shifted, decremented));
+  }
+};
+
+// ============================================================================
+// TageTable: parameterized TAGE tagged table component
+//
+// One instance per table in the TAGE hierarchy. The predictor holds N
+// instances and handles all cross-table logic (match priority, allocation,
+// u-bit epoch triggers). The table is a banked RAM wrapper with optional
+// register caching — no fold, no pipeline, no timing awareness.
+//
+// The predictor owns: fold registers, index/tag computation, ahead pipeline
+// buffering, path/XB management, and all cross-table logic. It passes
+// pre-computed index, tag, and bank index to the table.
+//
+// See agent/tagetable_plan.md for full design rationale.
+// ============================================================================
+
+template <
+    u64 TABLE_SIZE = 1024,   // entries per bank (power of 2, >= 2)
+    u64 TABLE_HIST = 64,     // history length (not used by table; predictor
+                             //   uses for fold computation)
+    u64 TAG_WIDTH = 11,      // tag width in bits
+    u64 CTR_WIDTH = 3,       // prediction counter width (embeds hysteresis)
+    u64 U_WIDTH = 1,         // useful counter width
+    u64 N = 4,               // max branches per cycle = predictions per block
+    u64 NUM_BANKS = 1,       // branch-slot banks; BPB = N / NUM_BANKS
+    bool USE_AHEAD = false,  // 1-ahead pipelining; doubles physical banks
+    bool SHARED_TAG = true,  // share one tag across branch-slot banks
+    bool SHARED_U = true,    // share one u-bit across branch-slot banks
+    bool U_STOR_FF = true,   // true = u-bits in flip-flops, false = u-bits in SRAM
+    u64 DECAY_CTR = 1024,    // probabilistic decay period (U_STOR_FF=false only)
+    typename ResetFn = DefaultResetFn, // u-bit reset functor (U_STOR_FF=true only)
+    bool USE_FF_CACHE = false // cache SRAM reads in FFs for block reuse
+    >
 class TageTable {
 
-  static constexpr u64 BITS_PER_INST = CTR_WIDTH;
-  static constexpr u64 BITS_PER_ENTRY =
-      TAG_WIDTH + PRED_BLK_SIZE * BITS_PER_INST + U_WIDTH;
+  // ======== Computed Constants ========
 
 public:
-  TageTable() {}
-  ~TageTable() {}
+  static constexpr u64 bpb = N / NUM_BANKS;
 
-  auto newRead(val<clog2(TABLE_SIZE)> idx, val<TAG_WIDTH> tag,
-               val<clog2(PRED_BLK_SIZE)> slot_idx) {
-    // Read entry from RAM
-    val<BITS_PER_ENTRY> entry = table_ram.read(idx);
-
-    // Split entry into components (LSB to MSB): u || counters || tag
-    auto [u_bits, ctr_bits_combined, tag_bits] =
-        split<U_WIDTH, PRED_BLK_SIZE * CTR_WIDTH, TAG_WIDTH>(entry);
-
-    // Store index and tag
-    idx_reg = idx;
-    tag_reg = tag;
-
-    // Store u-bit
-    u_reg = u_bits;
-
-    // Extract and store individual counters
-    // Counter layout: ctr_regs[0] at LSB, ctr_regs[PRED_BLK_SIZE-1] at MSB
-    arr<val<CTR_WIDTH>, PRED_BLK_SIZE> ctrs;
-    static_loop<PRED_BLK_SIZE>([&]<int I>() {
-      constexpr u64 shift_amt = I * CTR_WIDTH;
-      val<PRED_BLK_SIZE * CTR_WIDTH> shifted =
-          ctr_bits_combined >> hard<shift_amt>{};
-      ctrs[I] = shifted; // Store in val array for return
-                         // Hopefully, the wires for I != slot_idx are opted out
-      ctr_regs[I] = shifted; // Cache in register for reuse
-    });
-
-    // Check if tags match
-    hit = (tag_bits == tag);
-
-    // Return from SRAM read result (not register) with fo2
-    if (EN_N_BLK_RD)
-      return ctrs.select(slot_idx).fo2();
-  }
-  auto reuseRead(val<clog2(PRED_BLK_SIZE)> slot_idx) {
-    return ctr_regs[slot_idx];
-  }
-
-  auto writeReg(val<BITS_PER_INST> new_data,
-                val<clog2(PRED_BLK_SIZE)> slot_idx) {
-    ctr_regs[slot_idx] = new_data;
-  }
-
-  void updateBlock(val<1> use_regs, val<TAG_WIDTH> tag,
-                   val<BITS_PER_ENTRY> new_entry) {
-    // Build entry from registers: tag_reg || ctr_regs || u_reg
-    auto ctr_bits = ctr_regs.concat();
-    val<BITS_PER_ENTRY> reg_entry = concat(u_reg, ctr_bits, tag_reg);
-
-    // Select between reg_entry and new_entry based on use_regs
-    val<BITS_PER_ENTRY> entry_to_write = select(use_regs, reg_entry, new_entry);
-
-    // Write to RAM
-    table_ram.write(idx_reg, entry_to_write);
-  }
-
-  auto getUsefulness() { return u_reg; }
-  auto getHit() { return hit; }
-
-  auto setThreshold() {
-    // TODO: Let the predictor set the new
-    // threshold for decrementing U
-  }
+  static constexpr u64 table_size = TABLE_SIZE;
+  static constexpr u64 table_hist = TABLE_HIST;
+  static constexpr u64 tag_width = TAG_WIDTH;
+  static constexpr u64 ctr_width = CTR_WIDTH;
+  static constexpr u64 u_width = U_WIDTH;
+  static constexpr u64 n_branches = N;
+  static constexpr u64 num_banks = NUM_BANKS;
+  static constexpr bool use_ahead = USE_AHEAD;
+  static constexpr bool shared_tag = SHARED_TAG;
+  static constexpr bool shared_u = SHARED_U;
+  static constexpr bool use_ff_cache = USE_FF_CACHE;
 
 private:
-  // Instantiate the Registers for caching
-  hcm::ram<val<BITS_PER_ENTRY>, TABLE_SIZE> table_ram;
+  static constexpr u64 BPB = bpb;
+  static constexpr u64 AHEAD_FACTOR = USE_AHEAD ? 2 : 1;
+  static constexpr u64 PHYS_BANKS = NUM_BANKS * AHEAD_FACTOR;
+  static constexpr u64 IDX_BITS = clog2(TABLE_SIZE);
 
-  // Whether currently cached entry is a hit or not
-  reg<1> hit;
+  // Per-bank SRAM entry composition
+  // Counters are always present. Tag and U are optionally packed per-bank.
+  static constexpr u64 CTR_BITS = BPB * CTR_WIDTH;
+  static constexpr u64 BANK_TAG_BITS = SHARED_TAG ? 0 : TAG_WIDTH;
+  static constexpr u64 BANK_U_BITS =
+      (!SHARED_U && !U_STOR_FF) ? U_WIDTH : 0;
+  static constexpr u64 BANK_ENTRY_WIDTH =
+      CTR_BITS + BANK_TAG_BITS + BANK_U_BITS;
 
-  // Tag and index of currently cached entry
-  reg<TAG_WIDTH> tag_reg;
-  reg<clog2(TABLE_SIZE)> idx_reg;
+  // Result register counts (depends on sharing mode)
+  static constexpr u64 TAG_REG_COUNT = SHARED_TAG ? 1 : NUM_BANKS;
+  static constexpr u64 U_REG_COUNT = SHARED_U ? 1 : NUM_BANKS;
+  static constexpr u64 HIT_REG_COUNT = SHARED_TAG ? 1 : NUM_BANKS;
 
-  // U/CTR of currently cached entries
-  reg<U_WIDTH> u_reg;
-  arr<reg<CTR_WIDTH>, PRED_BLK_SIZE> ctr_regs;
+  // Counter cache depth per bank
+  static constexpr u64 CACHED_CTRS = USE_FF_CACHE ? BPB : 1;
 
-  auto decrementU() {
-    // TODO: If tag is a miss, compute probabilistic decay
-    // if greater than threshold, return Ureg decrement.
-    // Invoke inside updateBlock, so we knowreplace reg_entry
-  };
+  // U-bit FF array count
+  static constexpr u64 U_FF_ARRAYS = SHARED_U ? 1 : NUM_BANKS;
+
+  // ======== Static Constraints ========
+
+  static_assert(TABLE_SIZE >= 2,
+                "TABLE_SIZE must be at least 2");
+  static_assert(std::has_single_bit(TABLE_SIZE),
+                "TABLE_SIZE must be power of 2");
+  static_assert(N > 0,
+                "Must predict at least one branch");
+  static_assert(NUM_BANKS > 0,
+                "Must have at least one bank");
+  static_assert(N % NUM_BANKS == 0,
+                "N must be divisible by NUM_BANKS");
+  static_assert(!SHARED_TAG || SHARED_U,
+                "Per-bank U (SHARED_U=false) requires per-bank tags "
+                "(SHARED_TAG=false)");
+  static_assert(!USE_FF_CACHE || BPB > 1,
+                "FF caching requires BPB > 1 (multiple branches per bank)");
+  static_assert(CTR_WIDTH > 0,
+                "Counter width must be positive");
+  static_assert(TAG_WIDTH > 0,
+                "Tag width must be positive");
+  static_assert(U_WIDTH > 0,
+                "U-bit width must be positive");
+
+  // ======== SRAM Storage ========
+
+  // Per-bank entry RAM
+  // Entry layout (MSB to LSB) depends on SHARED_TAG and U_STOR_FF:
+  //   SHARED_TAG=true,  SHARED_U=true  or FF: [ctr[BPB-1]|...|ctr[0]]
+  //   SHARED_TAG=true,  SHARED_U=false, SRAM: [ctr[BPB-1]|...|ctr[0]|u]
+  //   SHARED_TAG=false, SHARED_U=true  or FF: [tag|ctr[BPB-1]|...|ctr[0]]
+  //   SHARED_TAG=false, SHARED_U=false, SRAM: [tag|ctr[BPB-1]|...|ctr[0]|u]
+  //
+  // PHYS_BANKS = NUM_BANKS * AHEAD_FACTOR
+  // Ahead stage s uses banks [s*NUM_BANKS .. (s+1)*NUM_BANKS - 1]
+  hcm::ram<val<BANK_ENTRY_WIDTH>, TABLE_SIZE> bank_ram[PHYS_BANKS]{"bank"};
+
+  // Shared tag RAM: one per ahead stage (only when SHARED_TAG=true)
+  // When SHARED_TAG=false, tags are packed in bank_ram entries.
+  std::conditional_t<SHARED_TAG,
+      hcm::ram<val<TAG_WIDTH>, TABLE_SIZE>,
+      EmptyMember> shared_tag_ram[AHEAD_FACTOR]{"stag"};
+
+  // Shared U-bit RAM: one per ahead stage
+  // Only when SHARED_U=true AND u-bits in SRAM.
+  // When SHARED_U=false, u packed in bank_ram. When U_STOR_FF, u in FFs.
+  std::conditional_t<(SHARED_U && !U_STOR_FF),
+      hcm::ram<val<U_WIDTH>, TABLE_SIZE>,
+      EmptyMember> shared_u_ram[AHEAD_FACTOR]{"su"};
+
+  // ======== Flip-Flop Storage ========
+
+  // U-bit flip-flops (only when U_STOR_FF=true)
+  // SHARED_U=true:  1 array of TABLE_SIZE entries
+  // SHARED_U=false: NUM_BANKS arrays of TABLE_SIZE entries each
+  std::conditional_t<U_STOR_FF,
+      arr<reg<U_WIDTH>, TABLE_SIZE>,
+      EmptyMember> u_ff[U_FF_ARRAYS];
+
+  // ======== Result / Cache Registers ========
+  // These hold the results of the most recent read for accessor methods
+  // and for write-back. When USE_FF_CACHE=true, counter regs also serve
+  // as a block-level cache for reuseRead().
+
+  // Cached index for write-back
+  reg<IDX_BITS> idx_reg;
+
+  // Tag result: stored tags from read (for accessor and write-back)
+  // SHARED_TAG=true:  1 register
+  // SHARED_TAG=false: NUM_BANKS registers
+  reg<TAG_WIDTH> tag_reg[TAG_REG_COUNT];
+
+  // Hit result: tag comparison results
+  // SHARED_TAG=true:  1 register (all banks share hit/miss)
+  // SHARED_TAG=false: NUM_BANKS registers (per-bank hit/miss)
+  reg<1> hit_reg[HIT_REG_COUNT];
+
+  // U-bit result
+  // SHARED_U=true:  1 register
+  // SHARED_U=false: NUM_BANKS registers
+  reg<U_WIDTH> u_reg[U_REG_COUNT];
+
+  // Counter result / cache registers
+  // USE_FF_CACHE=true:  BPB counters per bank (full block cache for reuse)
+  // USE_FF_CACHE=false: 1 counter per bank (current read result only)
+  arr<reg<CTR_WIDTH>, CACHED_CTRS> ctr_regs[NUM_BANKS];
+
+public:
+  TageTable() = default;
+  ~TageTable() = default;
+
+  // Phase 2: read(), reuseRead(), write(), accessors
+  // Phase 2: reset_u() for FF mode
 };
