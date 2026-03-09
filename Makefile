@@ -40,8 +40,8 @@ help:
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
 	@echo "  make trace-analyze    Build trace analysis tool"
-	@echo "  make run-trace-analyze Run trace analyzer on TRACE"	
-  @echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
+	@echo "  make run-trace-analyze Run trace analyzer on TRACE"
+	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
 	@echo "  make clean                  Remove generated build artifacts"
 	@echo
 	@echo "Variables you can override:"
