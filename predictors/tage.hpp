@@ -273,66 +273,6 @@ struct tage : predictor {
     num_branch++;
   }
 
-  void update_cycle(instruction_info &block_end_info) {
-    val<1> &mispredict = block_end_info.is_mispredict;
-    val<64> &next_pc = block_end_info.next_pc;
-    // updates for all conditional branches in the predicted block
-    if (num_branch == 0) {
-      // no conditional branch in this block
-      val<1> line_end = block_entry >> (LINEINST - block_size);
-      // update global history if previous block ended on a mispredicted
-      // not-taken branch (we are still in the same line, this is the last
-      // chunk) or if the block ends before the line boundary (unconditional
-      // jump)
-      execute_if(~true_block | ~line_end.fo1(), [&]() {
-        next_pc.fanout(hard<2>{});
-        global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc >> 2};
-        gfolds.update(val<PATHBITS>{next_pc >> 2});
-        true_block = 1;
-      });
-      return; // stop here
-    }
-    mispredict.fanout(hard<NUMG + 2>{});
-    val<1> correct_pred = ~mispredict;
-    correct_pred.fanout(hard<NUMG + 2>{});
-    index1.fanout(hard<LINEINST * 3>{});
-    p2.fanout(hard<2>{});
-    bindex.fanout(hard<LINEINST * 3>{});
-    gindex.fanout(hard<4>{});
-    htag.fanout(hard<3>{});
-    readb.fanout(hard<2>{});
-    readt.fanout(hard<4>{});
-    readc.fanout(hard<2>{});
-    match1.fanout(hard<3>{});
-    match2.fanout(hard<2>{});
-    pred1.fanout(hard<2>{});
-    pred2.fanout(hard<2 + NUMG>{});
-    branch_offset.fanout(hard<LINEINST + NUMG + 1>{});
-    branch_dir.fanout(hard<2>{});
-    gfolds.fanout(hard<2>{});
-#ifdef USE_META
-    meta.fanout(hard<2>{});
-#endif
-    val<LOGLINEINST> last_offset = branch_offset[num_branch - 1];
-    last_offset.fanout(hard<4 * NUMG + 2>{});
-
-    u64 update_valid = (u64(1) << num_branch) - 1;
-    arr<val<LINEINST>, LINEINST> update_mask = [&](u64 offset) {
-      arr<val<1>, LINEINST> match_offset = [&](u64 i) {
-        return branch_offset[i] == offset;
-      };
-      return match_offset.fo1().concat() & update_valid;
-    };
-    update_mask.fanout(hard<2>{});
-
-    arr<val<1>, LINEINST> is_branch = [&](u64 offset) {
-      return update_mask[offset] != hard<0>{};
-    };
-    is_branch.fanout(hard<5>{});
-
-    val<LINEINST> branch_mask = is_branch.concat();
-    branch_mask.fanout(hard<2>{});
-
     void update_cycle(instruction_info &block_end_info)
     {
         val<1> &mispredict = block_end_info.is_mispredict;

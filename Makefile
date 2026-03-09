@@ -15,6 +15,10 @@ PROFILE_WARN_FLAGS := -Wall -Wextra -pedantic -Wno-deprecated-declarations -Wno-
 EXTRA_COMMON_FLAGS ?=
 EXTRA_CBP_FLAGS ?=
 
+# for trace analysis
+TRACE_DIR := trace_files
+TRACE_READER := $(TRACE_DIR)/trace_reader.hpp
+
 -include $(PREDICTOR_MK)
 PREDICTOR_TYPE ?= tage<>
 TRACE ?= ./gcc_test_trace.gz
@@ -64,14 +68,14 @@ predictor-config: $(PREDICTOR_MK)
 $(PREDICTOR_MK): scripts/gen_predictor_config.py $(PARAMS_FILE) | $(BUILD_DIR)
 	$(PYTHON) scripts/gen_predictor_config.py --input $(PARAMS_FILE) --output $@
 
-cbp: cbp.cpp cbp.hpp branch_predictor.hpp trace_reader.hpp harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK)
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
+cbp: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
 
-reference: reference.cpp trace_reader.hpp seznec_cbp2025.h
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -o $@ reference.cpp -lz
+reference: reference.cpp $(TRACE_READER) seznec_cbp2025.h
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -Itrace_files -o $@ reference.cpp -lz
 
 trace-analyze: trace_files/trace_analyzer.cpp trace_files/trace_reader.hpp
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -o $@ trace_files/trace_analyzer.cpp -lz
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ trace_files/trace_analyzer.cpp -lz
 
 run-cbp: cbp
 	./cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
@@ -82,11 +86,8 @@ run-reference: reference
 run-trace-analyze: trace-analyze | out
 	./trace-analyze $(TRACE) $(REGION_SHIFT) | tee out/trace_analysis.txt
 
-out:
-	mkdir -p $@
-
-out/cbp-profile: cbp_profile.cpp cbp.hpp branch_predictor.hpp trace_reader.hpp harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK) | out
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) -o $@ cbp_profile.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)' -DENABLE_REGION_PROFILING
+out/cbp-profile: cbp_profile.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK) | out
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) -Itrace_files -o $@ cbp_profile.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)' -DENABLE_REGION_PROFILING
 
 cbp-profile-acc: out/cbp-profile
 	./out/cbp-profile --format csv --mode acc --no-score $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_acc.txt
@@ -106,6 +107,5 @@ cbp-profile-analyze-regions: out/cbp-profile
 
 clean:
 	rm -f cbp reference
-
 	rm -f $(PREDICTOR_MK)
 	rm -rf out/*
