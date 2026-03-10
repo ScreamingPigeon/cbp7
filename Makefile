@@ -105,6 +105,9 @@ cbp-profile-analyze-regions: out/cbp-profile
 	./out/cbp-profile --format csv --mode analyze --profile --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
 	@echo "=== Per-Function Analysis with Regions ===" && tail -40 out/profile_analyze.txt
 
+test-tage-compile: tests/test_tage_compile.cpp predictors/custom/Tage.hpp predictors/custom/TageTable.hpp harcom.hpp
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz
+
 test-tagetable-compile: tests/test_tagetable_compile.cpp predictors/custom/TageTable.hpp harcom.hpp
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz
 
@@ -115,6 +118,6 @@ test-tagetable-sweep: tests/test_tagetable_sweep.cpp predictors/custom/TageTable
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
 
 clean:
-	rm -f cbp reference test-tagetable test-tagetable-compile test-tagetable-sweep
+	rm -f cbp reference test-tage-compile test-tagetable test-tagetable-compile test-tagetable-sweep
 	rm -f $(PREDICTOR_MK)
 	rm -rf out/*
