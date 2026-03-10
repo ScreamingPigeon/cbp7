@@ -284,9 +284,11 @@ F = u-bit storage (0=SRAM, 1=FF). Reuse = reuseRead latency, - = no FF cache.
 
 ---
 
-## Phase 4: Integration with Reference TAGE
+## Phase 4: Integration with Reference TAGE — IN PROGRESS
 
 **Goal**: Drop TageTable into the reference `predictors/tage.hpp` and verify no accuracy regression.
+
+**Status**: `predictors/tage_tagetable.hpp` created and compiles clean. Runtime crash: `array bound exceeded (8>=8)` — an `arr<..., NUMG=8>` accessed at index 8. Not yet debugged.
 
 ### 4.1 Create integration branch
 - Copy `predictors/tage.hpp` → `predictors/tage_tagetable.hpp`
