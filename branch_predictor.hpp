@@ -10,6 +10,7 @@
 #include "predictors/gshareN_ahead.hpp"
 #include "predictors/tutorial/tutorial.hpp"
 #include "predictors/experiment_perceptron.hpp"
+#include "predictors/custom/Tage.hpp"
 
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args>
