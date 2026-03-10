@@ -79,14 +79,12 @@ struct experiment_perceptron : predictor
     reg<LINEINST> block_entry;
 
     // ---- RAMs ----
-    // P2 weight tables
+    region P2_TABLES;
     ram<val<WBITS, i64>, (1 << index2_bits)> wtable[NTABLES][LINEINST]{{"P2 weight"}};
-    // auxiliary feature weights
     ram<val<AUX_WBITS, i64>, (1 << aux_index_bits)> lwtable[LINEINST]{"P2 aux weight"};
 
-    // P1 prediction bits
+    region P1_TABLES;
     ram<val<1>, (1 << index1_bits)> table1_pred[LINEINST]{"P1 pred"};
-    // P1 hysteresis bits
     zone UPDATE_ONLY;
     ram<val<1>, (1 << index1_bits)> table1_hyst[LINEINST]{"P1 hyst"};
 
@@ -139,7 +137,8 @@ struct experiment_perceptron : predictor
     // P2 hashed perceptron
     val<1> predict2(val<64> inst_pc)
     {
-        val<index2_bits> lineaddr = inst_pc.fo1() >> LOGLB;
+        inst_pc.fanout(hard<2>{});
+        val<index2_bits> lineaddr = inst_pc >> LOGLB;
         val<index2_bits> path_mix = [&]() -> val<index2_bits>
         {
             if constexpr (PATHBITS <= index2_bits)
@@ -148,7 +147,7 @@ struct experiment_perceptron : predictor
             }
             return path_history.make_array(val<index2_bits>{}).fold_xor();
         }();
-        val<aux_index_bits> aux_lineaddr = inst_pc.fo1() >> LOGLB;
+        val<aux_index_bits> aux_lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<NTABLES + 1>{});
         aux_lineaddr.fanout(hard<LINEINST + 1>{});
         gfolds.fanout(hard<3>{});
@@ -220,7 +219,7 @@ struct experiment_perceptron : predictor
             }
             else
             {
-                yout[offset] = base_sum + val<YBITS, i64>{read_lw[offset]};
+                yout[offset] = base_sum + read_lw[offset];
             }
         }
         yout.fanout(hard<2>{});
@@ -360,6 +359,9 @@ struct experiment_perceptron : predictor
         train_mask.fanout(hard<NTABLES + 2>{});
         val<LINEINST> mispred_mask = branch_mask & ~correct_mask;
         mispred_mask.fanout(hard<2>{});
+        auto train = train_mask.make_array(val<1>{});
+        auto mispred = mispred_mask.make_array(val<1>{});
+        train.fanout(hard<2>{});
 
         // ---- P1 (gshare) update ----
         // did P1 and P2 disagree?
@@ -381,35 +383,44 @@ struct experiment_perceptron : predictor
         need_extra_cycle(extra_cycle.fo1());
 
         // update P1 prediction if P1 and P2 disagree and hysteresis bit is weak
-        execute_if(p1_weak.fo1().concat(), [&](u64 offset)
-                   { table1_pred[offset].write(index1, p2_split[offset]); });
+        for (u64 offset = 0; offset < LINEINST; offset++)
+        {
+            execute_if(p1_weak[offset], [&]()
+                       { table1_pred[offset].write(index1, p2_split[offset]); });
+        }
         // update P1 hysteresis for executed branches
-        execute_if(branch_mask, [&](u64 offset)
-                   { table1_hyst[offset].write(index1, ~disagree[offset]); });
+        for (u64 offset = 0; offset < LINEINST; offset++)
+        {
+            execute_if(is_branch[offset], [&]()
+                       { table1_hyst[offset].write(index1, ~disagree[offset]); });
+        }
 
         // ---- P2 (hashed perceptron) update ----
         // weight update
-        execute_if(train_mask, [&](u64 offset)
-                   {
-            for (u64 i=0; i<NTABLES; i++) {
-                wtable[i][offset].write(index2[i], update_ctr(readw[offset][i], ~branch_taken[offset]));
-            } });
+        for (u64 offset = 0; offset < LINEINST; offset++)
+        {
+            execute_if(train[offset], [&]()
+                       {
+                for (u64 i = 0; i < NTABLES; i++) {
+                    wtable[i][offset].write(index2[i], update_ctr(readw[offset][i], ~branch_taken[offset]));
+                } });
+        }
         // Auxiliary feature learns only from hard errors.
         if constexpr (AUX_TRAIN_WEAK)
         {
-            execute_if(train_mask, [&](u64 offset)
-                       {
-                if (offset < AUX_ACTIVE) {
-                    lwtable[offset].write(lindex2[offset], update_ctr(read_lw[offset], ~branch_taken[offset]));
-                } });
+            for (u64 offset = 0; offset < AUX_ACTIVE; offset++)
+            {
+                execute_if(train[offset], [&]()
+                           { lwtable[offset].write(lindex2[offset], update_ctr(read_lw[offset], ~branch_taken[offset])); });
+            }
         }
         else
         {
-            execute_if(mispred_mask, [&](u64 offset)
-                       {
-                if (offset < AUX_ACTIVE) {
-                    lwtable[offset].write(lindex2[offset], update_ctr(read_lw[offset], ~branch_taken[offset]));
-                } });
+            for (u64 offset = 0; offset < AUX_ACTIVE; offset++)
+            {
+                execute_if(mispred[offset], [&]()
+                           { lwtable[offset].write(lindex2[offset], update_ctr(read_lw[offset], ~branch_taken[offset])); });
+            }
         }
 
         // update packed counter
