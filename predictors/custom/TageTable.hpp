@@ -308,15 +308,34 @@ public:
 
   // ======== Read Interface ========
 
+  // Compute index fanout: idx_reg + bank_ram reads + optional shared RAMs/FFs
+  static constexpr u64 IDX_READ_FANOUT =
+      1 // idx_reg
+      + NUM_BANKS // bank_ram reads
+      + (SHARED_TAG ? 1 : 0) // shared_tag_ram
+      + (SHARED_U && U_STOR_FF ? 1 : 0) // u_ff select (shared)
+      + (SHARED_U && !U_STOR_FF ? 1 : 0) // shared_u_ram
+      + (!SHARED_U && U_STOR_FF ? NUM_BANKS : 0); // u_ff selects (per-bank)
+
+  // Compare tag fanout: 1 comparison per hit_reg written
+  static constexpr u64 TAG_CMP_FANOUT = SHARED_TAG ? 1 : NUM_BANKS;
+
   // Read all banks at index, compare tags, cache results.
   // stage: ahead stage index (0 when USE_AHEAD=false)
   void read(val<IDX_BITS> index, val<TAG_WIDTH> compare_tag,
             u64 stage = 0) {
+    // Fanout declarations for multi-use vals
+    index.fanout(hard<IDX_READ_FANOUT>{});
+    if constexpr (TAG_CMP_FANOUT > 1) {
+      compare_tag.fanout(hard<TAG_CMP_FANOUT>{});
+    }
+
     idx_reg = index;
 
     // Read shared tag if applicable
     if constexpr (SHARED_TAG) {
       val<TAG_WIDTH> stored_tag = shared_tag_ram[stage].read(index);
+      stored_tag.fanout(hard<2>{}); // tag_reg write + comparison
       tag_reg[0] = stored_tag;
       hit_reg[0] = (stored_tag == compare_tag);
     }
@@ -327,11 +346,15 @@ public:
     }
 
     // Read each bank: unpack entries, extract counters and tags.
-    // For per-bank SRAM u, we re-read the entry to extract u bits after
-    // tag comparison so we can apply decay based on hit/miss.
     u64 bank_base = stage * NUM_BANKS;
     for (u64 b = 0; b < NUM_BANKS; b++) {
       val<BANK_ENTRY_WIDTH> entry = bank_ram[bank_base + b].read(index);
+
+      // Entry fanout: unpack + optional u extraction for per-bank SRAM u
+      if constexpr (!SHARED_U && !U_STOR_FF) {
+        entry.fanout(hard<2>{}); // unpack + extract_u
+      }
+
       val<CTR_BITS> ctr_bits = unpack_bank_entry(entry, b);
       extract_counters(ctr_bits, b);
 
@@ -348,6 +371,7 @@ public:
       // Per-bank SRAM u: extract u bits, apply decay, write u_reg once
       if constexpr (!SHARED_U && !U_STOR_FF) {
         val<U_WIDTH> u_val = extract_u_from_entry(entry);
+        u_val.fanout(hard<3>{}); // comparison + subtraction + select-passthrough
         val<1> do_decay = ~hit_reg[b] & should_decay();
         u_reg[b] = select(do_decay,
             select(u_val == hard<0>{}, val<U_WIDTH>{0},
@@ -359,6 +383,7 @@ public:
     // Shared SRAM u-bit: read, apply probabilistic decay on miss, write once.
     if constexpr (SHARED_U && !U_STOR_FF) {
       val<U_WIDTH> u_val = shared_u_ram[stage].read(index);
+      u_val.fanout(hard<3>{}); // comparison + subtraction + select-passthrough
       val<1> do_decay = ~hit_reg[0] & should_decay();
       u_reg[0] = select(do_decay,
           select(u_val == hard<0>{}, val<U_WIDTH>{0},
@@ -413,12 +438,38 @@ public:
 
   // ======== Write Interface ========
 
+  // Compute write fanout for index, tag, u
+  static constexpr u64 IDX_WRITE_FANOUT =
+      1 // bank_ram write
+      + (SHARED_TAG ? 1 : 0) // shared_tag_ram write
+      + (SHARED_U && !U_STOR_FF ? 1 : 0) // shared_u_ram write
+      + (U_STOR_FF ? 1 : 0); // write_u_ff decode comparisons
+
+  static constexpr u64 TAG_WRITE_FANOUT =
+      1 // pack_bank_entry
+      + (SHARED_TAG ? 1 : 0); // shared_tag_ram write
+
+  static constexpr u64 U_WRITE_FANOUT =
+      1 // pack_bank_entry or u_ff write
+      + ((SHARED_U && !U_STOR_FF) || U_STOR_FF ? 1 : 0); // separate u storage
+
   // Write a single bank entry back to SRAM.
   // stage: ahead stage index (0 when USE_AHEAD=false)
   void write(val<IDX_BITS> index, u64 bank, u64 stage,
              val<TAG_WIDTH> tag,
              val<CTR_BITS> ctr_bits,
              val<U_WIDTH> u) {
+    // Fanout declarations
+    if constexpr (IDX_WRITE_FANOUT > 1) {
+      index.fanout(hard<IDX_WRITE_FANOUT>{});
+    }
+    if constexpr (TAG_WRITE_FANOUT > 1) {
+      tag.fanout(hard<TAG_WRITE_FANOUT>{});
+    }
+    if constexpr (U_WRITE_FANOUT > 1) {
+      u.fanout(hard<U_WRITE_FANOUT>{});
+    }
+
     u64 phys_bank = stage * NUM_BANKS + bank;
     val<BANK_ENTRY_WIDTH> entry = pack_bank_entry(ctr_bits, tag, u);
     bank_ram[phys_bank].write(index, entry);

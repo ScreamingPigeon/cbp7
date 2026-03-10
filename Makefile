@@ -111,7 +111,10 @@ test-tagetable-compile: tests/test_tagetable_compile.cpp predictors/custom/TageT
 test-tagetable: tests/test_tagetable.cpp predictors/custom/TageTable.hpp harcom.hpp
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
 
+test-tagetable-sweep: tests/test_tagetable_sweep.cpp predictors/custom/TageTable.hpp harcom.hpp
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
+
 clean:
-	rm -f cbp reference test-tagetable test-tagetable-compile
+	rm -f cbp reference test-tagetable test-tagetable-compile test-tagetable-sweep
 	rm -f $(PREDICTOR_MK)
 	rm -rf out/*

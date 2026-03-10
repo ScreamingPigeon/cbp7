@@ -755,6 +755,188 @@ void test_everything_combined() {
 }
 
 // ============================================================================
+// HARCOM Cost and Energy Exploration
+// ============================================================================
+void test_harcom_costs() {
+  SECTION("HARCOM Cost Exploration");
+
+  // Global costs (across ALL instantiated tables)
+  std::cout << "--- Global HARCOM costs (all 16 table instances) ---"
+            << std::endl;
+  std::cout << "Total storage bits: " << panel.storage() << std::endl;
+  std::cout << "Total transistors:  " << panel.transistors() << std::endl;
+  std::cout << "Total energy (fJ):  " << panel.energy_fJ() << std::endl;
+  std::cout << "Dynamic power (mW): " << panel.dyn_power_mW() << std::endl;
+  std::cout << "Static power (mW):  " << panel.sta_power_mW() << std::endl;
+}
+
+// Per-operation energy measurement: measure energy delta for a read and write
+void test_per_operation_energy() {
+  SECTION("Per-Operation Energy Measurement");
+
+  // Use t1 (basic config: 1024 entries, 11-bit tag, 3-bit ctr, shared tag/u)
+  constexpr u64 IDX = clog2(1024);
+  val<IDX> idx{99};
+  val<11> tag{0x555};
+  val<12> ctr{0b101010101010};
+  val<1> u{1};
+
+  // Measure write energy
+  f64 e_before = panel.energy_fJ();
+  t1.write(idx, 0, 0, tag, ctr, u);
+  f64 e_after_write = panel.energy_fJ();
+  hsu.next_cycle();
+
+  // Measure read energy
+  f64 e_before_read = panel.energy_fJ();
+  t1.read(idx, tag, 0);
+  f64 e_after_read = panel.energy_fJ();
+
+  std::cout << "--- t1 (basic: 1024x11/3/1, shared tag/u, FF u) ---"
+            << std::endl;
+  std::cout << "Write energy: " << (e_after_write - e_before) << " fJ"
+            << std::endl;
+  std::cout << "Read energy:  " << (e_after_read - e_before_read) << " fJ"
+            << std::endl;
+
+  // Read latency from accessor timing
+  t1.getHit(0).print("  Hit latency:     ");
+  t1.getCounter(0, 0).print("  Counter latency: ");
+  t1.getU(0).print("  U-bit latency:   ");
+
+  hsu.next_cycle();
+
+  // Measure for t4 (multi-bank: 256 entries, 4 banks, shared tag)
+  {
+    constexpr u64 IDX4 = clog2(256);
+    val<IDX4> idx4{20};
+    val<11> tag4{0x123};
+    val<6> ctr4{0b101010};
+    val<1> u4{0};
+
+    f64 e0 = panel.energy_fJ();
+    t4.write(idx4, 0, 0, tag4, ctr4, u4);
+    f64 e1 = panel.energy_fJ();
+    hsu.next_cycle();
+
+    f64 e2 = panel.energy_fJ();
+    t4.read(idx4, tag4, 0);
+    f64 e3 = panel.energy_fJ();
+
+    std::cout << "--- t4 (multibank: 256x11/3/1, 4 banks, shared tag) ---"
+              << std::endl;
+    std::cout << "Write energy: " << (e1 - e0) << " fJ" << std::endl;
+    std::cout << "Read energy:  " << (e3 - e2) << " fJ" << std::endl;
+    t4.getHit(0).print("  Hit latency:     ");
+    t4.getCounter(0, 0).print("  Counter latency: ");
+    hsu.next_cycle();
+  }
+
+  // Measure for t8 (SRAM u-bit: 64 entries, U_WIDTH=2, DECAY_CTR=1)
+  {
+    constexpr u64 IDX8 = clog2(64);
+    val<IDX8> idx8{10};
+    val<7> tag8{0x33};
+    val<3> ctr8{0b101};
+    val<2> u8{2};
+
+    f64 e0 = panel.energy_fJ();
+    t8.write(idx8, 0, 0, tag8, ctr8, u8);
+    f64 e1 = panel.energy_fJ();
+    hsu.next_cycle();
+
+    f64 e2 = panel.energy_fJ();
+    t8.read(idx8, tag8, 0);
+    f64 e3 = panel.energy_fJ();
+
+    std::cout << "--- t8 (SRAM u: 64x7/3/2, decay=1) ---" << std::endl;
+    std::cout << "Write energy: " << (e1 - e0) << " fJ" << std::endl;
+    std::cout << "Read energy:  " << (e3 - e2) << " fJ" << std::endl;
+    t8.getU(0).print("  U-bit latency:   ");
+    hsu.next_cycle();
+  }
+
+  // Measure for t16 (everything: ahead+multibank+cache+perbank)
+  {
+    constexpr u64 IDX16 = clog2(256);
+    val<IDX16> idx16{150};
+    val<11> tag16{0x3FF};
+    val<12> ctr16{0b110011001100};
+    val<1> u16{1};
+
+    f64 e0 = panel.energy_fJ();
+    t16.write(idx16, 0, 0, tag16, ctr16, u16);
+    f64 e1 = panel.energy_fJ();
+    hsu.next_cycle();
+
+    f64 e2 = panel.energy_fJ();
+    t16.read(idx16, tag16, 0);
+    f64 e3 = panel.energy_fJ();
+
+    std::cout << "--- t16 (everything: 256x11/3/1, ahead, 2 banks, "
+                 "cache, per-bank) ---"
+              << std::endl;
+    std::cout << "Write energy: " << (e1 - e0) << " fJ" << std::endl;
+    std::cout << "Read energy:  " << (e3 - e2) << " fJ" << std::endl;
+    t16.getHit(0).print("  Hit latency:     ");
+    t16.getHit(1).print("  Hit latency(b1): ");
+    t16.getCounter(0, 0).print("  Counter latency: ");
+    t16.getU(0).print("  U-bit latency:   ");
+
+    // Reuse read latency (FF only, should be much cheaper)
+    f64 e4 = panel.energy_fJ();
+    auto rv = t16.reuseRead(0, val<2>{1});
+    f64 e5 = panel.energy_fJ();
+    std::cout << "Reuse energy: " << (e5 - e4) << " fJ" << std::endl;
+    rv.print("  Reuse latency:   ");
+
+    hsu.next_cycle();
+  }
+}
+
+// ============================================================================
+// Cycle budget verification
+// ============================================================================
+void test_cycle_budget() {
+  SECTION("Cycle Budget Verification");
+
+  // read: 1 cycle (all banks in parallel)
+  u64 c0 = panel.cycle;
+  constexpr u64 IDX = clog2(1024);
+  t1.read(val<IDX>{1}, val<11>{0}, 0);
+  // No cycle consumed (combinational within one cycle)
+  CHECK(panel.cycle == c0);
+  hsu.next_cycle();
+
+  // write: 1 cycle
+  u64 c1 = panel.cycle;
+  t1.write(val<IDX>{1}, 0, 0, val<11>{0}, val<12>{0}, val<1>{0});
+  CHECK(panel.cycle == c1);
+  hsu.next_cycle();
+
+  // reuseRead: 0 extra cycles (FF only, no RAM)
+  constexpr u64 IDX6 = clog2(256);
+  t6.write(val<IDX6>{1}, 0, 0, val<11>{0}, val<12>{0}, val<1>{0});
+  hsu.next_cycle();
+  t6.read(val<IDX6>{1}, val<11>{0}, 0);
+  u64 c2 = panel.cycle;
+  auto rv = t6.reuseRead(0, val<2>{0});
+  CHECK(panel.cycle == c2); // no extra cycle
+  (void)rv;
+  hsu.next_cycle();
+
+  // reset_u: 0 cycles (combinational on FFs)
+  u64 c3 = panel.cycle;
+  t9.reset_u(val<2>{0});
+  CHECK(panel.cycle == c3);
+  hsu.next_cycle();
+
+  std::cout << "Cycle budget: read=0 extra, write=0 extra, "
+               "reuseRead=0 extra, reset_u=0 extra"
+            << std::endl;
+}
+
+// ============================================================================
 int main() {
   panel.make_floorplan();
 
@@ -774,6 +956,11 @@ int main() {
   test_timing_read_write_separation();
   test_u_sram_perbank_decay();
   test_everything_combined();
+
+  // Phase 3: HARCOM cost, energy, timing exploration
+  test_harcom_costs();
+  test_per_operation_energy();
+  test_cycle_budget();
 
   std::cout << "\n========================================" << std::endl;
   std::cout << "Results: " << pass_count << " passed, " << fail_count
