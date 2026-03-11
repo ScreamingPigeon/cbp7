@@ -350,11 +350,6 @@ public:
     for (u64 b = 0; b < NUM_BANKS; b++) {
       val<BANK_ENTRY_WIDTH> entry = bank_ram[bank_base + b].read(index);
 
-      // Entry fanout: unpack + optional u extraction for per-bank SRAM u
-      if constexpr (!SHARED_U && !U_STOR_FF) {
-        entry.fanout(hard<2>{}); // unpack + extract_u
-      }
-
       val<CTR_BITS> ctr_bits = unpack_bank_entry(entry, b);
       extract_counters(ctr_bits, b);
 
@@ -368,27 +363,15 @@ public:
         u_reg[b] = u_ff[b].select(index);
       }
 
-      // Per-bank SRAM u: extract u bits, apply decay, write u_reg once
+      // Per-bank SRAM u: extract raw value (decay deferred to update path)
       if constexpr (!SHARED_U && !U_STOR_FF) {
-        val<U_WIDTH> u_val = extract_u_from_entry(entry);
-        u_val.fanout(hard<3>{}); // comparison + subtraction + select-passthrough
-        val<1> do_decay = ~hit_reg[b] & should_decay();
-        u_reg[b] = select(do_decay,
-            select(u_val == hard<0>{}, val<U_WIDTH>{0},
-                   val<U_WIDTH>{u_val - 1}),
-            u_val);
+        u_reg[b] = extract_u_from_entry(entry);
       }
     }
 
-    // Shared SRAM u-bit: read, apply probabilistic decay on miss, write once.
+    // Shared SRAM u-bit: read raw value (decay deferred to update path).
     if constexpr (SHARED_U && !U_STOR_FF) {
-      val<U_WIDTH> u_val = shared_u_ram[stage].read(index);
-      u_val.fanout(hard<3>{}); // comparison + subtraction + select-passthrough
-      val<1> do_decay = ~hit_reg[0] & should_decay();
-      u_reg[0] = select(do_decay,
-          select(u_val == hard<0>{}, val<U_WIDTH>{0},
-                 val<U_WIDTH>{u_val - 1}),
-          u_val);
+      u_reg[0] = shared_u_ram[stage].read(index);
     }
   }
 
