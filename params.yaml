@@ -1,6 +1,6 @@
 # Predictor compile-time config used by `make cbp`.
 # Default: predictor + template_args list.
-predictor: gshare 
+predictor: gshareN_loop
 template_args: []
 
 # Build/profile options (YAML-first compile tuning)
@@ -12,7 +12,7 @@ sanitize: none
 defines: []
 extra_include_dirs: []
 
-trace: ./gcc_test_trace.gz
+trace: ./trace_files/gcc_test_trace.gz
 trace_name: test
 warmup: 1000000
 measure: 40000000

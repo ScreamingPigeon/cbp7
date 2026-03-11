@@ -9,6 +9,7 @@
 #include "predictors/gshareN_ahead.hpp"
 #include "predictors/tutorial/tutorial.hpp"
 #include "predictors/experiment_perceptron.hpp"
+#include "predictors/gshareN_loop.hpp"
 
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args>
@@ -19,6 +20,7 @@ using branch_predictor = PREDICTOR;
 #else
 // using branch_predictor = bimodal<>;
 // using branch_predictor = gshare<>;
-using branch_predictor = tage<>;
+// using branch_predictor = tage<>;
 // using branch_predictor = experiment_perceptron<>;
+using branch_predictor = gshareN_loop<>;
 #endif
