@@ -7,6 +7,7 @@
 
 using namespace hcm;
 
+
 // ============================================================================
 // Constexpr Helpers
 // ============================================================================
@@ -364,9 +365,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   // ======== Phase 2: Hash Functions (§2.1) ========
 
   // Compute bimodal index and per-table TAGE indexes.
-  // lineaddr must have fanout declared by caller.
   void compute_indexes(val<LINEADDR_BITS> lineaddr) {
     bindex = lineaddr;
+    bindex.fanout(hard<FETCH_WIDTH>{});
     for (u64 i = 0; i < NUM_TABLES; i++) {
       gindex[i] = lineaddr ^ gfolds.template get<0>(i);
     }
@@ -375,15 +376,16 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         gindex[i] = val<MAX_IDX_BITS>{gindex[i]} ^ val<MAX_IDX_BITS>{path_hist};
       }
     }
+    gindex.fanout(hard<2>{});
   }
 
   // Compute per-table hashed tags (the hash portion, without offset).
-  // lineaddr must have fanout declared by caller.
   void compute_tags(val<LINEADDR_BITS> lineaddr) {
     for (u64 i = 0; i < NUM_TABLES; i++) {
       htag[i] =
           val<MAX_HTAGBITS>{lineaddr}.reverse() ^ gfolds.template get<1>(i);
     }
+    htag.fanout(hard<2>{});
   }
 
   // ======== Phase 2: Table Read (§2.3) ========
@@ -393,15 +395,12 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   // Caller must set gindex, htag, bindex before calling (via §2.1).
   void read_tables() {
     // Fanout for multi-use registers
-    gindex.fanout(hard<100>{});
-    htag.fanout(hard<100>{});
-    bindex.fanout(hard<100>{});
 
     // Read bimodal tables (one per offset in the fetch block)
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       readb[offset] = bim[offset].read(bindex);
     }
-    readb.fanout(hard<100>{});
+    readb.fanout(hard<2>{});
 
     // Read each TAGE table via static_loop (tables are heterogeneous)
     static_loop<NUM_TABLES>([&]<u64 I>() {
@@ -418,20 +417,19 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       // Extract results into uniform-width registers
       readt[I] = std::get<I>(tables).getTag();
       val<CW> ctr = std::get<I>(tables).getCounter(0);
-      ctr.fanout(hard<100>{});
       readc[I] = ctr >> hard<CW - 1>{}; // MSB = prediction
       readh[I] =
           ctr & hard<(1ULL << (CW - 1)) - 1>{}; // lower bits = hysteresis only
       readu[I] = std::get<I>(tables).getU();
     });
+    readt.fanout(hard<FETCH_WIDTH + 1>{});
+    readc.fanout(hard<3>{});
+    readh.fanout(hard<2>{});
+    readu.fanout(hard<2>{});
 
     // Fanout for downstream use
-    readt.fanout(hard<100>{});
-    readc.fanout(hard<100>{});
-    readh.fanout(hard<100>{});
-    readu.fanout(hard<100>{});
     notumask = ~readu.concat();
-    notumask.fanout(hard<100>{});
+    notumask.fanout(hard<2>{});
   }
 
   // ======== Phase 2: Match Logic (§2.4) ========
@@ -444,11 +442,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // match vector is (NUM_TABLES+1) wide: bit 0..NUM_TABLES-1 = tables,
     // bit NUM_TABLES = bimodal (always matches as fallback).
     val<NUM_TABLES> gpreds = readc.concat();
-    gpreds.fanout(hard<100>{});
+    gpreds.fanout(hard<FETCH_WIDTH>{});
     arr<val<NUM_TABLES + 1>, FETCH_WIDTH> preds = [&](u64 offset) {
       return concat(readb[offset], gpreds);
     };
-    preds.fanout(hard<100>{});
+    preds.fanout(hard<2 * FETCH_WIDTH>{});
 
     if constexpr (BR_P_ENTRY == 1) {
       // BR_P_ENTRY=1: offset encoded in upper tag bits.
@@ -458,7 +456,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         return val<MAX_HTAGBITS>{readt[i]} == htag[i];
       };
       val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
-      htagcmp.fanout(hard<100>{});
+      htagcmp.fanout(hard<FETCH_WIDTH>{});
 
       static_loop<FETCH_WIDTH>([&]<u64 offset>() {
         arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
@@ -473,32 +471,31 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         return val<MAX_TAG_WIDTH>{readt[i]} == htag[i];
       };
       val<NUM_TABLES> tagcmp = tagcmp_split.fo1().concat();
-      tagcmp.fanout(hard<100>{});
       for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
         match[offset] = concat(val<1>{1}, tagcmp);
       }
     }
-    match.fanout(hard<100>{});
 
     // Longest match → provider prediction
+    match.fanout(hard<2>{});
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       match1[offset] = match[offset].one_hot();
     }
-    match1.fanout(hard<100>{});
+    match1.fanout(hard<3>{});
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
     }
-    pred1.fanout(hard<100>{});
+    pred1.fanout(hard<2>{});
 
     // Second longest match → alternate prediction
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       match2[offset] = (match[offset] ^ match1[offset]).one_hot();
     }
-    match2.fanout(hard<100>{});
+    match2.fanout(hard<2>{});
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
     }
-    pred2.fanout(hard<100>{});
+    pred2.fanout(hard<2>{});
   }
 
   // ======== Phase 2: Meta-prediction (§2.5) ========
@@ -512,29 +509,31 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       p2 = pred1.concat();
     } else {
       // Detect newly-allocated providers: weak hysteresis AND u=0
+      if constexpr (META_TABLE_SIZE_V == 0) {
+        meta_global.fanout(hard<2>{});
+      }
       arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
         return readh[i] == hard<0>{};
       };
       val<NUM_TABLES> coldctr = notumask & weakctr.fo1().concat();
-      coldctr.fanout(hard<100>{});
+      coldctr.fanout(hard<FETCH_WIDTH>{});
 
       // Read meta counter sign
       auto metasign = [&]() -> val<1> {
         if constexpr (META_TABLE_SIZE_V == 0) {
           // Global counter mode
-          meta_global.fanout(hard<100>{});
           return (meta_global[Base::METAPIPE - 1] >= hard<0>{});
         } else {
           // PC-indexed table mode — TODO: read meta_table in predict2
           return val<1>{0};
         }
       }();
-      metasign.fanout(hard<100>{});
+      metasign.fanout(hard<FETCH_WIDTH>{});
 
       for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
         newly_alloc[offset] = (match1[offset] & coldctr) != hard<0>{};
       }
-      newly_alloc.fanout(hard<100>{});
+      newly_alloc.fanout(hard<2>{});
 
       // altsel = metasign AND newly_alloc AND (altpred exists)
       arr<val<1>, FETCH_WIDTH> altsel = [&](u64 offset) {
@@ -542,13 +541,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                                  match2[offset] != hard<0>{}};
         return inputs.fo1().fold_and();
       };
-      altsel.fanout(hard<100>{});
 
       p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
              return select(altsel[offset], pred2[offset], pred1[offset]);
            }}.concat();
     }
-    p2.fanout(hard<100>{});
   }
 
   // ======== Phase 2: Allocation (§2.8) ========
@@ -567,8 +564,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   // that have u=0, then selects one with randomization.
   AllocResult allocate_entries(val<1> mispredict,
                                val<LOG_FETCH_WIDTH> last_offset) {
-    mispredict.fanout(hard<100>{});
-    last_offset.fanout(hard<100>{});
 
     // Find provider for the last (mispredicting) branch by full tag comparison
     arr<val<1>, NUM_TABLES> last_tagcmp = [&](int i) {
@@ -580,7 +575,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     };
     val<NUM_TABLES + 1> last_match1 =
         last_tagcmp.fo1().append(1).concat().one_hot();
-    last_match1.fanout(hard<100>{});
 
     // Post-provider mask: tables with longer history than provider
     // (one_hot - 1 gives all bits below the provider)
@@ -588,26 +582,23 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         mispredict.replicate(hard<NUM_TABLES>{}).concat();
     val<NUM_TABLES> postmask =
         mispmask.fo1() & val<NUM_TABLES>(last_match1 - 1);
-    postmask.fanout(hard<100>{});
 
     // Candidate = post-provider AND u=0
     val<NUM_TABLES> candallocmask = postmask & notumask;
-    candallocmask.fanout(hard<100>{});
 
     // Select one candidate with randomization.
     // Reverse so one_hot picks shortest-history candidate first,
     // then reverse back for table indexing.
     val<NUM_TABLES> collamask = candallocmask.reverse();
-    collamask.fanout(hard<100>{});
+    collamask.fanout(hard<2>{});
     val<NUM_TABLES> collamask1 = collamask.one_hot();
-    collamask1.fanout(hard<100>{});
+    collamask1.fanout(hard<3>{});
     val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
     // 25% chance of picking the second candidate instead
     val<NUM_TABLES> collamask12 =
         select(val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
     arr<val<1>, NUM_TABLES> allocate =
         collamask12.fo1().reverse().make_array(val<1>{});
-    allocate.fanout(hard<100>{});
 
     return {allocate, postmask, candallocmask, collamask1, last_match1};
   }
@@ -632,7 +623,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       arr<val<1>, NUM_TABLES> &uclear, arr<val<1>, NUM_TABLES> &g_weak,
       val<LOG_FETCH_WIDTH> last_offset,
       val<1> extra_cycle) {
-
     // u-bit update condition: primary provider where alt prediction differs
     arr<val<1>, NUM_TABLES> update_u = [&](u64 i) {
       return primary[i] & altdiffer[i].fo1();
@@ -702,7 +692,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                      val<1> extra_cycle) {
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       val<1> bim_primary = match1[offset] >> NUM_TABLES;
-      bim_primary.fanout(hard<100>{});
 
       // Flip prediction if weak and wrong (gated by extra_cycle for bim RAM)
       execute_if(extra_cycle & b_weak[offset],
@@ -742,12 +731,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
       if constexpr (META_TABLE_SIZE_V == 0) {
         // Global counter: pipeline shift and saturating add
-        meta_global.fanout(hard<100>{});
         for (u64 i = Base::METAPIPE - 1; i != 0; i--) {
           meta_global[i] = meta_global[i - 1];
         }
         auto newmeta = meta_global[0] + meta_incr.fo1().fold_add();
-        newmeta.fanout(hard<100>{});
+        newmeta.fanout(hard<3>{});
         using meta_t = valt<decltype(meta_global[0])>;
         meta_global[0] =
             select(newmeta > meta_t::maxval, meta_t{meta_t::maxval},
@@ -764,7 +752,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   // Update global history, fold registers, P1 history, and path history.
   // Called unconditionally (caller gates with execute_if when needed).
   void update_history(val<64> next_pc) {
-    next_pc.fanout(hard<100>{});
     val<PATHBITS> branch_bits = next_pc >> 2;
     if constexpr (P1_USE_GSHARE_V) {
       global_history1 = (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
@@ -781,6 +768,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   void new_block(val<64> inst_pc) {
     val<LOG_FETCH_WIDTH> offset = inst_pc.fo1() >> 2;
     block_entry = offset.fo1().decode().concat();
+    block_entry.fanout(hard<6 * FETCH_WIDTH>{});
     block_size = 1;
   }
 
@@ -797,8 +785,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
   val<1> predict2(val<64> inst_pc) override {
     val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
-    lineaddr.fanout(hard<100>{});
-    gfolds.fanout(hard<100>{});
+    lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
+    gfolds.fanout(hard<2>{});
 
     compute_indexes(lineaddr);
     compute_tags(lineaddr);
@@ -806,7 +794,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     compute_matches();
     compute_meta_prediction();
 
-    block_entry.fanout(hard<100>{});
+    p2.fanout(hard<FETCH_WIDTH>{});
     val<1> taken = (block_entry & p2) != hard<0>{};
     taken.fanout(hard<2>{});
     reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1)});
@@ -837,8 +825,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     if (num_branch == 0) {
       val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
       val<1> actual_block = ~(true_block & line_end.fo1());
-      actual_block.fanout(hard<100>{});
+      actual_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
       execute_if(actual_block, [&]() {
+        next_pc.fanout(hard<3>{});
         update_history(next_pc);
         true_block = 1;
       });
@@ -846,37 +835,34 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
 
     // --- Fanout cached state for update logic ---
-    // Using generous fanouts (100) to validate logic; tune later.
-    mispredict.fanout(hard<100>{});
+    mispredict.fanout(hard<NUM_TABLES + 2>{});
     val<1> correct_pred = ~mispredict;
-    correct_pred.fanout(hard<100>{});
-    index1.fanout(hard<100>{});
-    p2.fanout(hard<100>{});
-    bindex.fanout(hard<100>{});
-    gindex.fanout(hard<100>{});
-    htag.fanout(hard<100>{});
-    readb.fanout(hard<100>{});
-    readt.fanout(hard<100>{});
-    readc.fanout(hard<100>{});
-    readh.fanout(hard<100>{});
-    match1.fanout(hard<100>{});
-    match2.fanout(hard<100>{});
-    pred1.fanout(hard<100>{});
-    pred2.fanout(hard<100>{});
-    branch_offset.fanout(hard<100>{});
-    branch_dir.fanout(hard<100>{});
-    gfolds.fanout(hard<100>{});
-    notumask.fanout(hard<100>{});
-    readu.fanout(hard<100>{});
+    correct_pred.fanout(hard<NUM_TABLES + 2>{});
+    index1.fanout(hard<FETCH_WIDTH * 3>{});
+    p2.fanout(hard<2>{});
+    bindex.fanout(hard<FETCH_WIDTH * 3>{});
+    gindex.fanout(hard<4>{});
+    htag.fanout(hard<3>{});
+    readb.fanout(hard<2>{});
+    readt.fanout(hard<4>{});
+    readc.fanout(hard<3>{});
+    readh.fanout(hard<2>{});
+    match1.fanout(hard<3>{});
+    match2.fanout(hard<2>{});
+    pred1.fanout(hard<2>{});
+    pred2.fanout(hard<2 + NUM_TABLES>{});
+    branch_offset.fanout(hard<FETCH_WIDTH + NUM_TABLES + 1>{});
+    branch_dir.fanout(hard<2>{});
+    gfolds.fanout(hard<2>{});
     if constexpr (USE_META_V) {
       if constexpr (META_TABLE_SIZE_V == 0) {
-        meta_global.fanout(hard<100>{});
+        meta_global.fanout(hard<2>{});
       }
-      newly_alloc.fanout(hard<100>{});
+      newly_alloc.fanout(hard<2>{});
     }
 
     val<LOG_FETCH_WIDTH> last_offset = branch_offset[num_branch - 1];
-    last_offset.fanout(hard<100>{});
+    last_offset.fanout(hard<4 * NUM_TABLES + 2>{});
 
     // --- Build per-offset masks ---
     u64 update_valid = (u64(1) << num_branch) - 1;
@@ -886,54 +872,50 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       };
       return match_offset.fo1().concat() & update_valid;
     };
-    update_mask.fanout(hard<100>{});
+    update_mask.fanout(hard<2>{});
 
     arr<val<1>, FETCH_WIDTH> is_branch = [&](u64 offset) {
       return update_mask[offset] != hard<0>{};
     };
-    is_branch.fanout(hard<100>{});
+    is_branch.fanout(hard<6>{});
 
     val<FETCH_WIDTH> branch_mask = is_branch.concat();
 
     val<FETCH_WIDTH> actualdirs = branch_dir.concat();
-    actualdirs.fanout(hard<100>{});
+    actualdirs.fanout(hard<FETCH_WIDTH>{});
 
     arr<val<1>, FETCH_WIDTH> branch_taken = [&](u64 offset) {
       return (actualdirs & update_mask[offset]) != hard<0>{};
     };
-    branch_taken.fanout(hard<100>{});
+    branch_taken.fanout(hard<3>{});
 
     // --- Per-offset: actual provider match (zero if no branch at offset) ---
     arr<val<NUM_TABLES + 1>, FETCH_WIDTH> actual_match1 = [&](u64 offset) {
       return select(is_branch[offset], match1[offset], val<NUM_TABLES + 1>{0});
     };
-    actual_match1.fanout(hard<100>{});
+    actual_match1.fanout(hard<2>{});
 
     val<NUM_TABLES> primary_mask = actual_match1.fold_or();
-    primary_mask.fanout(hard<100>{});
+    primary_mask.fanout(hard<2>{});
     arr<val<1>, NUM_TABLES> primary = primary_mask.make_array(val<1>{});
-    primary.fanout(hard<100>{});
+    primary.fanout(hard<3>{});
 
     arr<val<1>, FETCH_WIDTH> primary_wrong = [&](u64 offset) {
       return pred1[offset] != branch_taken[offset];
     };
-    primary_wrong.fanout(hard<100>{});
+    primary_wrong.fanout(hard<2>{});
 
     // --- Allocation ---
     auto alloc = allocate_entries(mispredict, last_offset);
-    alloc.allocate.fanout(hard<100>{});
-    alloc.postmask.fanout(hard<100>{});
-    alloc.candallocmask.fanout(hard<100>{});
-    alloc.collamask1.fanout(hard<100>{});
-    alloc.last_match1.fanout(hard<100>{});
 
     // --- Associate branch direction to each table ---
+    alloc.allocate.fanout(hard<7>{});
     arr<val<1>, NUM_TABLES> bdir = [&](u64 i) {
       if constexpr (BR_P_ENTRY == 1) {
         val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
         val<LOG_FETCH_WIDTH> offset =
             select(alloc.allocate[i], last_offset, tag_offset.fo1());
-        offset.fanout(hard<100>{});
+        offset.fanout(hard<FETCH_WIDTH>{});
         arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 j) {
           return branch_offset[j] == offset;
         };
@@ -944,13 +926,13 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         return branch_taken[0]; // simplified; full multi-slot TODO
       }
     };
-    bdir.fanout(hard<100>{});
+    bdir.fanout(hard<2>{});
 
     // --- Per-table: is prediction incorrect? ---
     arr<val<1>, NUM_TABLES> badpred1 = [&](u64 i) {
       return readc[i] != bdir[i];
     };
-    badpred1.fanout(hard<100>{});
+    badpred1.fanout(hard<3>{});
 
     // --- Per-table: does primary differ from alt? ---
     arr<val<1>, NUM_TABLES> altdiffer = [&](u64 i) {
@@ -979,9 +961,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // --- P1/P2 disagreement (for P1 update) ---
     val<FETCH_WIDTH> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
-    disagree_mask.fanout(hard<100>{});
+    disagree_mask.fanout(hard<2>{});
     arr<val<1>, FETCH_WIDTH> disagree = disagree_mask.make_array(val<1>{});
-    disagree.fanout(hard<100>{});
+    disagree.fanout(hard<2>{});
 
     arr<val<1>, FETCH_WIDTH> p1_weak = [&](u64 offset) -> val<1> {
       return execute_if(disagree[offset],
@@ -990,13 +972,12 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // --- Bimodal hysteresis read (before extra cycle, same cycle as predict2) ---
     auto b_weak = compute_b_weak(actual_match1, primary_wrong);
-    b_weak.fanout(hard<100>{});
 
     // --- Extra cycle for prediction bit flips and allocation ---
     val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
     val<1> extra_cycle =
         some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-    extra_cycle.fanout(hard<100>{});
+    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1>{});
     need_extra_cycle(extra_cycle);
 
     // --- Meta update (§2.11) ---
@@ -1008,7 +989,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     val<NUM_TABLES> uclearmask =
         alloc.postmask & noalloc.fo1().replicate(hard<NUM_TABLES>{}).concat();
     arr<val<1>, NUM_TABLES> uclear = uclearmask.fo1().make_array(val<1>{});
-    uclear.fanout(hard<100>{});
+    uclear.fanout(hard<2>{});
 
     // --- TAGE table writes (§2.9) ---
     update_tables(alloc.allocate, bdir, badpred1, goodpred, primary, altdiffer,
@@ -1033,13 +1014,13 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // --- U-bit epoch reset (U_STOR_FF mode) ---
     if constexpr (U_STOR_FF_V) {
-      uctr.fanout(hard<100>{});
+      uctr.fanout(hard<3>{});
       val<NUM_TABLES> allocmask1 = alloc.collamask1.reverse();
-      allocmask1.fanout(hard<100>{});
+      allocmask1.fanout(hard<2>{});
       val<1> faralloc = (((alloc.last_match1 >> 3) | allocmask1).one_hot() ^
                          allocmask1) == hard<0>{};
       val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
-      uctrsat.fanout(hard<100>{});
+      uctrsat.fanout(hard<2>{});
       uctr = select(correct_pred, uctr,
                     select(uctrsat, val<decltype(uctr)::size>{0},
                            update_ctr(uctr, faralloc.fo1())));
@@ -1053,8 +1034,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // --- Global history update ---
     val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
     true_block = correct_pred | branch_dir[num_branch - 1] | line_end.fo1();
-    true_block.fanout(hard<100>{});
-    execute_if(true_block, [&]() { update_history(next_pc); });
+    true_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
+    execute_if(true_block, [&]() {
+      next_pc.fanout(hard<3>{});
+      update_history(next_pc);
+    });
 
     num_branch = 0;
   }

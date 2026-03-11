@@ -128,10 +128,16 @@ All predictor interface methods stubbed with `return val<1>{0};` or empty bodies
 
 ---
 
-## Phase 2: Accessors and Routines
+## Phase 2: Accessors and Routines ✓ COMPLETE
 
 **Goal**: Implement all dataflow as callable functions invoked by predict/update methods.
 Build the predict2, reuse_predict2, and update_cycle flows from these building blocks.
+
+**Status**: All sub-phases (2.1-2.13) implemented. Direct-mode Tage runs full traces.
+Mispredictions match reference exactly when `-DREAD_WRITE_RAM` is used (208,030 on gcc trace).
+Without it, 219,832 mispredictions due to TageTable write gating by `extra_cycle`
+(HARCOM `ram<>` enforces single access per cycle; bank_ram is read in predict2 and
+written in update_tables). See `memory/tage_phase2.md` for full details.
 
 ### 2.1 Hash functions
 - `compute_index(table_idx, lineaddr, fold)` → per-table index
