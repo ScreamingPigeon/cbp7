@@ -287,9 +287,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   static constexpr u64 P1_ENTRIES = P1_TABLE_SIZE_V / FETCH_WIDTH;
   static constexpr u64 BIM_ENTRIES = BIMODAL_SIZE_V / FETCH_WIDTH;
 
-  // ======== Table type ========
-  using Table0 = std::tuple_element_t<0, typename Base::Tables>;
-
   // ======== State ========
   geometric_folds<NUM_TABLES, TableCfg::MINHIST, MAXHIST, MAX_IDX_BITS,
                   MAX_HTAGBITS>
@@ -346,8 +343,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   // P1 tables
   hcm::ram<val<1>, P1_ENTRIES> table1_pred[FETCH_WIDTH]{"P1 pred"};
 
-  // P2 TAGE tables (TageTable storage)
-  Table0 table[NUM_TABLES];
+  // P2 TAGE tables (TageTable storage — tuple for non-uniform params)
+  typename Base::Tables tables;
 
   // P2 bimodal
   hcm::ram<val<1>, BIM_ENTRIES> bim[FETCH_WIDTH]{"bpred"};
@@ -428,18 +425,19 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       readb[offset] = bim[offset].read(bindex);
     }
     readb.fanout(hard<2>{});
-    for (u64 i = 0; i < NUM_TABLES; i++) {
-      readt[i] = table[i].tag_ram[0].read(gindex[i]);
-      readc[i] = table[i].pred_ram[0].read(gindex[i]);
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      auto &t = std::get<I>(tables);
+      readt[I] = t.tag_ram[0].read(gindex[I]);
+      readc[I] = t.pred_ram[0].read(gindex[I]);
       if constexpr (MAX_HYST_WIDTH > 0) {
-        readh[i] = table[i].hyst_ram[0].read(gindex[i]);
+        readh[I] = t.hyst_ram[0].read(gindex[I]);
       }
       if constexpr (U_STOR_FF_V) {
-        readu[i] = table[i].u_ff[0].select(gindex[i]);
+        readu[I] = t.u_ff[0].select(gindex[I]);
       } else {
-        readu[i] = table[i].u_ram[0].read(gindex[i]);
+        readu[I] = t.u_ram[0].read(gindex[I]);
       }
-    }
+    });
     readt.fanout(hard<FETCH_WIDTH + 1>{});
     readc.fanout(hard<3>{});
     if constexpr (MAX_HYST_WIDTH > 0) {
@@ -805,17 +803,18 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
 
     // overwrite the tag in the allocated entry (mispredict)
-    for (u64 i = 0; i < NUM_TABLES; i++) {
-      execute_if(allocate[i], [&]() {
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(allocate[I], [&]() {
+        auto &t = std::get<I>(tables);
         if constexpr (BR_P_ENTRY_V == 1) {
-          table[i].tag_ram[0].write(gindex[i],
-                                    concat(last_offset, htag[i]));
+          t.tag_ram[0].write(gindex[I],
+                             concat(last_offset, htag[I]));
         } else {
-          table[i].tag_ram[0].write(gindex[i],
-                                    val<MAX_TAG_WIDTH>{htag[i]});
+          t.tag_ram[0].write(gindex[I],
+                             val<MAX_TAG_WIDTH>{htag[I]});
         }
       });
-    }
+    });
 
     // update the u bits
     arr<val<1>, NUM_TABLES> update_u = [&](u64 i) {
@@ -828,16 +827,17 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     arr<val<1>, NUM_TABLES> uclear =
         uclearmask.fo1().make_array(val<1>{});
     uclear.fanout(hard<2>{});
-    for (u64 i = 0; i < NUM_TABLES; i++) {
-      execute_if(update_u[i].fo1() | allocate[i] | uclear[i], [&]() {
-        val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i];
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(update_u[I].fo1() | allocate[I] | uclear[I], [&]() {
+        auto &t = std::get<I>(tables);
+        val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I];
         if constexpr (U_STOR_FF_V) {
-          table[i].write_u_ff_arr(0, gindex[i], newu);
+          t.write_u_ff_arr(0, gindex[I], newu);
         } else {
-          table[i].u_ram[0].write(gindex[i], newu.fo1(), extra_cycle);
+          t.u_ram[0].write(gindex[I], newu.fo1(), extra_cycle);
         }
       });
-    }
+    });
 
     // update P1 prediction if P1 and P2 disagree and the hysteresis bit is weak
     auto p2_split = p2.make_array(val<1>{});
@@ -869,21 +869,21 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // update incorrect global prediction if primary provider and hyst is weak;
     // initialize global prediction in the allocated entry
-    for (u64 i = 0; i < NUM_TABLES; i++) {
-      execute_if(g_weak[i].fo1() | allocate[i], [&]() {
-        table[i].pred_ram[0].write(gindex[i], bdir[i]);
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(g_weak[I].fo1() | allocate[I], [&]() {
+        std::get<I>(tables).pred_ram[0].write(gindex[I], bdir[I]);
       });
-    }
+    });
     // update global prediction hysteresis if primary provider or allocated entry
     if constexpr (MAX_HYST_WIDTH > 0) {
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        execute_if(primary[i] | allocate[i], [&]() {
-          auto newhyst = select(allocate[i],
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        execute_if(primary[I] | allocate[I], [&]() {
+          auto newhyst = select(allocate[I],
                                 val<std::max(u64(1), MAX_HYST_WIDTH)>{0},
-                                update_ctr(readh[i], ~badpred1[i]));
-          table[i].hyst_ram[0].write(gindex[i], newhyst.fo1(), extra_cycle);
+                                update_ctr(readh[I], ~badpred1[I]));
+          std::get<I>(tables).hyst_ram[0].write(gindex[I], newhyst.fo1(), extra_cycle);
         });
-      }
+      });
     }
 
     // u-bit epoch reset
@@ -900,13 +900,15 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                          update_ctr(uctr, faralloc.fo1())));
     if constexpr (U_STOR_FF_V) {
       execute_if(uctrsat, [&]() {
-        for (u64 i = 0; i < NUM_TABLES; i++)
-          table[i].reset_u(val<ResetFn_V::MODE_BITS>{0});
+        static_loop<NUM_TABLES>([&]<u64 I>() {
+          std::get<I>(tables).reset_u(val<ResetFn_V::MODE_BITS>{0});
+        });
       });
     } else {
       execute_if(uctrsat, [&]() {
-        for (auto &t : table)
-          t.u_ram[0].reset();
+        static_loop<NUM_TABLES>([&]<u64 I>() {
+          std::get<I>(tables).u_ram[0].reset();
+        });
       });
     }
 

@@ -247,16 +247,16 @@ Bimodal write gating fixed to match reference (no extra_cycle guard).
 
 ---
 
-## Phase 3.7: Non-Uniform Table Parameters — HIGH PRIORITY
+## Phase 3.7: Non-Uniform Table Parameters ✓ COMPLETE
 
 **Goal**: Support per-table TABLE_SIZE, TAG_WIDTH, CTR_WIDTH, HYST_WIDTH, U_WIDTH.
 Real TAGE designs use increasing table sizes with longer history lengths (more entries
-to reduce aliasing for longer patterns). The current `Table0 table[NUM_TABLES]` forces
-all tables to use index-0's TageTable type, making per-table sizing impossible.
+to reduce aliasing for longer patterns).
 
-**Challenge**: Must preserve the flat inline structure that achieved EPI parity (Phase 3.6).
-The previous member-function approach with `std::tuple` + `static_loop` caused 2x EPI.
-Need to find an approach that uses tuple storage but doesn't regress energy.
+**Status**: Replaced `Table0 table[NUM_TABLES]` (C array of uniform type) with
+`typename Base::Tables tables` (std::tuple of per-table TageTable types). All 6 table
+access loops converted from `for` to `static_loop<NUM_TABLES>` with `std::get<I>(tables)`.
+Zero EPI/latency regression (EPI=1903, P2=1.86). All 9 compile test instantiations pass.
 
 ### 3.7.1 Replace Table0 array with tuple
 - Change `Table0 table[NUM_TABLES]` back to `typename Base::Tables tables;`
@@ -430,12 +430,10 @@ difference (likely from bimodal write gating change or minor fanout differences)
 
 ## Priority Order
 
-1. **Phase 3.7 (non-uniform tables)** — CRITICAL: real TAGE needs increasing table size with
-   history length. Current Table0 array forces all tables to identical size/width.
-2. **Phase 4-5 (validation)** — cost/timing verification, multi-trace comparison
-3. **Phase 5.5 (ahead mode)** — pipeline optimization for lower P2 latency
-4. **Phase 7 (monitoring)** — performance counters for parameter tuning
-5. **Phase 8 (loop predictor)** — accuracy improvement
+1. **Phase 4-5 (validation)** — cost/timing verification, multi-trace comparison
+2. **Phase 5.5 (ahead mode)** — pipeline optimization for lower P2 latency
+3. **Phase 7 (monitoring)** — performance counters for parameter tuning
+4. **Phase 8 (loop predictor)** — accuracy improvement
 
 ## Metrics Snapshot (gcc trace, 1K warmup, 5M measure)
 
@@ -444,4 +442,4 @@ difference (likely from bimodal write gating change or minor fanout differences)
 | P2 mispredictions | 26,164 | 26,870 |
 | P1 latency | 0.937 | 0.937 |
 | P2 latency | 1.86 | 1.86 |
-| Energy/instr (fJ) | 1,906 | 1,868 |
+| Energy/instr (fJ) | 1,903 | 1,868 |
