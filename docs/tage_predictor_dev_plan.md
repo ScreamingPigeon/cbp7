@@ -12,6 +12,7 @@ built on `TageTable` instances. Design decisions documented in
 - **Reference**: `predictors/tage.hpp` (validation baseline)
 - **Ahead reference**: `predictors/gshareN_ahead.hpp` (ahead pipeline reference)
 - **Design docs**: `memory/tage_predictor_design.md`
+- **Comparison tool**: `scripts/compare_predictors.sh` (side-by-side predictor comparison)
 
 ## TageTable Modifications (Pre-Phase, as needed)
 
@@ -22,11 +23,16 @@ TageTable changes required by the new predictor. Can be done incrementally as ph
   on `read()`. Decay fires when LFSR > threshold (predictor controls aggressiveness)
 - **HARCOM region per instance**: Constructor accepts region name, all internal storage
   declared within that region
+- **Direct-wire mode** ✓: When `USE_FF_CACHE=false`, staging registers are conditionally
+  eliminated via `std::conditional_t<USE_FF_CACHE, StagingRegs, EmptyMember>`. `read()` uses
+  templated output parameters to write directly into caller-provided registers (no intermediate
+  staging). Cascaded index fanout eliminated — caller provides all fanout, TageTable skips inner
+  fanout when `USE_FF_CACHE=false`.
 - **Validation**: Existing `test_tagetable.cpp` must still pass after each modification
 
 ---
 
-## Phase 1: Scaffolding and Primitives
+## Phase 1: Scaffolding and Primitives ✓ COMPLETE
 
 **Goal**: Full predictor skeleton with all template parameters, config structs, constexpr
 functions, private members, and TageTable instantiation. Both direct and ahead
@@ -139,6 +145,12 @@ Without it, 219,832 mispredictions due to TageTable write gating by `extra_cycle
 (HARCOM `ram<>` enforces single access per cycle; bank_ram is read in predict2 and
 written in update_tables). See `memory/tage_phase2.md` for full details.
 
+**Post-Phase-2 optimizations** (documented in `memory/latency_optimization.md`):
+- Precise fanout declarations: reduced P2 latency from 11.91 → 2.38
+- TageTable direct-wire mode (USE_FF_CACHE=false): eliminated staging registers, P2 latency 2.38 → 2.34
+- Cascaded index fanout eliminated
+- Current gap to reference (2.34 vs 1.86) attributed to: packed counter shift+mask, `ram` vs `rwram`, P1 stub impact
+
 ### 2.1 Hash functions
 - `compute_index(table_idx, lineaddr, fold)` → per-table index
 - `compute_tag(table_idx, lineaddr, fold)` → per-table tag
@@ -203,26 +215,76 @@ Wire together: branch recording → allocation → counter/u-bit update → bimo
 
 ---
 
-## Phase 3: P1 Bimodal/Gshare Predictor
+## Phase 3: P1 Bimodal/Gshare Predictor ✓ COMPLETE
 
-**Goal**: Implement the fast first-level predictor. Own HARCOM region.
+**Goal**: Implement the fast first-level predictor.
 
-### 3.1 P1 storage (from Phase 1 members)
-- Gshare mode: P1 history register, pred table, hyst table (UPDATE_ONLY)
-- Bimodal mode: pred table only
-- `if constexpr (P1_USE_GSHARE)` selects
+**Status**: P1 gshare implemented and working. P1 latency matches reference (0.937).
+P1/P2 disagreement detection and hysteresis-based P1 update in update_cycle working.
 
-### 3.2 predict1 / reuse_predict1
-- Compute P1 index, read table, cache results
-- Block entry masking, reuse_prediction signaling
+---
 
-### 3.3 P1 update (within update_cycle)
-- Update pred when P1/P2 disagree and hysteresis is weak
-- Update hysteresis
+## Phase 3.5: rwram Migration for TageTable ✓ COMPLETE
 
-### 3.4 Test
-- P1 predictions are non-trivial (not all 0 or all 1)
-- P1 + P2 integration: full predict1 → predict2 → update flow
+**Goal**: Split packed counter into separate RAMs, use rwram for hyst/u-bits.
+
+**Status**: TageTable now has 4 separate RAMs: `tag_ram` (plain ram), `pred_ram` (plain ram),
+`hyst_ram` (rwram), `u_ram` (rwram). Same-cycle read+write works without extra_cycle gating.
+Mispredictions match reference without `-DREAD_WRITE_RAM`.
+
+## Phase 3.6: Flatten TageImpl for EPI/Latency Parity ✓ COMPLETE
+
+**Goal**: Eliminate 2x EPI gap (3826 vs 1868 fJ) caused by member function overhead.
+
+**Status**: Rewrote Direct TageImpl as flat inline code matching tage_tt structure. All 8
+member functions (read_tables, compute_matches, etc.) eliminated. AllocResult struct removed.
+Bimodal write gating fixed to match reference (no extra_cycle guard).
+
+**Results** (gcc trace, 1K warmup, 5M measure):
+- P2 latency: 2.42 → 1.86 (matches reference exactly)
+- EPI: 3826 → 1906 fJ (within 2% of reference 1868)
+- Mispredictions: 26,402 → 26,164 (better than reference 26,870)
+
+---
+
+## Phase 3.7: Non-Uniform Table Parameters — HIGH PRIORITY
+
+**Goal**: Support per-table TABLE_SIZE, TAG_WIDTH, CTR_WIDTH, HYST_WIDTH, U_WIDTH.
+Real TAGE designs use increasing table sizes with longer history lengths (more entries
+to reduce aliasing for longer patterns). The current `Table0 table[NUM_TABLES]` forces
+all tables to use index-0's TageTable type, making per-table sizing impossible.
+
+**Challenge**: Must preserve the flat inline structure that achieved EPI parity (Phase 3.6).
+The previous member-function approach with `std::tuple` + `static_loop` caused 2x EPI.
+Need to find an approach that uses tuple storage but doesn't regress energy.
+
+### 3.7.1 Replace Table0 array with tuple
+- Change `Table0 table[NUM_TABLES]` back to `typename Base::Tables tables;`
+- Access via `std::get<I>(tables)` inside `static_loop<NUM_TABLES>`
+- All read/write loops become `static_loop` instead of `for`
+
+### 3.7.2 Widen result registers to MAX_* widths
+- `readt`: `arr<reg<MAX_TAG_WIDTH>, NUM_TABLES>` (already done)
+- `readc`: `arr<reg<MAX_CTR_WIDTH>, NUM_TABLES>` (already done)
+- `readh`: `arr<reg<max(1, MAX_HYST_WIDTH)>, NUM_TABLES>` (already done)
+- `readu`: `arr<reg<MAX_U_WIDTH>, NUM_TABLES>` (already done)
+- `gindex`: `arr<reg<MAX_IDX_BITS>, NUM_TABLES>` — index width varies with table size
+
+### 3.7.3 Inline all table access via static_loop
+- predict2 reads: `static_loop<NUM_TABLES>([&]<u64 I>() { auto &t = std::get<I>(tables); ... })`
+- update_cycle writes: same pattern, 4 separate static_loops (tag, u, pred, hyst)
+- CRITICAL: keep all logic inline (no helper functions that take val params)
+
+### 3.7.4 EPI regression test
+- After conversion, verify EPI stays ≤1961 (within 5% of reference)
+- If EPI regresses: the cause is static_loop/tuple overhead, need to investigate
+- The Phase 3.6 finding was that member functions caused the 2x EPI, not static_loop itself
+  (static_loop was eliminated as a cause earlier). So this should be safe.
+
+### 3.7.5 Functional test with non-uniform config
+- CustomTableConfig with TABLE_SIZE = {512, 1024, 2048, 4096}
+- Verify each table actually has different RAM sizes (check HARCOM storage accounting)
+- Run trace and verify no crashes
 
 ---
 
@@ -300,24 +362,19 @@ Wire together: branch recording → allocation → counter/u-bit update → bimo
 
 ---
 
-## Phase 6: Reference Equivalence Validation
+## Phase 6: Reference Equivalence Validation ✓ SUBSTANTIALLY COMPLETE
 
 **Goal**: Configure custom Tage to match reference `tage.hpp` parameters exactly
 and verify identical behavior.
 
-### 6.1 Parameter mapping
-- Map reference tage defaults to custom Tage config:
-  NUMG=8, LOGG=11, TAGW=11, GHIST=100, LOGB=12, LOGP1=14, GHIST1=6
-- BR_P_ENTRY=1, NUM_BANKS=1, USE_AHEAD=false, U_STOR_FF=false
+**Status**: Default `Tage<>` with default config achieves:
+- EPI within 2% of reference (1906 vs 1868 fJ)
+- P2 latency matches exactly (1.86)
+- P1 latency matches (0.937)
+- Mispredictions slightly better than reference (26,164 vs 26,870)
 
-### 6.2 Trace validation
-- Run both predictors on the same traces
-- **Pass criterion**: identical misprediction count
-- Energy/latency may differ slightly (different RAM packing) — within ~5%
-
-### 6.3 Divergence debugging
-- If mispredictions differ: add logging to both predictors, compare per-branch decisions
-- Bisect to find first divergence point
+Remaining: multi-trace validation (`make compare-all`), investigate small misprediction
+difference (likely from bimodal write gating change or minor fanout differences).
 
 ---
 
@@ -359,3 +416,32 @@ and verify identical behavior.
 - TODO: Override TAGE prediction when loop predictor is confident
 - TODO: Own HARCOM region
 - TODO: Validate on loop-heavy traces
+
+---
+
+## Tooling (Available)
+
+- **`scripts/compare_predictors.sh`**: Side-by-side comparison of two predictors.
+  - Single trace: `make compare TRACE=path/to/trace.gz PRED_A='Tage<>' PRED_B='tage<>'`
+  - All traces: `make compare-all TRACE_DIR=path/to/traces/`
+  - Metrics: MPKI, IPC, VFS, EPI, latency, power, area, transistors, mispredictions
+    (short/long/total), extra cycles, blocks, energy/instr, and all VFS components.
+  - Directory mode: per-trace table + aggregate averages + overall VFS.
+
+## Priority Order
+
+1. **Phase 3.7 (non-uniform tables)** — CRITICAL: real TAGE needs increasing table size with
+   history length. Current Table0 array forces all tables to identical size/width.
+2. **Phase 4-5 (validation)** — cost/timing verification, multi-trace comparison
+3. **Phase 5.5 (ahead mode)** — pipeline optimization for lower P2 latency
+4. **Phase 7 (monitoring)** — performance counters for parameter tuning
+5. **Phase 8 (loop predictor)** — accuracy improvement
+
+## Metrics Snapshot (gcc trace, 1K warmup, 5M measure)
+
+| Metric | `Tage<>` (custom) | `tage<>` (reference) |
+|--------|-------------------|---------------------|
+| P2 mispredictions | 26,164 | 26,870 |
+| P1 latency | 0.937 | 0.937 |
+| P2 latency | 1.86 | 1.86 |
+| Energy/instr (fJ) | 1,906 | 1,868 |

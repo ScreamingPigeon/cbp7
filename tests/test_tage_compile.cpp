@@ -16,6 +16,7 @@ struct CustomTableConfig {
                                                               4096};
   static constexpr std::array<u64, NUM_TABLES> TAG_WIDTH = {9, 11, 13, 15};
   static constexpr std::array<u64, NUM_TABLES> CTR_WIDTH = {3, 3, 3, 3};
+  static constexpr std::array<u64, NUM_TABLES> HYST_WIDTH = {2, 2, 2, 2};
   static constexpr std::array<u64, NUM_TABLES> U_WIDTH = {1, 1, 2, 2};
   static constexpr auto HIST_LEN =
       geometric_hist<NUM_TABLES>(MINHIST, MAXHIST);
@@ -33,7 +34,8 @@ using T4 = Tage<DefaultTableConfig, DefaultAllocConfig,
                 /*FETCH_WIDTH=*/8, /*BIMODAL_SIZE=*/4096,
                 /*BR_P_ENTRY=*/1, /*NUM_BANKS=*/1,
                 /*USE_AHEAD=*/false, /*SHARED_TAG=*/true,
-                /*SHARED_U=*/true, /*U_STOR_FF=*/false,
+                /*SHARED_U=*/true, /*SHARED_HYS=*/true,
+                /*U_STOR_FF=*/false,
                 /*DECAY_CTR=*/1024, /*ResetFn=*/DefaultResetFn,
                 /*USE_FF_CACHE=*/false,
                 /*P1_USE_GSHARE=*/false>;
@@ -43,7 +45,8 @@ using T5 = Tage<DefaultTableConfig, DefaultAllocConfig,
                 /*FETCH_WIDTH=*/8, /*BIMODAL_SIZE=*/4096,
                 /*BR_P_ENTRY=*/1, /*NUM_BANKS=*/1,
                 /*USE_AHEAD=*/false, /*SHARED_TAG=*/true,
-                /*SHARED_U=*/true, /*U_STOR_FF=*/false,
+                /*SHARED_U=*/true, /*SHARED_HYS=*/true,
+                /*U_STOR_FF=*/false,
                 /*DECAY_CTR=*/1024, /*ResetFn=*/DefaultResetFn,
                 /*USE_FF_CACHE=*/false,
                 /*P1_USE_GSHARE=*/true, /*P1_TABLE_SIZE=*/16384,
@@ -56,7 +59,8 @@ using T6 = Tage<DefaultTableConfig, DefaultAllocConfig,
                 /*FETCH_WIDTH=*/8, /*BIMODAL_SIZE=*/4096,
                 /*BR_P_ENTRY=*/1, /*NUM_BANKS=*/1,
                 /*USE_AHEAD=*/false, /*SHARED_TAG=*/true,
-                /*SHARED_U=*/true, /*U_STOR_FF=*/false,
+                /*SHARED_U=*/true, /*SHARED_HYS=*/true,
+                /*U_STOR_FF=*/false,
                 /*DECAY_CTR=*/1024, /*ResetFn=*/DefaultResetFn,
                 /*USE_FF_CACHE=*/false,
                 /*P1_USE_GSHARE=*/true, /*P1_TABLE_SIZE=*/16384,
@@ -68,14 +72,16 @@ using T7 = Tage<DefaultTableConfig, DefaultAllocConfig,
                 /*FETCH_WIDTH=*/8, /*BIMODAL_SIZE=*/4096,
                 /*BR_P_ENTRY=*/1, /*NUM_BANKS=*/1,
                 /*USE_AHEAD=*/false, /*SHARED_TAG=*/true,
-                /*SHARED_U=*/true, /*U_STOR_FF=*/true>;
+                /*SHARED_U=*/true, /*SHARED_HYS=*/true,
+                /*U_STOR_FF=*/true>;
 
 // ---- Test 8: Path history enabled ----
 using T8 = Tage<DefaultTableConfig, DefaultAllocConfig,
                 /*FETCH_WIDTH=*/8, /*BIMODAL_SIZE=*/4096,
                 /*BR_P_ENTRY=*/1, /*NUM_BANKS=*/1,
                 /*USE_AHEAD=*/false, /*SHARED_TAG=*/true,
-                /*SHARED_U=*/true, /*U_STOR_FF=*/false,
+                /*SHARED_U=*/true, /*SHARED_HYS=*/true,
+                /*U_STOR_FF=*/false,
                 /*DECAY_CTR=*/1024, /*ResetFn=*/DefaultResetFn,
                 /*USE_FF_CACHE=*/false,
                 /*P1_USE_GSHARE=*/true, /*P1_TABLE_SIZE=*/16384,

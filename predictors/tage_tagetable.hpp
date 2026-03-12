@@ -37,20 +37,22 @@ struct tage_tt : predictor {
   static constexpr u64 HTAGBITS = TAGW - LOGLINEINST; // hashed tag bits
 
   // ======== TageTable type for global tables ========
-  // Encodes 1-bit prediction + 2-bit hysteresis as 3-bit counter.
-  // pred = counter[2] (MSB), hyst = counter[1:0].
-  static constexpr u64 TT_CTR_WIDTH = 3;
+  // Separate 1-bit prediction counter + 2-bit hysteresis (matching reference).
+  static constexpr u64 TT_CTR_WIDTH = 1;
+  static constexpr u64 TT_HYST_WIDTH = 2;
   using GTable = TageTable<
       (1 << LOGG), // TABLE_SIZE
       0,           // TABLE_HIST (unused by table; predictor uses geometric_folds)
       TAGW,        // TAG_WIDTH
-      TT_CTR_WIDTH,// CTR_WIDTH
+      TT_CTR_WIDTH,// CTR_WIDTH (1-bit prediction direction)
+      TT_HYST_WIDTH,// HYST_WIDTH (2-bit hysteresis, separate rwram)
       1,           // U_WIDTH
       1,           // N (1 prediction per entry)
       1,           // NUM_BANKS
       false,       // USE_AHEAD
       true,        // SHARED_TAG
       true,        // SHARED_U
+      true,        // SHARED_HYS
       false,       // U_STOR_FF (SRAM mode — avoids FF write conflict with reset)
       1024,        // DECAY_CTR (probabilistic decay, replaces bulk reset)
       DefaultResetFn,
@@ -178,7 +180,7 @@ struct tage_tt : predictor {
     for (u64 i = 0; i < NUMG; i++) {
       gindex[i] = lineaddr ^ gfolds.template get<0>(i);
     }
-    gindex.fanout(hard<2>{}); // TageTable: 1 read + 1 write (was 4+4 with separate RAMs)
+    gindex.fanout(hard<4>{}); // TageTable: 4 RAM reads in read() + update_cycle writes
 
     // compute hashed tags
     for (u64 i = 0; i < NUMG; i++) {
@@ -186,21 +188,16 @@ struct tage_tt : predictor {
     }
     htag.fanout(hard<2>{});
 
-    std::cerr << "DBG: predict2 reading tables\n";
-    // read tables — TageTable replaces 4 separate RAM reads
+    // read tables — inline RAM access, no function call overhead
     for (u64 offset = 0; offset < LINEINST; offset++) {
       readb[offset] = bim[offset].read(bindex);
     }
     readb.fanout(hard<2>{});
     for (u64 i = 0; i < NUMG; i++) {
-      // Read TageTable (comparison tag unused — predictor does its own matching)
-      table[i].read(val<LOGG>{gindex[i]}, val<TAGW>{0}, 0);
-      readt[i] = table[i].getTag();
-      val<TT_CTR_WIDTH> ctr_val = table[i].getCounter(0, 0);
-      auto [hyst_val, pred_val] = split<2, 1>(ctr_val);
-      readc[i] = pred_val;
-      readh[i] = hyst_val;
-      readu[i] = table[i].getU();
+      readt[i] = table[i].tag_ram[0].read(gindex[i]);
+      readc[i] = table[i].pred_ram[0].read(gindex[i]);
+      readh[i] = table[i].hyst_ram[0].read(gindex[i]);
+      readu[i] = table[i].u_ram[0].read(gindex[i]);
     }
     readt.fanout(hard<LINEINST + 1>{});
     readc.fanout(hard<3>{});
@@ -303,7 +300,6 @@ struct tage_tt : predictor {
 
     void update_cycle(instruction_info &block_end_info)
     {
-        std::cerr << "DBG: update_cycle start, num_branch=" << num_branch << "\n";
         val<1> &mispredict = block_end_info.is_mispredict;
         val<64> &next_pc = block_end_info.next_pc;
         // updates for all conditional branches in the predicted block
@@ -329,7 +325,7 @@ struct tage_tt : predictor {
         index1.fanout(hard<LINEINST*3>{});
         p2.fanout(hard<2>{});
         bindex.fanout(hard<LINEINST*3>{});
-        gindex.fanout(hard<2>{}); // TageTable: 1 write per table (was 4 with separate RAMs)
+        gindex.fanout(hard<4>{}); // 4 separate write methods per table
         htag.fanout(hard<3>{});
         readb.fanout(hard<2>{});
         readt.fanout(hard<4>{});
@@ -346,7 +342,6 @@ struct tage_tt : predictor {
 #ifdef USE_META
         meta.fanout(hard<2>{});
 #endif
-        std::cerr << "DBG: before last_offset\n";
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
         last_offset.fanout(hard<4*NUMG+2>{});
 
@@ -387,118 +382,82 @@ struct tage_tt : predictor {
         };
         primary_wrong.fanout(hard<2>{});
 
-        std::cerr << "DBG: before allocation\n";
         // select some candidate entries for allocation
         val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
-        std::cerr << "DBG: alloc A\n";
         arr<val<1>,NUMG> last_tagcmp = [&](int i){return readt[i] == concat(last_offset,htag[i]);};
-        std::cerr << "DBG: alloc B\n";
         val<NUMG+1> last_match1 = last_tagcmp.fo1().append(1).concat().one_hot();
-        std::cerr << "DBG: alloc C\n";
         last_match1.fanout(hard<2>{});
         val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match1-1);
-        std::cerr << "DBG: alloc D\n";
         postmask.fanout(hard<2>{});
         val<NUMG> candallocmask = postmask & notumask; // candidate post entries for allocation
         candallocmask.fanout(hard<2>{});
-        std::cerr << "DBG: alloc E\n";
         // if multiple candidate entries, we select a single one, with some randomization
         val<NUMG> collamask = candallocmask.reverse();
         collamask.fanout(hard<2>{});
         val<NUMG> collamask1 = collamask.one_hot();
         collamask1.fanout(hard<3>{});
-        std::cerr << "DBG: alloc F\n";
         val<NUMG> collamask2 = (collamask^collamask1).one_hot();
         val<NUMG> collamask12 = select(val<2>{std::rand()}==hard<0>{}, collamask2.fo1(), collamask1);
         arr<val<1>,NUMG> allocate = collamask12.fo1().reverse().make_array(val<1>{});
-        allocate.fanout(hard<10>{}); // increased fanout for combined TageTable write
-        std::cerr << "DBG: alloc G\n";
+        allocate.fanout(hard<7>{});
 
-        std::cerr << "DBG: before bdir\n";
         // associate a branch direction to each global table
         arr<val<1>,NUMG> bdir = [&](u64 i) {
-            std::cerr << "DBG: bdir i=" << i << "\n";
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
             val<LOGLINEINST> offset = select(allocate[i],last_offset,tag_offset.fo1());
             offset.fanout(hard<LINEINST>{});
             arr<val<1>,LINEINST> match_offset = [&](u64 j){return branch_offset[j] == offset;};
             return (match_offset.fo1().concat() & update_valid & actualdirs) != hard<0>{};
         };
-        std::cerr << "DBG: after bdir\n";
         bdir.fanout(hard<2>{});
 
         // tell if global prediction is incorrect
-        std::cerr << "DBG: before badpred1\n";
         arr<val<1>,NUMG> badpred1 = [&](u64 i){
-            std::cerr << "DBG: badpred1 i=" << i << "\n";
             return readc[i] != bdir[i];
         };
-        std::cerr << "DBG: badpred1 constructed, calling fanout\n";
         badpred1.fanout(hard<3>{});
-        std::cerr << "DBG: badpred1 fanout done\n";
 
         // associate to each global table a bit telling if local prediction differs from secondary prediction
-        std::cerr << "DBG: before altdiffer\n";
         arr<val<1>,NUMG> altdiffer = [&](u64 i){
-            std::cerr << "DBG: altdiffer i=" << i << "\n";
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
             return readc[i] != pred2.select(tag_offset.fo1());
         };
 
         // associate to each global table a bit telling if prediction for owning branch is correct
-        std::cerr << "DBG: before goodpred\n";
         arr<val<1>,NUMG> goodpred = [&](u64 i){
-            std::cerr << "DBG: goodpred i=" << i << "\n";
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
             return (tag_offset.fo1() != last_offset) | correct_pred;
         };
-        std::cerr << "DBG: before goodpred.fanout\n";
         goodpred.fanout(hard<2>{});
-        std::cerr << "DBG: after goodpred.fanout\n";
 
         // do P1 and P2 agree?
-        std::cerr << "DBG: p1 ^ p2\n";
-        val<LINEINST> p1xp2 = p1 ^ p2;
-        std::cerr << "DBG: branch_mask.fo1()\n";
-        val<LINEINST> bm = branch_mask.fo1();
-        std::cerr << "DBG: p1xp2 & bm\n";
-        val<LINEINST> disagree_mask = p1xp2 & bm;
-        std::cerr << "DBG: disagree_mask.fanout\n";
+        val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
         disagree_mask.fanout(hard<2>{});
-        std::cerr << "DBG: disagree_mask.make_array\n";
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
-        std::cerr << "DBG: disagree.fanout\n";
         disagree.fanout(hard<2>{});
 
         // read the P1 hysteresis if P1 and P2 disagree
-        std::cerr << "DBG: before p1_weak\n";
         arr<val<1>,LINEINST> p1_weak = [&] (u64 offset) -> val<1> {
-            // returns 1 iff disagreement and hysteresis is weak
             return execute_if(disagree[offset], [&](){
-                return ~table1_hyst[offset].read(index1); // hyst=0 means weak
+                return ~table1_hyst[offset].read(index1);
             });
         };
 
         // read the bimodal hysteresis if bimodal caused a misprediction
-        std::cerr << "DBG: before b_weak\n";
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
-            // returns 1 iff cause of misprediction and hysteresis is weak
             val<1> bim_primary = actual_match1[offset] >> NUMG;
             return execute_if(bim_primary.fo1() & primary_wrong[offset], [&](){
-                return ~bhyst[offset].read(bindex); // hyst=0 means weak
+                return ~bhyst[offset].read(bindex);
             });
         };
 
         // determine which primary global predictions are incorrect with a weak hysteresis
-        std::cerr << "DBG: before g_weak\n";
         arr<val<1>,NUMG> g_weak = [&] (u64 i) -> val<1> {
-            // returns 1 iff incorrect primary prediction and hysteresis is weak
             return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
         };
         g_weak.fanout(hard<2>{});
 
         // need extra cycle for modifying prediction bits and for TAGE allocation
-        std::cerr << "DBG: before some_badpred1\n";
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
         val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
         extra_cycle.fanout(hard<NUMG*2+1>{});
@@ -507,7 +466,6 @@ struct tage_tt : predictor {
 #ifdef USE_META
     // update meta counter
     arr<val<1>, LINEINST> altdiff = [&](u64 offset) {
-      // for each offset, tell if primary and secondary predictions differ
       return (match2[offset] != hard<0>{}) & (pred2[offset] != pred1[offset]);
     };
     arr<val<2, i64>, LINEINST> meta_incr = [&](u64 offset) -> val<2, i64> {
@@ -528,66 +486,33 @@ struct tage_tt : predictor {
                             meta_t{newmeta}));
 #endif
 
-        std::cerr << "DBG: before combined write\n";
-        // ======== Combined TageTable write ========
-        // Reference tage writes tag, pred, hyst, u separately with different
-        // conditions. With TageTable, we combine into a single write per table,
-        // using selects to choose new vs old values for each field.
+        // ======== Inline TageTable writes (matching reference pattern) ========
 
-        // u-bit update logic
+        // overwrite the tag in the allocated entry (mispredict)
+        for (u64 i=0; i<NUMG; i++) {
+            execute_if(allocate[i], [&](){table[i].tag_ram[0].write(gindex[i],concat(last_offset,htag[i]));});
+        }
+
+        // update the u bits
         arr<val<1>,NUMG> update_u = [&](u64 i){
             return primary[i] & altdiffer[i].fo1();
         };
-        update_u.fanout(hard<2>{});
         // if all post entries have the u bit set, reset their u bits
         val<1> noalloc = (candallocmask == hard<0>{});
         val<NUMG> uclearmask = postmask & noalloc.fo1().replicate(hard<NUMG>{}).concat();
         arr<val<1>,NUMG> uclear = uclearmask.fo1().make_array(val<1>{});
-        uclear.fanout(hard<3>{});
-
-        for (u64 i = 0; i < NUMG; i++) {
-            std::cerr << "DBG: combined write i=" << i << " need_write\n";
-            val<1> need_write = allocate[i] | g_weak[i] | primary[i] |
-                                update_u[i] | uclear[i];
-            std::cerr << "DBG: combined write i=" << i << " execute_if\n";
-            execute_if(need_write, [&]() {
-                std::cerr << "DBG: write i=" << i << " wtag\n";
-                // tag: new on allocate, old otherwise
-                val<TAGW> wtag = select(allocate[i],
-                    concat(last_offset, val<HTAGBITS>{htag[i]}),
-                    val<TAGW>{readt[i]});
-
-                std::cerr << "DBG: write i=" << i << " wpred\n";
-                // pred: new on g_weak/allocate, old otherwise
-                val<1> wpred = select(g_weak[i] | allocate[i],
-                    val<1>{bdir[i]}, val<1>{readc[i]});
-
-                std::cerr << "DBG: write i=" << i << " whyst\n";
-                // hyst: new on primary/allocate, old otherwise
-                val<2> whyst = select(primary[i] | allocate[i],
-                    select(allocate[i], val<2>{0},
-                           update_ctr(val<2>{readh[i]}, ~badpred1[i])),
-                    val<2>{readh[i]});
-
-                std::cerr << "DBG: write i=" << i << " wu\n";
-                // u: new on update_u/allocate/uclear, old otherwise
-                val<1> wu = select(update_u[i] | allocate[i] | uclear[i],
-                    val<1>{goodpred[i] & ~allocate[i] & ~uclear[i]},
-                    val<1>{readu[i]});
-
-                std::cerr << "DBG: write i=" << i << " wctr+write\n";
-                val<TT_CTR_WIDTH> wctr = concat(whyst, wpred);
-                table[i].write(val<LOGG>{gindex[i]}, 0, 0, wtag, wctr, wu);
-                std::cerr << "DBG: write i=" << i << " done\n";
+        uclear.fanout(hard<2>{});
+        for (u64 i=0; i<NUMG; i++) {
+            execute_if(update_u[i].fo1() | allocate[i] | uclear[i], [&]() {
+                val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i];
+                table[i].u_ram[0].write(gindex[i],newu.fo1(),extra_cycle);
             });
         }
 
-        std::cerr << "DBG: before P1 update\n";
         // update P1 prediction if P1 and P2 disagree and the hysteresis bit is weak
         auto p2_split = p2.make_array(val<1>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(p1_weak[offset].fo1(), [&](){
-                // update with the P2 prediction, not with the actual branch direction
                 table1_pred[offset].write(index1,p2_split[offset].fo1());
             });
         }
@@ -612,12 +537,38 @@ struct tage_tt : predictor {
             });
         }
 
-        std::cerr << "DBG: before RESET_UBITS\n";
-        // With U_STOR_FF=false (SRAM mode), u-bit decay is handled internally
-        // by TageTable via DECAY_CTR probabilistic clearing on tag misses.
-        // The bulk reset logic (uctr/uctrsat/reset_u) is not needed.
+        // update incorrect global prediction if primary provider and the hysteresis is weak;
+        // initialize global prediction in the allocated entry
+        for (u64 i=0; i<NUMG; i++) {
+            execute_if(g_weak[i].fo1() | allocate[i], [&](){
+                table[i].pred_ram[0].write(gindex[i],bdir[i]);
+            });
+        }
+        // update global prediction hysteresis if primary provider or allocated entry
+        for (u64 i=0; i<NUMG; i++) {
+            execute_if(primary[i] | allocate[i], [&](){
+                val<2> newhyst = select(allocate[i],val<2>{0},update_ctr(readh[i],~badpred1[i]));
+                table[i].hyst_ram[0].write(gindex[i],newhyst.fo1(),extra_cycle);
+            });
+        }
 
-        std::cerr << "DBG: before history update\n";
+#ifdef RESET_UBITS
+    uctr.fanout(hard<3>{});
+    val<NUMG> allocmask1 = collamask1.reverse();
+    allocmask1.fanout(hard<2>{});
+    val<1> faralloc =
+        (((last_match1 >> 3) | allocmask1).one_hot() ^ allocmask1) == hard<0>{};
+    val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
+    uctrsat.fanout(hard<2>{});
+    uctr = select(correct_pred, uctr,
+                  select(uctrsat, val<decltype(uctr)::size>{0},
+                         update_ctr(uctr, faralloc.fo1())));
+    execute_if(uctrsat, [&]() {
+      for (auto &t : table)
+        t.u_ram[0].reset();
+    });
+#endif
+
         // update global history
         val<1> line_end = block_entry >> (LINEINST-block_size);
         true_block = correct_pred | branch_dir[num_branch-1] | line_end.fo1();

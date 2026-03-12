@@ -92,7 +92,8 @@ struct DefaultTableConfig {
   static constexpr auto TABLE_SIZE =
       uniform_array<u64, NUM_TABLES>(1 << 11); // 2048
   static constexpr auto TAG_WIDTH = uniform_array<u64, NUM_TABLES>(11);
-  static constexpr auto CTR_WIDTH = uniform_array<u64, NUM_TABLES>(3);
+  static constexpr auto CTR_WIDTH = uniform_array<u64, NUM_TABLES>(1);
+  static constexpr auto HYST_WIDTH = uniform_array<u64, NUM_TABLES>(2);
   static constexpr auto U_WIDTH = uniform_array<u64, NUM_TABLES>(1);
   static constexpr auto HIST_LEN = geometric_hist<NUM_TABLES>(MINHIST, MAXHIST);
 };
@@ -110,29 +111,33 @@ struct DefaultAllocConfig {
 
 // Generate a TageTable type from config arrays at index I, plus global params.
 template <typename Cfg, u64 BR_P_ENTRY, u64 NUM_BANKS, bool USE_AHEAD,
-          bool SHARED_TAG, bool SHARED_U, bool U_STOR_FF, u64 DECAY_CTR,
+          bool SHARED_TAG, bool SHARED_U, bool SHARED_HYS,
+          bool U_STOR_FF, u64 DECAY_CTR,
           typename ResetFn, bool USE_FF_CACHE, u64 I>
 using TableAt =
     TageTable<Cfg::TABLE_SIZE[I], Cfg::HIST_LEN[I], Cfg::TAG_WIDTH[I],
-              Cfg::CTR_WIDTH[I], Cfg::U_WIDTH[I], BR_P_ENTRY, NUM_BANKS,
-              USE_AHEAD, SHARED_TAG, SHARED_U, U_STOR_FF, DECAY_CTR, ResetFn,
-              USE_FF_CACHE>;
+              Cfg::CTR_WIDTH[I], Cfg::HYST_WIDTH[I], Cfg::U_WIDTH[I],
+              BR_P_ENTRY, NUM_BANKS,
+              USE_AHEAD, SHARED_TAG, SHARED_U, SHARED_HYS,
+              U_STOR_FF, DECAY_CTR, ResetFn, USE_FF_CACHE>;
 
 // Build a std::tuple of TageTable types from the config.
 template <typename Cfg, u64 BR_P_ENTRY, u64 NUM_BANKS, bool USE_AHEAD,
-          bool SHARED_TAG, bool SHARED_U, bool U_STOR_FF, u64 DECAY_CTR,
+          bool SHARED_TAG, bool SHARED_U, bool SHARED_HYS,
+          bool U_STOR_FF, u64 DECAY_CTR,
           typename ResetFn, bool USE_FF_CACHE, typename Seq>
 struct MakeTableTuple;
 
 template <typename Cfg, u64 BR_P_ENTRY, u64 NUM_BANKS, bool USE_AHEAD,
-          bool SHARED_TAG, bool SHARED_U, bool U_STOR_FF, u64 DECAY_CTR,
+          bool SHARED_TAG, bool SHARED_U, bool SHARED_HYS,
+          bool U_STOR_FF, u64 DECAY_CTR,
           typename ResetFn, bool USE_FF_CACHE, u64... Is>
 struct MakeTableTuple<Cfg, BR_P_ENTRY, NUM_BANKS, USE_AHEAD, SHARED_TAG,
-                      SHARED_U, U_STOR_FF, DECAY_CTR, ResetFn, USE_FF_CACHE,
-                      std::index_sequence<Is...>> {
+                      SHARED_U, SHARED_HYS, U_STOR_FF, DECAY_CTR, ResetFn,
+                      USE_FF_CACHE, std::index_sequence<Is...>> {
   using type = std::tuple<
       TableAt<Cfg, BR_P_ENTRY, NUM_BANKS, USE_AHEAD, SHARED_TAG, SHARED_U,
-              U_STOR_FF, DECAY_CTR, ResetFn, USE_FF_CACHE, Is>...>;
+              SHARED_HYS, U_STOR_FF, DECAY_CTR, ResetFn, USE_FF_CACHE, Is>...>;
 };
 
 // ============================================================================
@@ -142,7 +147,8 @@ struct MakeTableTuple<Cfg, BR_P_ENTRY, NUM_BANKS, USE_AHEAD, SHARED_TAG,
 template <bool USE_AHEAD_V, typename TableCfg, typename AllocCfg,
           // Global hardware params
           u64 FETCH_WIDTH_V, u64 BIMODAL_SIZE_V, u64 BR_P_ENTRY_V,
-          u64 NUM_BANKS_V, bool SHARED_TAG_V, bool SHARED_U_V, bool U_STOR_FF_V,
+          u64 NUM_BANKS_V, bool SHARED_TAG_V, bool SHARED_U_V,
+          bool SHARED_HYS_V, bool U_STOR_FF_V,
           u64 DECAY_CTR_V, typename ResetFn_V, bool USE_FF_CACHE_V,
           // P1 params
           bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V, u64 P1_HIST_V,
@@ -160,8 +166,9 @@ struct TageImpl;
 template <typename TableCfg, typename AllocCfg, u64 FETCH_WIDTH_V,
           u64 BIMODAL_SIZE_V, u64 BR_P_ENTRY_V, u64 NUM_BANKS_V,
           bool USE_AHEAD_V, bool SHARED_TAG_V, bool SHARED_U_V,
-          bool U_STOR_FF_V, u64 DECAY_CTR_V, typename ResetFn_V,
-          bool USE_FF_CACHE_V, bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V,
+          bool SHARED_HYS_V, bool U_STOR_FF_V, u64 DECAY_CTR_V,
+          typename ResetFn_V, bool USE_FF_CACHE_V,
+          bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V,
           u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
           u64 META_TABLE_SIZE_V, bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V,
           u64 PATH_BITS_V>
@@ -177,6 +184,7 @@ struct TageBase {
   // ---- Per-table max widths (for uniform result registers) ----
   static constexpr u64 MAX_TAG_WIDTH = array_max(TableCfg::TAG_WIDTH);
   static constexpr u64 MAX_CTR_WIDTH = array_max(TableCfg::CTR_WIDTH);
+  static constexpr u64 MAX_HYST_WIDTH = array_max(TableCfg::HYST_WIDTH);
   static constexpr u64 MAX_U_WIDTH = array_max(TableCfg::U_WIDTH);
   static constexpr u64 MAX_TABLE_SIZE = array_max(TableCfg::TABLE_SIZE);
   static constexpr u64 MAX_IDX_BITS = clog2(MAX_TABLE_SIZE);
@@ -211,8 +219,9 @@ struct TageBase {
   // ---- Table tuple type ----
   using Tables =
       typename MakeTableTuple<TableCfg, BR_P_ENTRY_V, NUM_BANKS_V, USE_AHEAD_V,
-                              SHARED_TAG_V, SHARED_U_V, U_STOR_FF_V,
-                              DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V,
+                              SHARED_TAG_V, SHARED_U_V, SHARED_HYS_V,
+                              U_STOR_FF_V, DECAY_CTR_V, ResetFn_V,
+                              USE_FF_CACHE_V,
                               std::make_index_sequence<NUM_TABLES>>::type;
 
   // ---- Static asserts ----
@@ -233,139 +242,168 @@ struct TageBase {
 // ============================================================================
 // TageImpl — Direct (non-ahead) specialization
 // ============================================================================
-// This is the predictor
+// Flat inline implementation matching tage_tt structure for optimal EPI/latency.
+// All prediction and update logic is inline — no member function decomposition.
 
 template <typename TableCfg, typename AllocCfg, u64 FETCH_WIDTH_V,
           u64 BIMODAL_SIZE_V, u64 BR_P_ENTRY_V, u64 NUM_BANKS_V,
-          bool SHARED_TAG_V, bool SHARED_U_V, bool U_STOR_FF_V, u64 DECAY_CTR_V,
+          bool SHARED_TAG_V, bool SHARED_U_V, bool SHARED_HYS_V,
+          bool U_STOR_FF_V, u64 DECAY_CTR_V,
           typename ResetFn_V, bool USE_FF_CACHE_V, bool P1_USE_GSHARE_V,
           u64 P1_TABLE_SIZE_V, u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V,
           u64 METAPIPE_V, u64 META_TABLE_SIZE_V, bool USE_PATH_HIST_V,
           u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V>
 struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                 BR_P_ENTRY_V, NUM_BANKS_V, SHARED_TAG_V, SHARED_U_V,
-                U_STOR_FF_V, DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V,
-                P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V,
-                METABITS_V, METAPIPE_V, META_TABLE_SIZE_V, USE_PATH_HIST_V,
-                PATH_HIST_WIDTH_V, PATH_BITS_V> : predictor {
+                SHARED_HYS_V, U_STOR_FF_V, DECAY_CTR_V, ResetFn_V,
+                USE_FF_CACHE_V, P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V,
+                USE_META_V, METABITS_V, METAPIPE_V, META_TABLE_SIZE_V,
+                USE_PATH_HIST_V, PATH_HIST_WIDTH_V, PATH_BITS_V> : predictor {
 
   using Base =
       TageBase<TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V, BR_P_ENTRY_V,
-               NUM_BANKS_V, false, SHARED_TAG_V, SHARED_U_V, U_STOR_FF_V,
-               DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V, P1_USE_GSHARE_V,
-               P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V, METABITS_V, METAPIPE_V,
-               META_TABLE_SIZE_V, USE_PATH_HIST_V, PATH_HIST_WIDTH_V,
-               PATH_BITS_V>;
+               NUM_BANKS_V, false, SHARED_TAG_V, SHARED_U_V, SHARED_HYS_V,
+               U_STOR_FF_V, DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V,
+               P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V,
+               METABITS_V, METAPIPE_V, META_TABLE_SIZE_V, USE_PATH_HIST_V,
+               PATH_HIST_WIDTH_V, PATH_BITS_V>;
 
+  // ======== Constants ========
   static constexpr u64 NUM_TABLES = Base::NUM_TABLES;
   static constexpr u64 FETCH_WIDTH = Base::FETCH_WIDTH;
   static constexpr u64 LOG_FETCH_WIDTH = Base::LOG_FETCH_WIDTH;
-  static constexpr u64 BR_P_ENTRY = Base::BR_P_ENTRY;
   static constexpr u64 MAX_TAG_WIDTH = Base::MAX_TAG_WIDTH;
   static constexpr u64 MAX_CTR_WIDTH = Base::MAX_CTR_WIDTH;
+  static constexpr u64 MAX_HYST_WIDTH = Base::MAX_HYST_WIDTH;
   static constexpr u64 MAX_U_WIDTH = Base::MAX_U_WIDTH;
   static constexpr u64 MAX_IDX_BITS = Base::MAX_IDX_BITS;
   static constexpr u64 MAX_HTAGBITS = Base::MAX_HTAGBITS;
   static constexpr u64 MAXHIST = Base::MAXHIST;
   static constexpr u64 BINDEX_BITS = Base::BINDEX_BITS;
   static constexpr u64 P1_INDEX_BITS = Base::P1_INDEX_BITS;
-
-  // ---- Computed RAM sizes ----
+  static constexpr u64 UCTRBITS = 8;
+  static constexpr u64 PATHBITS = Base::PATH_BITS;
+  static constexpr u64 LINEADDR_BITS = std::max(BINDEX_BITS, MAX_IDX_BITS);
   static constexpr u64 P1_ENTRIES = P1_TABLE_SIZE_V / FETCH_WIDTH;
   static constexpr u64 BIM_ENTRIES = BIMODAL_SIZE_V / FETCH_WIDTH;
-  // Meta table size: at least 1 to keep ram<> valid even when conditional is
-  // false
-  static constexpr u64 META_RAM_SIZE =
-      (META_TABLE_SIZE_V > 0) ? META_TABLE_SIZE_V : 1;
 
-  // ======== Table Instances ========
-  typename Base::Tables tables;
+  // ======== Table type ========
+  using Table0 = std::tuple_element_t<0, typename Base::Tables>;
 
-  // ======== History State ========
+  // ======== State ========
   geometric_folds<NUM_TABLES, TableCfg::MINHIST, MAXHIST, MAX_IDX_BITS,
                   MAX_HTAGBITS>
       gfolds;
   reg<1> true_block = 1;
 
-  // Path history (conditional)
-  std::conditional_t<USE_PATH_HIST_V, reg<PATH_HIST_WIDTH_V>, EmptyMember>
-      path_hist;
-
-  // ======== P1 State ========
-  // P1 uses its own short history (gshare mode only)
+  // P1
   std::conditional_t<P1_USE_GSHARE_V, reg<P1_HIST_V>, EmptyMember>
       global_history1;
   reg<P1_INDEX_BITS> index1;
-  arr<reg<1>, FETCH_WIDTH> readp1; // P1 read results
-  reg<FETCH_WIDTH> p1;             // P1 predictions (concatenated)
+  arr<reg<1>, FETCH_WIDTH> readp1;
+  reg<FETCH_WIDTH> p1;
 
-  // P1 tables
-  hcm::ram<val<1>, P1_ENTRIES> table1_pred[FETCH_WIDTH]{"P1 pred"};
-
-  // ======== Bimodal (P2 base) ========
+  // P2
   reg<BINDEX_BITS> bindex;
-  arr<reg<1>, FETCH_WIDTH> readb; // bimodal read results
-  hcm::ram<val<1>, BIM_ENTRIES> bim[FETCH_WIDTH]{"bpred"};
+  arr<reg<MAX_IDX_BITS>, NUM_TABLES> gindex;
+  arr<reg<MAX_HTAGBITS>, NUM_TABLES> htag;
 
-  // ======== P2 (TAGE) Result Registers ========
-  // Uniform max-width to keep cross-table logic simple.
-  arr<reg<MAX_IDX_BITS>, NUM_TABLES> gindex; // per-table indices
-  arr<reg<MAX_HTAGBITS>, NUM_TABLES> htag;   // per-table hashed tags
-  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> readt; // read tags
-  arr<reg<1>, NUM_TABLES> readc;             // read prediction bits
-  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> readh; // read hysteresis
-  arr<reg<1>, NUM_TABLES> readu;             // read u-bits
-  reg<NUM_TABLES> notumask;                  // inverted u-bits
+  arr<reg<1>, FETCH_WIDTH> readb;
+  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> readt;
+  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> readc;
+  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> readh;
+  arr<reg<MAX_U_WIDTH>, NUM_TABLES> readu;
+  reg<NUM_TABLES> notumask;
 
-  // ======== Match Registers ========
-  arr<reg<NUM_TABLES + 1>, FETCH_WIDTH> match;  // all matches per offset
-  arr<reg<NUM_TABLES + 1>, FETCH_WIDTH> match1; // longest match per offset
-  arr<reg<NUM_TABLES + 1>, FETCH_WIDTH> match2; // second longest per offset
-  arr<reg<1>, FETCH_WIDTH> pred1;               // primary prediction per offset
-  arr<reg<1>, FETCH_WIDTH> pred2; // alternate prediction per offset
-  reg<FETCH_WIDTH> p2;            // final P2 predictions
+  arr<reg<NUM_TABLES + 1>, FETCH_WIDTH> match;
+  arr<reg<NUM_TABLES + 1>, FETCH_WIDTH> match1;
+  arr<reg<NUM_TABLES + 1>, FETCH_WIDTH> match2;
 
-  // ======== Meta-prediction ========
-  // USE_META=true: signed counter for alt-on-newly-allocated
-  // META_TABLE_SIZE=0: global counter
-  // META_TABLE_SIZE>0: PC-indexed table
-  std::conditional_t<USE_META_V && META_TABLE_SIZE_V == 0,
-                     arr<reg<METABITS_V, i64>, METAPIPE_V>, EmptyMember>
-      meta_global;
-  std::conditional_t<USE_META_V && (META_TABLE_SIZE_V > 0),
-                     hcm::ram<val<METABITS_V, i64>, META_RAM_SIZE>, EmptyMember>
-      meta_table;
-  std::conditional_t<USE_META_V, arr<reg<1>, FETCH_WIDTH>, EmptyMember>
-      newly_alloc;
+  arr<reg<1>, FETCH_WIDTH> pred1;
+  arr<reg<1>, FETCH_WIDTH> pred2;
+  reg<FETCH_WIDTH> p2;
 
-  // ======== U-bit Management ========
-  // Epoch mode (U_STOR_FF=true): global reset counter
-  static constexpr u64 UCTRBITS = 8;
-  std::conditional_t<U_STOR_FF_V, reg<UCTRBITS>, EmptyMember> uctr;
-  // SRAM decay mode: adaptive threshold (runtime register)
-  // TODO: decay threshold register and allocation failure tracking
+  // Meta-prediction
+  std::conditional_t<USE_META_V,
+      arr<reg<METABITS_V, i64>, METAPIPE_V>, EmptyMember> meta;
+  std::conditional_t<USE_META_V,
+      arr<reg<1>, FETCH_WIDTH>, EmptyMember> newly_alloc;
 
-  // ======== UPDATE_ONLY Zone ========
-  // Hysteresis tables don't affect prediction latency
-  zone UPDATE_ONLY;
-  hcm::ram<val<1>, P1_ENTRIES> table1_hyst[FETCH_WIDTH]{"P1 hyst"};
-  hcm::ram<val<1>, BIM_ENTRIES> bhyst[FETCH_WIDTH]{"bhyst"};
+  // U-bit reset
+  reg<UCTRBITS> uctr;
 
-  // ======== Block State (simulation artifacts) ========
+  // Path history
+  std::conditional_t<USE_PATH_HIST_V, reg<PATH_HIST_WIDTH_V>, EmptyMember>
+      path_hist;
+
+  // Simulation artifacts
   u64 num_branch = 0;
   u64 block_size = 0;
   arr<reg<LOG_FETCH_WIDTH>, FETCH_WIDTH> branch_offset;
   arr<reg<1>, FETCH_WIDTH> branch_dir;
-  reg<FETCH_WIDTH> block_entry; // one-hot vector
+  reg<FETCH_WIDTH> block_entry;
 
-  // ======== Derived Constants ========
-  static constexpr u64 LINEADDR_BITS = std::max(BINDEX_BITS, MAX_IDX_BITS);
-  static constexpr u64 PATHBITS = Base::PATH_BITS;
+  // P1 tables
+  hcm::ram<val<1>, P1_ENTRIES> table1_pred[FETCH_WIDTH]{"P1 pred"};
 
-  // ======== Phase 2: Hash Functions (§2.1) ========
+  // P2 TAGE tables (TageTable storage)
+  Table0 table[NUM_TABLES];
 
-  // Compute bimodal index and per-table TAGE indexes.
-  void compute_indexes(val<LINEADDR_BITS> lineaddr) {
+  // P2 bimodal
+  hcm::ram<val<1>, BIM_ENTRIES> bim[FETCH_WIDTH]{"bpred"};
+
+  zone UPDATE_ONLY;
+  hcm::ram<val<1>, P1_ENTRIES> table1_hyst[FETCH_WIDTH]{"P1 hyst"};
+  hcm::ram<val<1>, BIM_ENTRIES> bhyst[FETCH_WIDTH]{"bhyst"};
+
+  // ======== Predictor Interface ========
+
+  void new_block(val<64> inst_pc) {
+    val<LOG_FETCH_WIDTH> offset = inst_pc.fo1() >> 2;
+    block_entry = offset.fo1().decode().concat();
+    block_entry.fanout(hard<6 * FETCH_WIDTH>{});
+    block_size = 1;
+  }
+
+  val<1> predict1(val<64> inst_pc) override {
+    inst_pc.fanout(hard<2>{});
+    new_block(inst_pc);
+    val<std::max(P1_INDEX_BITS, P1_HIST_V)> lineaddr =
+        inst_pc >> (LOG_FETCH_WIDTH + 2);
+    lineaddr.fanout(hard<2>{});
+    if constexpr (P1_USE_GSHARE_V) {
+      if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
+        index1 = lineaddr ^
+                 (val<P1_INDEX_BITS>{global_history1}
+                      << (P1_INDEX_BITS - P1_HIST_V));
+      } else {
+        index1 = global_history1.make_array(val<P1_INDEX_BITS>{})
+                     .append(lineaddr)
+                     .fold_xor();
+      }
+    } else {
+      index1 = lineaddr;
+    }
+    index1.fanout(hard<FETCH_WIDTH>{});
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      readp1[offset] = table1_pred[offset].read(index1);
+    }
+    readp1.fanout(hard<2>{});
+    p1 = readp1.concat();
+    p1.fanout(hard<FETCH_WIDTH>{});
+    return (block_entry & p1) != hard<0>{};
+  }
+
+  val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) override {
+    return ((block_entry << block_size) & p1) != hard<0>{};
+  }
+
+  val<1> predict2(val<64> inst_pc) override {
+    val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
+    lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
+    gfolds.fanout(hard<2>{});
+
+    // compute indexes
     bindex = lineaddr;
     bindex.fanout(hard<FETCH_WIDTH>{});
     for (u64 i = 0; i < NUM_TABLES; i++) {
@@ -376,82 +414,61 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         gindex[i] = val<MAX_IDX_BITS>{gindex[i]} ^ val<MAX_IDX_BITS>{path_hist};
       }
     }
-    gindex.fanout(hard<2>{});
-  }
+    gindex.fanout(hard<4>{});
 
-  // Compute per-table hashed tags (the hash portion, without offset).
-  void compute_tags(val<LINEADDR_BITS> lineaddr) {
+    // compute hashed tags
     for (u64 i = 0; i < NUM_TABLES; i++) {
       htag[i] =
           val<MAX_HTAGBITS>{lineaddr}.reverse() ^ gfolds.template get<1>(i);
     }
     htag.fanout(hard<2>{});
-  }
 
-  // ======== Phase 2: Table Read (§2.3) ========
-
-  // Read all TageTable instances and bimodal tables, populating result
-  // registers (readt, readc, readh, readu, notumask, readb).
-  // Caller must set gindex, htag, bindex before calling (via §2.1).
-  void read_tables() {
-    // Fanout for multi-use registers
-
-    // Read bimodal tables (one per offset in the fetch block)
+    // read tables
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       readb[offset] = bim[offset].read(bindex);
     }
     readb.fanout(hard<2>{});
-
-    // Read each TAGE table via static_loop (tables are heterogeneous)
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      constexpr u64 TW = TableCfg::TAG_WIDTH[I];
-      constexpr u64 CW = TableCfg::CTR_WIDTH[I];
-
-      // For BR_P_ENTRY=1, compare_tag is just htag zero-extended to TAG_WIDTH.
-      // TageTable's internal hit_reg won't be fully correct (missing offset),
-      // but it only affects SRAM u-bit decay (1/DECAY_CTR probability).
-      // For BR_P_ENTRY>1, htag IS the full tag.
-      val<TW> compare_tag = htag[I];
-      std::get<I>(tables).read(gindex[I], compare_tag);
-
-      // Extract results into uniform-width registers
-      readt[I] = std::get<I>(tables).getTag();
-      val<CW> ctr = std::get<I>(tables).getCounter(0);
-      readc[I] = ctr >> hard<CW - 1>{}; // MSB = prediction
-      readh[I] =
-          ctr & hard<(1ULL << (CW - 1)) - 1>{}; // lower bits = hysteresis only
-      readu[I] = std::get<I>(tables).getU();
-    });
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      readt[i] = table[i].tag_ram[0].read(gindex[i]);
+      readc[i] = table[i].pred_ram[0].read(gindex[i]);
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        readh[i] = table[i].hyst_ram[0].read(gindex[i]);
+      }
+      if constexpr (U_STOR_FF_V) {
+        readu[i] = table[i].u_ff[0].select(gindex[i]);
+      } else {
+        readu[i] = table[i].u_ram[0].read(gindex[i]);
+      }
+    }
     readt.fanout(hard<FETCH_WIDTH + 1>{});
     readc.fanout(hard<3>{});
-    readh.fanout(hard<2>{});
+    if constexpr (MAX_HYST_WIDTH > 0) {
+      readh.fanout(hard<2>{});
+    }
     readu.fanout(hard<2>{});
-
-    // Fanout for downstream use
     notumask = ~readu.concat();
     notumask.fanout(hard<2>{});
-  }
 
-  // ======== Phase 2: Match Logic (§2.4) ========
-
-  // Build match masks, find provider (longest match) and altpred (second
-  // longest) for each offset. Populates match, match1, match2, pred1, pred2.
-  // Caller must have called read_tables() first.
-  void compute_matches() {
-    // Gather prediction bits: per-table readc + bimodal readb per offset.
-    // match vector is (NUM_TABLES+1) wide: bit 0..NUM_TABLES-1 = tables,
-    // bit NUM_TABLES = bimodal (always matches as fallback).
-    val<NUM_TABLES> gpreds = readc.concat();
+    // gather prediction bits for each offset
+    val<NUM_TABLES> gpreds = [&]() -> val<NUM_TABLES> {
+      if constexpr (MAX_CTR_WIDTH == 1) {
+        return readc.concat();
+      } else {
+        arr<val<1>, NUM_TABLES> gpred_split = [&](int i) -> val<1> {
+          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
+        };
+        return gpred_split.fo1().concat();
+      }
+    }();
     gpreds.fanout(hard<FETCH_WIDTH>{});
     arr<val<NUM_TABLES + 1>, FETCH_WIDTH> preds = [&](u64 offset) {
       return concat(readb[offset], gpreds);
     };
     preds.fanout(hard<2 * FETCH_WIDTH>{});
 
-    if constexpr (BR_P_ENTRY == 1) {
-      // BR_P_ENTRY=1: offset encoded in upper tag bits.
-      // Tag stored = concat(offset, htag). readt has full stored tag.
-      // Match requires both htag match AND offset match.
+    // tag comparisons
+    if constexpr (BR_P_ENTRY_V == 1) {
+      // offset encoded in upper tag bits
       arr<val<1>, NUM_TABLES> htagcmp_split = [&](int i) {
         return val<MAX_HTAGBITS>{readt[i]} == htag[i];
       };
@@ -463,10 +480,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
           return val<LOG_FETCH_WIDTH>{readt[i] >> MAX_HTAGBITS} ==
                  hard<offset>{};
         };
-        match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
+        match[offset] =
+            concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
       });
     } else {
-      // BR_P_ENTRY>1: full tag match, same for all offsets.
+      // full tag match, same for all offsets
       arr<val<1>, NUM_TABLES> tagcmp_split = [&](int i) {
         return val<MAX_TAG_WIDTH>{readt[i]} == htag[i];
       };
@@ -475,9 +493,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         match[offset] = concat(val<1>{1}, tagcmp);
       }
     }
-
-    // Longest match → provider prediction
     match.fanout(hard<2>{});
+
+    // for each offset, find longest match and select primary prediction
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       match1[offset] = match[offset].one_hot();
     }
@@ -487,7 +505,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
     pred1.fanout(hard<2>{});
 
-    // Second longest match → alternate prediction
+    // for each offset, find second longest match and select secondary prediction
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       match2[offset] = (match[offset] ^ match1[offset]).one_hot();
     }
@@ -496,303 +514,31 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
     }
     pred2.fanout(hard<2>{});
-  }
 
-  // ======== Phase 2: Meta-prediction (§2.5) ========
-
-  // Compute final p2 prediction per offset using alt-on-newly-allocated logic.
-  // When USE_META: if the provider looks recently allocated (weak counter,
-  // u=0) and the meta counter says alt is better, use pred2 instead of pred1.
-  // Caller must have called compute_matches() first.
-  void compute_meta_prediction() {
-    if constexpr (!USE_META_V) {
-      p2 = pred1.concat();
-    } else {
-      // Detect newly-allocated providers: weak hysteresis AND u=0
-      if constexpr (META_TABLE_SIZE_V == 0) {
-        meta_global.fanout(hard<2>{});
-      }
+    if constexpr (USE_META_V) {
+      meta.fanout(hard<2>{});
       arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
         return readh[i] == hard<0>{};
       };
       val<NUM_TABLES> coldctr = notumask & weakctr.fo1().concat();
       coldctr.fanout(hard<FETCH_WIDTH>{});
-
-      // Read meta counter sign
-      auto metasign = [&]() -> val<1> {
-        if constexpr (META_TABLE_SIZE_V == 0) {
-          // Global counter mode
-          return (meta_global[Base::METAPIPE - 1] >= hard<0>{});
-        } else {
-          // PC-indexed table mode — TODO: read meta_table in predict2
-          return val<1>{0};
-        }
-      }();
+      val<1> metasign = (meta[METAPIPE_V - 1] >= hard<0>{});
       metasign.fanout(hard<FETCH_WIDTH>{});
-
       for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
         newly_alloc[offset] = (match1[offset] & coldctr) != hard<0>{};
       }
       newly_alloc.fanout(hard<2>{});
-
-      // altsel = metasign AND newly_alloc AND (altpred exists)
       arr<val<1>, FETCH_WIDTH> altsel = [&](u64 offset) {
         arr<val<1>, 3> inputs = {metasign, newly_alloc[offset],
                                  match2[offset] != hard<0>{}};
         return inputs.fo1().fold_and();
       };
-
       p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-             return select(altsel[offset], pred2[offset], pred1[offset]);
+             return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
            }}.concat();
+    } else {
+      p2 = pred1.concat();
     }
-  }
-
-  // ======== Phase 2: Allocation (§2.8) ========
-
-  // Results from allocation routine, consumed by update_cycle.
-  struct AllocResult {
-    arr<val<1>, NUM_TABLES> allocate; // per-table: allocate this entry?
-    val<NUM_TABLES> postmask;        // tables with longer history than provider
-    val<NUM_TABLES> candallocmask;   // postmask & u=0
-    val<NUM_TABLES> collamask1;      // first candidate (reversed one_hot)
-    val<NUM_TABLES + 1> last_match1; // provider match for last branch
-  };
-
-  // Select candidate entries for allocation on misprediction.
-  // Finds tables with longer history than the mispredicting branch's provider
-  // that have u=0, then selects one with randomization.
-  AllocResult allocate_entries(val<1> mispredict,
-                               val<LOG_FETCH_WIDTH> last_offset) {
-
-    // Find provider for the last (mispredicting) branch by full tag comparison
-    arr<val<1>, NUM_TABLES> last_tagcmp = [&](int i) {
-      if constexpr (BR_P_ENTRY == 1) {
-        return readt[i] == concat(last_offset, htag[i]);
-      } else {
-        return val<MAX_TAG_WIDTH>{readt[i]} == htag[i];
-      }
-    };
-    val<NUM_TABLES + 1> last_match1 =
-        last_tagcmp.fo1().append(1).concat().one_hot();
-
-    // Post-provider mask: tables with longer history than provider
-    // (one_hot - 1 gives all bits below the provider)
-    val<NUM_TABLES> mispmask =
-        mispredict.replicate(hard<NUM_TABLES>{}).concat();
-    val<NUM_TABLES> postmask =
-        mispmask.fo1() & val<NUM_TABLES>(last_match1 - 1);
-
-    // Candidate = post-provider AND u=0
-    val<NUM_TABLES> candallocmask = postmask & notumask;
-
-    // Select one candidate with randomization.
-    // Reverse so one_hot picks shortest-history candidate first,
-    // then reverse back for table indexing.
-    val<NUM_TABLES> collamask = candallocmask.reverse();
-    collamask.fanout(hard<2>{});
-    val<NUM_TABLES> collamask1 = collamask.one_hot();
-    collamask1.fanout(hard<3>{});
-    val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
-    // 25% chance of picking the second candidate instead
-    val<NUM_TABLES> collamask12 =
-        select(val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
-    arr<val<1>, NUM_TABLES> allocate =
-        collamask12.fo1().reverse().make_array(val<1>{});
-
-    return {allocate, postmask, candallocmask, collamask1, last_match1};
-  }
-
-  // ======== Phase 2: Counter/U-bit Update (§2.9) ========
-
-  // Update TAGE table entries: tag writes for allocation, counter updates
-  // for primary providers, u-bit updates. One TageTable::write() per table.
-  //
-  // Per table, the write triggers when: allocate OR primary OR update_u OR
-  // uclear. The new entry packs:
-  //   tag:  allocated → full tag (concat offset+htag or htag), else keep readt
-  //   ctr:  allocated → (bdir << (CW-1)) | 0  (pred=bdir, hyst=0)
-  //         g_weak   → (bdir << (CW-1)) | 0  (flip pred, hyst stays 0)
-  //         primary  → (readc << (CW-1)) | update_ctr(hyst, ~badpred)
-  //         else     → keep existing
-  //   u:    goodpred & ~allocate & ~uclear
-  void update_tables(
-      arr<val<1>, NUM_TABLES> &allocate, arr<val<1>, NUM_TABLES> &bdir,
-      arr<val<1>, NUM_TABLES> &badpred1, arr<val<1>, NUM_TABLES> &goodpred,
-      arr<val<1>, NUM_TABLES> &primary, arr<val<1>, NUM_TABLES> &altdiffer,
-      arr<val<1>, NUM_TABLES> &uclear, arr<val<1>, NUM_TABLES> &g_weak,
-      val<LOG_FETCH_WIDTH> last_offset,
-      val<1> extra_cycle) {
-    // u-bit update condition: primary provider where alt prediction differs
-    arr<val<1>, NUM_TABLES> update_u = [&](u64 i) {
-      return primary[i] & altdiffer[i].fo1();
-    };
-
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      constexpr u64 CW = TableCfg::CTR_WIDTH[I];
-      constexpr u64 TW = TableCfg::TAG_WIDTH[I];
-      constexpr u64 UW = TableCfg::U_WIDTH[I];
-      constexpr u64 HYST_W = CW - 1;
-
-      // Gate all writes by extra_cycle to prevent same-cycle read+write
-      // on TageTable bank_ram (read happens in predict2, write here).
-      val<1> should_write =
-          extra_cycle & (allocate[I] | primary[I] | update_u[I].fo1() | uclear[I]);
-
-      execute_if(should_write, [&]() {
-        // --- Tag ---
-        val<TW> new_tag = [&]() -> val<TW> {
-          if constexpr (BR_P_ENTRY == 1) {
-            return select(allocate[I], val<TW>{concat(last_offset, htag[I])},
-                          val<TW>{readt[I]});
-          } else {
-            return select(allocate[I], val<TW>{htag[I]}, val<TW>{readt[I]});
-          }
-        }();
-
-        // --- Counter (pred + hyst) ---
-        val<HYST_W> cur_hyst = readh[I]; // truncated to per-table width
-        val<HYST_W> updated_hyst = update_ctr(cur_hyst, ~badpred1[I]);
-        val<1> new_pred = select(g_weak[I] | allocate[I], bdir[I], readc[I]);
-        val<HYST_W> new_hyst =
-            select(allocate[I], val<HYST_W>{0}, updated_hyst);
-        // Pack: pred is MSB, hyst is lower bits
-        val<CW> new_ctr = concat(new_pred, new_hyst);
-
-        // --- U-bit ---
-        val<UW> new_u = val<UW>{goodpred[I].fo1() & ~allocate[I] & ~uclear[I]};
-
-        std::get<I>(tables).write(gindex[I], 0, 0, new_tag, new_ctr, new_u);
-      });
-    });
-  }
-
-  // ======== Phase 2: Bimodal Update (§2.10) ========
-
-  // Part 1: Read bimodal hysteresis (BEFORE need_extra_cycle, same cycle as predict2).
-  // Returns b_weak: 1 iff bimodal is primary, prediction wrong, and hysteresis weak.
-  arr<val<1>, FETCH_WIDTH> compute_b_weak(
-      arr<val<NUM_TABLES + 1>, FETCH_WIDTH> &actual_match1,
-      arr<val<1>, FETCH_WIDTH> &primary_wrong) {
-    return [&](u64 offset) -> val<1> {
-      val<1> bim_primary = actual_match1[offset] >> NUM_TABLES;
-      return execute_if(bim_primary.fo1() & primary_wrong[offset], [&]() {
-        return ~bhyst[offset].read(bindex);
-      });
-    };
-  }
-
-  // Part 2: Write bimodal tables (AFTER need_extra_cycle, in the extra cycle).
-  // Gate bim writes with extra_cycle since bim is read in predict2 (same cycle).
-  // bhyst is in UPDATE_ONLY zone and not read in predict2, so no gating needed.
-  void write_bimodal(arr<val<1>, FETCH_WIDTH> &is_branch,
-                     arr<val<1>, FETCH_WIDTH> &branch_taken,
-                     arr<val<1>, FETCH_WIDTH> &primary_wrong,
-                     arr<val<1>, FETCH_WIDTH> &b_weak,
-                     val<1> extra_cycle) {
-    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-      val<1> bim_primary = match1[offset] >> NUM_TABLES;
-
-      // Flip prediction if weak and wrong (gated by extra_cycle for bim RAM)
-      execute_if(extra_cycle & b_weak[offset],
-                 [&]() { bim[offset].write(bindex, branch_taken[offset]); });
-
-      // Update hysteresis if bimodal is primary (bhyst is UPDATE_ONLY zone)
-      execute_if(is_branch[offset] & bim_primary, [&]() {
-        bhyst[offset].write(bindex, ~primary_wrong[offset]);
-      });
-    }
-  }
-
-  // ======== Phase 2: Meta Update (§2.11) ========
-
-  // Update the meta counter (alt-on-newly-allocated).
-  // Increment when alt was correct for a newly-allocated provider,
-  // decrement when alt was wrong.
-  void update_meta(arr<val<1>, FETCH_WIDTH> &is_branch,
-                   arr<val<1>, FETCH_WIDTH> &branch_taken) {
-    if constexpr (USE_META_V) {
-      // For each offset: should we update meta?
-      arr<val<1>, FETCH_WIDTH> altdiff = [&](u64 offset) {
-        return (match2[offset] != hard<0>{}) & (pred2[offset] != pred1[offset]);
-      };
-
-      // Compute signed increment per offset:
-      // concat(bad_pred2, 1): bad_pred2=0 → +1 (primary better, trust primary)
-      //                       bad_pred2=1 → -1 (alt better, trust alt)
-      // 0 when no update needed.
-      arr<val<2, i64>, FETCH_WIDTH> meta_incr = [&](u64 offset) -> val<2, i64> {
-        val<1> do_update =
-            is_branch[offset] & altdiff[offset].fo1() & newly_alloc[offset];
-        val<1> bad_pred2 = (pred2[offset] != branch_taken[offset]);
-        return select(do_update.fo1(), concat(bad_pred2.fo1(), val<1>{1}),
-                      val<2>{0});
-      };
-
-      if constexpr (META_TABLE_SIZE_V == 0) {
-        // Global counter: pipeline shift and saturating add
-        for (u64 i = Base::METAPIPE - 1; i != 0; i--) {
-          meta_global[i] = meta_global[i - 1];
-        }
-        auto newmeta = meta_global[0] + meta_incr.fo1().fold_add();
-        newmeta.fanout(hard<3>{});
-        using meta_t = valt<decltype(meta_global[0])>;
-        meta_global[0] =
-            select(newmeta > meta_t::maxval, meta_t{meta_t::maxval},
-                   select(newmeta < meta_t::minval, meta_t{meta_t::minval},
-                          meta_t{newmeta}));
-      } else {
-        // PC-indexed table mode — TODO: read/write meta_table
-      }
-    }
-  }
-
-  // ======== Phase 2: History Update (§2.2) ========
-
-  // Update global history, fold registers, P1 history, and path history.
-  // Called unconditionally (caller gates with execute_if when needed).
-  void update_history(val<64> next_pc) {
-    val<PATHBITS> branch_bits = next_pc >> 2;
-    if constexpr (P1_USE_GSHARE_V) {
-      global_history1 = (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
-    }
-    gfolds.update(branch_bits);
-    if constexpr (USE_PATH_HIST_V) {
-      path_hist =
-          (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
-    }
-  }
-
-  // ======== Predictor Interface ========
-
-  void new_block(val<64> inst_pc) {
-    val<LOG_FETCH_WIDTH> offset = inst_pc.fo1() >> 2;
-    block_entry = offset.fo1().decode().concat();
-    block_entry.fanout(hard<6 * FETCH_WIDTH>{});
-    block_size = 1;
-  }
-
-  val<1> predict1([[maybe_unused]] val<64> inst_pc) override {
-    // TODO: Phase 3 — P1 gshare/bimodal predict
-    new_block(inst_pc);
-    return val<1>{0};
-  }
-
-  val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) override {
-    // TODO: Phase 3 — P1 reuse predict
-    return val<1>{0};
-  }
-
-  val<1> predict2(val<64> inst_pc) override {
-    val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
-    lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
-    gfolds.fanout(hard<2>{});
-
-    compute_indexes(lineaddr);
-    compute_tags(lineaddr);
-    read_tables();
-    compute_matches();
-    compute_meta_prediction();
 
     p2.fanout(hard<FETCH_WIDTH>{});
     val<1> taken = (block_entry & p2) != hard<0>{};
@@ -817,24 +563,31 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     num_branch++;
   }
 
-  void update_cycle(instruction_info &block_end_info) {
+  void update_cycle(instruction_info &block_end_info) override {
     val<1> &mispredict = block_end_info.is_mispredict;
     val<64> &next_pc = block_end_info.next_pc;
 
-    // --- No conditional branch: just update history if needed ---
     if (num_branch == 0) {
+      // no conditional branch in this block
       val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
       val<1> actual_block = ~(true_block & line_end.fo1());
       actual_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
       execute_if(actual_block, [&]() {
-        next_pc.fanout(hard<3>{});
-        update_history(next_pc);
+        next_pc.fanout(hard<2>{});
+        if constexpr (P1_USE_GSHARE_V) {
+          global_history1 =
+              (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
+        }
+        gfolds.update(val<PATHBITS>{next_pc >> 2});
+        if constexpr (USE_PATH_HIST_V) {
+          path_hist =
+              (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
+        }
         true_block = 1;
       });
       return;
     }
 
-    // --- Fanout cached state for update logic ---
     mispredict.fanout(hard<NUM_TABLES + 2>{});
     val<1> correct_pred = ~mispredict;
     correct_pred.fanout(hard<NUM_TABLES + 2>{});
@@ -845,8 +598,10 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     htag.fanout(hard<3>{});
     readb.fanout(hard<2>{});
     readt.fanout(hard<4>{});
-    readc.fanout(hard<3>{});
-    readh.fanout(hard<2>{});
+    readc.fanout(hard<2>{});
+    if constexpr (MAX_HYST_WIDTH > 0) {
+      readh.fanout(hard<3>{});
+    }
     match1.fanout(hard<3>{});
     match2.fanout(hard<2>{});
     pred1.fanout(hard<2>{});
@@ -854,17 +609,13 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     branch_offset.fanout(hard<FETCH_WIDTH + NUM_TABLES + 1>{});
     branch_dir.fanout(hard<2>{});
     gfolds.fanout(hard<2>{});
+    readu.fanout(hard<2>{});
     if constexpr (USE_META_V) {
-      if constexpr (META_TABLE_SIZE_V == 0) {
-        meta_global.fanout(hard<2>{});
-      }
-      newly_alloc.fanout(hard<2>{});
+      meta.fanout(hard<2>{});
     }
-
     val<LOG_FETCH_WIDTH> last_offset = branch_offset[num_branch - 1];
     last_offset.fanout(hard<4 * NUM_TABLES + 2>{});
 
-    // --- Build per-offset masks ---
     u64 update_valid = (u64(1) << num_branch) - 1;
     arr<val<FETCH_WIDTH>, FETCH_WIDTH> update_mask = [&](u64 offset) {
       arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 i) {
@@ -889,9 +640,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     };
     branch_taken.fanout(hard<3>{});
 
-    // --- Per-offset: actual provider match (zero if no branch at offset) ---
     arr<val<NUM_TABLES + 1>, FETCH_WIDTH> actual_match1 = [&](u64 offset) {
-      return select(is_branch[offset], match1[offset], val<NUM_TABLES + 1>{0});
+      return select(is_branch[offset], match1[offset],
+                    val<NUM_TABLES + 1>{0});
     };
     actual_match1.fanout(hard<2>{});
 
@@ -905,16 +656,41 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     };
     primary_wrong.fanout(hard<2>{});
 
-    // --- Allocation ---
-    auto alloc = allocate_entries(mispredict, last_offset);
+    // select candidate entries for allocation
+    val<NUM_TABLES> mispmask =
+        mispredict.replicate(hard<NUM_TABLES>{}).concat();
+    arr<val<1>, NUM_TABLES> last_tagcmp = [&](int i) {
+      if constexpr (BR_P_ENTRY_V == 1) {
+        return readt[i] == concat(last_offset, htag[i]);
+      } else {
+        return val<MAX_TAG_WIDTH>{readt[i]} == htag[i];
+      }
+    };
+    val<NUM_TABLES + 1> last_match1 =
+        last_tagcmp.fo1().append(1).concat().one_hot();
+    last_match1.fanout(hard<2>{});
+    val<NUM_TABLES> postmask =
+        mispmask.fo1() & val<NUM_TABLES>(last_match1 - 1);
+    postmask.fanout(hard<2>{});
+    val<NUM_TABLES> candallocmask = postmask & notumask;
+    candallocmask.fanout(hard<2>{});
+    val<NUM_TABLES> collamask = candallocmask.reverse();
+    collamask.fanout(hard<2>{});
+    val<NUM_TABLES> collamask1 = collamask.one_hot();
+    collamask1.fanout(hard<3>{});
+    val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
+    val<NUM_TABLES> collamask12 = select(
+        val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
+    arr<val<1>, NUM_TABLES> allocate =
+        collamask12.fo1().reverse().make_array(val<1>{});
+    allocate.fanout(hard<7>{});
 
-    // --- Associate branch direction to each table ---
-    alloc.allocate.fanout(hard<7>{});
+    // associate a branch direction to each global table
     arr<val<1>, NUM_TABLES> bdir = [&](u64 i) {
-      if constexpr (BR_P_ENTRY == 1) {
+      if constexpr (BR_P_ENTRY_V == 1) {
         val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
         val<LOG_FETCH_WIDTH> offset =
-            select(alloc.allocate[i], last_offset, tag_offset.fo1());
+            select(allocate[i], last_offset, tag_offset.fo1());
         offset.fanout(hard<FETCH_WIDTH>{});
         arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 j) {
           return branch_offset[j] == offset;
@@ -922,125 +698,236 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         return (match_offset.fo1().concat() & update_valid & actualdirs) !=
                hard<0>{};
       } else {
-        // BR_P_ENTRY>1: direction from the branch that owns this table's slot
-        return branch_taken[0]; // simplified; full multi-slot TODO
+        return branch_taken[0]; // simplified for multi-slot
       }
     };
     bdir.fanout(hard<2>{});
 
-    // --- Per-table: is prediction incorrect? ---
-    arr<val<1>, NUM_TABLES> badpred1 = [&](u64 i) {
-      return readc[i] != bdir[i];
+    // tell if global prediction is incorrect
+    arr<val<1>, NUM_TABLES> badpred1 = [&](u64 i) -> val<1> {
+      if constexpr (MAX_CTR_WIDTH == 1) {
+        return readc[i] != bdir[i];
+      } else {
+        return (readc[i] >> hard<MAX_CTR_WIDTH - 1>{}) != bdir[i];
+      }
     };
     badpred1.fanout(hard<3>{});
 
-    // --- Per-table: does primary differ from alt? ---
-    arr<val<1>, NUM_TABLES> altdiffer = [&](u64 i) {
-      if constexpr (BR_P_ENTRY == 1) {
+    // does primary differ from alt?
+    arr<val<1>, NUM_TABLES> altdiffer = [&](u64 i) -> val<1> {
+      auto pred_dir = [&]() -> val<1> {
+        if constexpr (MAX_CTR_WIDTH == 1) {
+          return readc[i];
+        } else {
+          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
+        }
+      }();
+      if constexpr (BR_P_ENTRY_V == 1) {
         val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
-        return readc[i] != pred2.select(tag_offset.fo1());
+        return pred_dir != pred2.select(tag_offset.fo1());
       } else {
-        return readc[i] != pred2[0]; // simplified for multi-slot
+        return pred_dir != pred2[0];
       }
     };
 
-    // --- Per-table: is owning branch's prediction correct? ---
+    // is owning branch's prediction correct?
     arr<val<1>, NUM_TABLES> goodpred = [&](u64 i) {
-      if constexpr (BR_P_ENTRY == 1) {
+      if constexpr (BR_P_ENTRY_V == 1) {
         val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
         return (tag_offset.fo1() != last_offset) | correct_pred;
       } else {
-        return correct_pred; // simplified for multi-slot
+        return correct_pred;
       }
     };
+    goodpred.fanout(hard<2>{});
 
-    // --- Weak detection for primary global predictions ---
-    arr<val<1>, NUM_TABLES> g_weak = [&](u64 i) -> val<1> {
-      return primary[i] & badpred1[i] & (readh[i] == hard<0>{});
-    };
-
-    // --- P1/P2 disagreement (for P1 update) ---
+    // do P1 and P2 agree?
     val<FETCH_WIDTH> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
     disagree_mask.fanout(hard<2>{});
     arr<val<1>, FETCH_WIDTH> disagree = disagree_mask.make_array(val<1>{});
     disagree.fanout(hard<2>{});
 
+    // read the P1 hysteresis if P1 and P2 disagree
     arr<val<1>, FETCH_WIDTH> p1_weak = [&](u64 offset) -> val<1> {
       return execute_if(disagree[offset],
                         [&]() { return ~table1_hyst[offset].read(index1); });
     };
 
-    // --- Bimodal hysteresis read (before extra cycle, same cycle as predict2) ---
-    auto b_weak = compute_b_weak(actual_match1, primary_wrong);
+    // read the bimodal hysteresis if bimodal caused a misprediction
+    arr<val<1>, FETCH_WIDTH> b_weak = [&](u64 offset) -> val<1> {
+      val<1> bim_primary = actual_match1[offset] >> NUM_TABLES;
+      return execute_if(bim_primary.fo1() & primary_wrong[offset],
+                        [&]() { return ~bhyst[offset].read(bindex); });
+    };
 
-    // --- Extra cycle for prediction bit flips and allocation ---
-    val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
+    // determine which primary global predictions are incorrect with weak hyst
+    arr<val<1>, NUM_TABLES> g_weak = [&](u64 i) -> val<1> {
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        return primary[i] & badpred1[i] & (readh[i] == hard<0>{});
+      } else {
+        return primary[i] & badpred1[i];
+      }
+    };
+    g_weak.fanout(hard<2>{});
+
+    // need extra cycle for modifying prediction bits and for TAGE allocation
+    val<1> some_badpred1 =
+        (primary_mask & badpred1.concat()) != hard<0>{};
     val<1> extra_cycle =
         some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
     extra_cycle.fanout(hard<NUM_TABLES * 2 + 1>{});
     need_extra_cycle(extra_cycle);
 
-    // --- Meta update (§2.11) ---
-    update_meta(is_branch, branch_taken);
+    // update meta counter
+    if constexpr (USE_META_V) {
+      arr<val<1>, FETCH_WIDTH> altdiff = [&](u64 offset) {
+        return (match2[offset] != hard<0>{}) &
+               (pred2[offset] != pred1[offset]);
+      };
+      arr<val<2, i64>, FETCH_WIDTH> meta_incr =
+          [&](u64 offset) -> val<2, i64> {
+        val<1> update_meta = is_branch[offset] & altdiff[offset].fo1() &
+                             newly_alloc[offset];
+        val<1> bad_pred2 = (pred2[offset] != branch_taken[offset]);
+        return select(update_meta.fo1(),
+                      concat(bad_pred2.fo1(), val<1>{1}), val<2>{0});
+      };
+      for (u64 i = METAPIPE_V - 1; i != 0; i--) {
+        meta[i] = meta[i - 1];
+      }
+      auto newmeta = meta[0] + meta_incr.fo1().fold_add();
+      newmeta.fanout(hard<3>{});
+      using meta_t = valt<decltype(meta[0])>;
+      meta[0] =
+          select(newmeta > meta_t::maxval, meta_t{meta_t::maxval},
+                 select(newmeta < meta_t::minval, meta_t{meta_t::minval},
+                        meta_t{newmeta}));
+    }
 
-    // --- U-bit clear: if no allocation candidates, clear u-bits on post
-    // entries ---
-    val<1> noalloc = (alloc.candallocmask == hard<0>{});
+    // overwrite the tag in the allocated entry (mispredict)
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      execute_if(allocate[i], [&]() {
+        if constexpr (BR_P_ENTRY_V == 1) {
+          table[i].tag_ram[0].write(gindex[i],
+                                    concat(last_offset, htag[i]));
+        } else {
+          table[i].tag_ram[0].write(gindex[i],
+                                    val<MAX_TAG_WIDTH>{htag[i]});
+        }
+      });
+    }
+
+    // update the u bits
+    arr<val<1>, NUM_TABLES> update_u = [&](u64 i) {
+      return primary[i] & altdiffer[i].fo1();
+    };
+    // if all post entries have the u bit set, reset their u bits
+    val<1> noalloc = (candallocmask == hard<0>{});
     val<NUM_TABLES> uclearmask =
-        alloc.postmask & noalloc.fo1().replicate(hard<NUM_TABLES>{}).concat();
-    arr<val<1>, NUM_TABLES> uclear = uclearmask.fo1().make_array(val<1>{});
+        postmask & noalloc.fo1().replicate(hard<NUM_TABLES>{}).concat();
+    arr<val<1>, NUM_TABLES> uclear =
+        uclearmask.fo1().make_array(val<1>{});
     uclear.fanout(hard<2>{});
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      execute_if(update_u[i].fo1() | allocate[i] | uclear[i], [&]() {
+        val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i];
+        if constexpr (U_STOR_FF_V) {
+          table[i].write_u_ff_arr(0, gindex[i], newu);
+        } else {
+          table[i].u_ram[0].write(gindex[i], newu.fo1(), extra_cycle);
+        }
+      });
+    }
 
-    // --- TAGE table writes (§2.9) ---
-    update_tables(alloc.allocate, bdir, badpred1, goodpred, primary, altdiffer,
-                  uclear, g_weak, last_offset, extra_cycle);
-
-    // --- P1 update: flip prediction if P1/P2 disagree and P1 is weak ---
+    // update P1 prediction if P1 and P2 disagree and the hysteresis bit is weak
     auto p2_split = p2.make_array(val<1>{});
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       execute_if(p1_weak[offset].fo1(), [&]() {
         table1_pred[offset].write(index1, p2_split[offset].fo1());
       });
     }
-    // P1 hysteresis: agreement strengthens, disagreement weakens
+    // update P1 hysteresis
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       execute_if(is_branch[offset], [&]() {
         table1_hyst[offset].write(index1, ~disagree[offset]);
       });
     }
 
-    // --- Bimodal writes (§2.10, after extra cycle) ---
-    write_bimodal(is_branch, branch_taken, primary_wrong, b_weak, extra_cycle);
-
-    // --- U-bit epoch reset (U_STOR_FF mode) ---
-    if constexpr (U_STOR_FF_V) {
-      uctr.fanout(hard<3>{});
-      val<NUM_TABLES> allocmask1 = alloc.collamask1.reverse();
-      allocmask1.fanout(hard<2>{});
-      val<1> faralloc = (((alloc.last_match1 >> 3) | allocmask1).one_hot() ^
-                         allocmask1) == hard<0>{};
-      val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
-      uctrsat.fanout(hard<2>{});
-      uctr = select(correct_pred, uctr,
-                    select(uctrsat, val<decltype(uctr)::size>{0},
-                           update_ctr(uctr, faralloc.fo1())));
-      execute_if(uctrsat, [&]() {
-        static_loop<NUM_TABLES>([&]<u64 I>() {
-          std::get<I>(tables).reset_u(val<DefaultResetFn::MODE_BITS>{0});
-        });
+    // update incorrect bimodal prediction if primary provider and hyst is weak
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      execute_if(b_weak[offset].fo1(), [&]() {
+        bim[offset].write(bindex, branch_taken[offset]);
+      });
+    }
+    // update bimodal hysteresis if bimodal is primary provider
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      val<1> bim_primary = match1[offset] >> NUM_TABLES;
+      execute_if(is_branch[offset] & bim_primary.fo1(), [&]() {
+        bhyst[offset].write(bindex, ~primary_wrong[offset]);
       });
     }
 
-    // --- Global history update ---
+    // update incorrect global prediction if primary provider and hyst is weak;
+    // initialize global prediction in the allocated entry
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      execute_if(g_weak[i].fo1() | allocate[i], [&]() {
+        table[i].pred_ram[0].write(gindex[i], bdir[i]);
+      });
+    }
+    // update global prediction hysteresis if primary provider or allocated entry
+    if constexpr (MAX_HYST_WIDTH > 0) {
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        execute_if(primary[i] | allocate[i], [&]() {
+          auto newhyst = select(allocate[i],
+                                val<std::max(u64(1), MAX_HYST_WIDTH)>{0},
+                                update_ctr(readh[i], ~badpred1[i]));
+          table[i].hyst_ram[0].write(gindex[i], newhyst.fo1(), extra_cycle);
+        });
+      }
+    }
+
+    // u-bit epoch reset
+    uctr.fanout(hard<3>{});
+    val<NUM_TABLES> allocmask1 = collamask1.reverse();
+    allocmask1.fanout(hard<2>{});
+    val<1> faralloc =
+        (((last_match1 >> 3) | allocmask1).one_hot() ^ allocmask1) ==
+        hard<0>{};
+    val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
+    uctrsat.fanout(hard<2>{});
+    uctr = select(correct_pred, uctr,
+                  select(uctrsat, val<decltype(uctr)::size>{0},
+                         update_ctr(uctr, faralloc.fo1())));
+    if constexpr (U_STOR_FF_V) {
+      execute_if(uctrsat, [&]() {
+        for (u64 i = 0; i < NUM_TABLES; i++)
+          table[i].reset_u(val<ResetFn_V::MODE_BITS>{0});
+      });
+    } else {
+      execute_if(uctrsat, [&]() {
+        for (auto &t : table)
+          t.u_ram[0].reset();
+      });
+    }
+
+    // update global history
     val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
     true_block = correct_pred | branch_dir[num_branch - 1] | line_end.fo1();
     true_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
     execute_if(true_block, [&]() {
-      next_pc.fanout(hard<3>{});
-      update_history(next_pc);
+      next_pc.fanout(hard<2>{});
+      if constexpr (P1_USE_GSHARE_V) {
+        global_history1 =
+            (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
+      }
+      gfolds.update(val<PATHBITS>{next_pc >> 2});
+      if constexpr (USE_PATH_HIST_V) {
+        path_hist =
+            (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
+      }
     });
 
-    num_branch = 0;
+    num_branch = 0; // done
   }
 };
 
@@ -1050,25 +937,26 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
 template <typename TableCfg, typename AllocCfg, u64 FETCH_WIDTH_V,
           u64 BIMODAL_SIZE_V, u64 BR_P_ENTRY_V, u64 NUM_BANKS_V,
-          bool SHARED_TAG_V, bool SHARED_U_V, bool U_STOR_FF_V, u64 DECAY_CTR_V,
+          bool SHARED_TAG_V, bool SHARED_U_V, bool SHARED_HYS_V,
+          bool U_STOR_FF_V, u64 DECAY_CTR_V,
           typename ResetFn_V, bool USE_FF_CACHE_V, bool P1_USE_GSHARE_V,
           u64 P1_TABLE_SIZE_V, u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V,
           u64 METAPIPE_V, u64 META_TABLE_SIZE_V, bool USE_PATH_HIST_V,
           u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V>
 struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                 BR_P_ENTRY_V, NUM_BANKS_V, SHARED_TAG_V, SHARED_U_V,
-                U_STOR_FF_V, DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V,
-                P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V,
-                METABITS_V, METAPIPE_V, META_TABLE_SIZE_V, USE_PATH_HIST_V,
-                PATH_HIST_WIDTH_V, PATH_BITS_V> : predictor {
+                SHARED_HYS_V, U_STOR_FF_V, DECAY_CTR_V, ResetFn_V,
+                USE_FF_CACHE_V, P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V,
+                USE_META_V, METABITS_V, METAPIPE_V, META_TABLE_SIZE_V,
+                USE_PATH_HIST_V, PATH_HIST_WIDTH_V, PATH_BITS_V> : predictor {
 
   using Base =
       TageBase<TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V, BR_P_ENTRY_V,
-               NUM_BANKS_V, true, SHARED_TAG_V, SHARED_U_V, U_STOR_FF_V,
-               DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V, P1_USE_GSHARE_V,
-               P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V, METABITS_V, METAPIPE_V,
-               META_TABLE_SIZE_V, USE_PATH_HIST_V, PATH_HIST_WIDTH_V,
-               PATH_BITS_V>;
+               NUM_BANKS_V, true, SHARED_TAG_V, SHARED_U_V, SHARED_HYS_V,
+               U_STOR_FF_V, DECAY_CTR_V, ResetFn_V, USE_FF_CACHE_V,
+               P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V,
+               METABITS_V, METAPIPE_V, META_TABLE_SIZE_V, USE_PATH_HIST_V,
+               PATH_HIST_WIDTH_V, PATH_BITS_V>;
 
   static constexpr u64 NUM_TABLES = Base::NUM_TABLES;
   static constexpr u64 FETCH_WIDTH = Base::FETCH_WIDTH;
@@ -1076,6 +964,7 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   static constexpr u64 BR_P_ENTRY = Base::BR_P_ENTRY;
   static constexpr u64 MAX_TAG_WIDTH = Base::MAX_TAG_WIDTH;
   static constexpr u64 MAX_CTR_WIDTH = Base::MAX_CTR_WIDTH;
+  static constexpr u64 MAX_HYST_WIDTH = Base::MAX_HYST_WIDTH;
   static constexpr u64 MAX_U_WIDTH = Base::MAX_U_WIDTH;
   static constexpr u64 MAX_IDX_BITS = Base::MAX_IDX_BITS;
   static constexpr u64 MAX_HTAGBITS = Base::MAX_HTAGBITS;
@@ -1161,7 +1050,7 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
   // ======== U-bit Management ========
   static constexpr u64 UCTRBITS = 8;
-  std::conditional_t<U_STOR_FF_V, reg<UCTRBITS>, EmptyMember> uctr;
+  reg<UCTRBITS> uctr;
 
   // ======== UPDATE_ONLY Zone ========
   zone UPDATE_ONLY;
@@ -1226,10 +1115,11 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 template <typename TableCfg = DefaultTableConfig,
           typename AllocCfg = DefaultAllocConfig,
           // Global hardware params
-          u64 TAGE_FETCH_WIDTH = 8, u64 TAGE_BIMODAL_SIZE = 4096,
+          u64 TAGE_FETCH_WIDTH = 16, u64 TAGE_BIMODAL_SIZE = 4096,
           u64 TAGE_BR_P_ENTRY = 1, u64 TAGE_NUM_BANKS = 1,
           bool TAGE_USE_AHEAD = false, bool TAGE_SHARED_TAG = true,
-          bool TAGE_SHARED_U = true, bool TAGE_U_STOR_FF = false,
+          bool TAGE_SHARED_U = true, bool TAGE_SHARED_HYS = true,
+          bool TAGE_U_STOR_FF = false,
           u64 TAGE_DECAY_CTR = 1024, typename ResetFn = DefaultResetFn,
           bool TAGE_USE_FF_CACHE = false,
           // P1 params
@@ -1244,7 +1134,8 @@ template <typename TableCfg = DefaultTableConfig,
 using Tage =
     TageImpl<TAGE_USE_AHEAD, TableCfg, AllocCfg, TAGE_FETCH_WIDTH,
              TAGE_BIMODAL_SIZE, TAGE_BR_P_ENTRY, TAGE_NUM_BANKS,
-             TAGE_SHARED_TAG, TAGE_SHARED_U, TAGE_U_STOR_FF, TAGE_DECAY_CTR,
+             TAGE_SHARED_TAG, TAGE_SHARED_U, TAGE_SHARED_HYS,
+             TAGE_U_STOR_FF, TAGE_DECAY_CTR,
              ResetFn, TAGE_USE_FF_CACHE, TAGE_P1_USE_GSHARE, TAGE_P1_TABLE_SIZE,
              TAGE_P1_HIST, TAGE_USE_META, TAGE_METABITS, TAGE_METAPIPE,
              TAGE_META_TABLE_SIZE, TAGE_USE_PATH_HIST, TAGE_PATH_HIST_WIDTH,

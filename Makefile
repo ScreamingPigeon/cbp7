@@ -23,12 +23,12 @@ TRACE_READER := $(TRACE_DIR)/trace_reader.hpp
 PREDICTOR_TYPE ?= tage<>
 TRACE ?= ./gcc_test_trace.gz
 TRACE_NAME ?= test
-WARMUP ?= 1000000
-MEASURE ?= 40000000
+WARMUP ?= 1000
+MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions compare compare-all clean
 
 all: cbp reference
 
@@ -104,6 +104,18 @@ cbp-profile-analyze: out/cbp-profile
 cbp-profile-analyze-regions: out/cbp-profile
 	./out/cbp-profile --format csv --mode analyze --profile --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
 	@echo "=== Per-Function Analysis with Regions ===" && tail -40 out/profile_analyze.txt
+
+# Compare two predictors side-by-side.
+# Single trace:  make compare TRACE=path/to/trace.gz
+# All traces:    make compare-all TRACE_DIR=path/to/traces/
+PRED_A ?= Tage<>
+PRED_B ?= tage<>
+TRACE_DIR ?= ./traces
+compare:
+	scripts/compare_predictors.sh '$(PRED_A)' '$(PRED_B)' '$(TRACE)' $(WARMUP) $(MEASURE) '$(EXTRA_COMMON_FLAGS) $(EXTRA_CBP_FLAGS)'
+
+compare-all:
+	scripts/compare_predictors.sh --dir '$(PRED_A)' '$(PRED_B)' '$(TRACE_DIR)' $(WARMUP) $(MEASURE) '$(EXTRA_COMMON_FLAGS) $(EXTRA_CBP_FLAGS)'
 
 test-tage-compile: tests/test_tage_compile.cpp predictors/custom/Tage.hpp predictors/custom/TageTable.hpp harcom.hpp
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz
