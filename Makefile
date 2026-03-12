@@ -105,13 +105,6 @@ cbp-profile-analyze-regions: out/cbp-profile
 	./out/cbp-profile --format csv --mode analyze --profile --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
 	@echo "=== Per-Function Analysis with Regions ===" && tail -40 out/profile_analyze.txt
 
-sweep-gshareN-loop:
-	python3 scripts/sweep_predictors.py --config sweeps/gshareN_loop_grid.yaml
-
-sweep-gshareN-loop-small:
-	python3 scripts/sweep_predictors.py --config sweeps/gshareN_loop_small.yaml
-
-
 clean:
 	rm -f cbp reference
 	rm -f $(PREDICTOR_MK)

@@ -12,7 +12,7 @@ sanitize: none
 defines: []
 extra_include_dirs: []
 
-trace: ./trace_files/gcc_test_trace.gz
+trace: ./trace_files/fp_11_trace.gz
 trace_name: test
 warmup: 1000000
 measure: 40000000
