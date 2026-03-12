@@ -16,8 +16,8 @@ EXTRA_COMMON_FLAGS ?=
 EXTRA_CBP_FLAGS ?=
 
 # for trace analysis
-TRACE_DIR := trace_files
-TRACE_READER := $(TRACE_DIR)/trace_reader.hpp
+TRACE_DIR := traces
+TRACE_READER := trace_files/trace_reader.hpp
 
 -include $(PREDICTOR_MK)
 PREDICTOR_TYPE ?= tage<>
@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions compare compare-all sweep sweep-report clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions compare compare-all quick-eval quick-eval-all gsweep gsweep-report sweep sweep-report clean
 
 all: cbp reference
 
@@ -43,6 +43,8 @@ help:
 	@echo "  make cbp-profile-acc-regions    Accuracy mode with per-region breakdown"
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
+	@echo "  make quick-eval                 Run current predictor on 20 representative traces"
+	@echo "  make quick-eval-all             Compare PRED_A vs PRED_B on representative traces"
 	@echo "  make trace-analyze    Build trace analysis tool"
 	@echo "  make run-trace-analyze Run trace analyzer on TRACE"
 	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
@@ -128,6 +130,36 @@ test-tagetable: tests/test_tagetable.cpp predictors/custom/TageTable.hpp harcom.
 
 test-tagetable-sweep: tests/test_tagetable_sweep.cpp predictors/custom/TageTable.hpp harcom.hpp
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
+
+# Quick evaluation on representative trace subset (20 traces)
+QUICK_JOBS ?= $(shell nproc)
+QUICK_OUT ?= out/quick
+
+quick-eval: cbp
+	scripts/quick_eval.sh ./cbp $(TRACE_DIR) $(QUICK_OUT) $(QUICK_JOBS)
+
+# Compare two predictors on the representative subset
+quick-eval-all:
+	@echo "=== Building and evaluating: $(PRED_A) ==="
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o out/quick_a cbp.cpp -lz -DPREDICTOR='$(PRED_A)'
+	scripts/quick_eval.sh ./out/quick_a $(TRACE_DIR) out/quick_a_results $(QUICK_JOBS)
+	@echo ""
+	@echo "=== Building and evaluating: $(PRED_B) ==="
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o out/quick_b cbp.cpp -lz -DPREDICTOR='$(PRED_B)'
+	scripts/quick_eval.sh ./out/quick_b $(TRACE_DIR) out/quick_b_results $(QUICK_JOBS)
+
+GSWEEP_CONFIGS ?= 60
+GSWEEP_JOBS ?= $(shell nproc)
+GSWEEP_SEED ?= 42
+
+gsweep:
+	$(PYTHON) scripts/gaussian_sweep.py \
+		-n $(GSWEEP_CONFIGS) --seed $(GSWEEP_SEED) -j $(GSWEEP_JOBS) \
+		--trace-dir $(TRACE_DIR) \
+		--extra-flags '$(EXTRA_COMMON_FLAGS) $(EXTRA_CBP_FLAGS)' --resume
+
+gsweep-report:
+	$(PYTHON) scripts/gaussian_sweep.py --report out/gsweep/results.csv --top $(GSWEEP_CONFIGS)
 
 SWEEP_TIER ?= 1
 SWEEP_JOBS ?= $(shell nproc)
