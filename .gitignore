@@ -3,6 +3,7 @@
 
 # Local simulator/reference binaries
 /cbp
+/cbp_profile
 /reference
 /test_harcom
 /a.out
@@ -12,3 +13,10 @@
 
 # Run outputs
 *.out
+
+/out/*
+/traces/*
+# Local training traces (large datasets)
+/cbp-ng_training_traces/
+/cbp-ng_training_traces.tar.gz
+
