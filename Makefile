@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions compare compare-all clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions compare compare-all sweep sweep-report clean
 
 all: cbp reference
 
@@ -128,6 +128,23 @@ test-tagetable: tests/test_tagetable.cpp predictors/custom/TageTable.hpp harcom.
 
 test-tagetable-sweep: tests/test_tagetable_sweep.cpp predictors/custom/TageTable.hpp harcom.hpp
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
+
+SWEEP_TIER ?= 1
+SWEEP_JOBS ?= $(shell nproc)
+SWEEP_WARMUP ?= 1000
+SWEEP_MEASURE ?= 10000
+
+sweep:
+	mkdir -p out/sweep
+	$(PYTHON) scripts/tage_sweep.py \
+		--tier $(SWEEP_TIER) --jobs $(SWEEP_JOBS) \
+		--traces $(wildcard traces/*_trace.gz) \
+		--warmup $(SWEEP_WARMUP) --measure $(SWEEP_MEASURE) \
+		--build-dir out/sweep/bin --output out/sweep/results.csv \
+		--extra-flags '$(EXTRA_COMMON_FLAGS) $(EXTRA_CBP_FLAGS)' --resume
+
+sweep-report:
+	$(PYTHON) scripts/tage_sweep.py --report out/sweep/results.csv --top 20
 
 clean:
 	rm -f cbp reference test-tage-compile test-tagetable test-tagetable-compile test-tagetable-sweep

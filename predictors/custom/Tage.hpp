@@ -98,6 +98,48 @@ struct DefaultTableConfig {
   static constexpr auto HIST_LEN = geometric_hist<NUM_TABLES>(MINHIST, MAXHIST);
 };
 
+// Constexpr helper: generate per-table sizes via a callable.
+template <std::size_t N, typename Fn>
+constexpr std::array<u64, N> generate_table_sizes(Fn fn) {
+  std::array<u64, N> s{};
+  for (std::size_t i = 0; i < N; i++)
+    s[i] = fn(i, N);
+  return s;
+}
+
+// Size lambda: geometric scaling from long-history (small) to short-history (large).
+// SIZE_RATIO=1: uniform. SIZE_RATIO=2: 2x range across tables.
+template <u64 SIZE, u64 SIZE_RATIO>
+constexpr auto size_fn = [](u64 i, u64 n) -> u64 {
+  if constexpr (SIZE_RATIO <= 1) return SIZE;
+  else {
+    double t = double(i) / std::max(1.0, double(n - 1));
+    double scale = constexpr_pow(double(SIZE_RATIO), t - 0.5);
+    u64 sz = u64(SIZE * scale);
+    // Round up to power of 2, minimum 64
+    u64 result = 64;
+    while (result < sz) result *= 2;
+    return result;
+  }
+};
+
+// Sweep-friendly table config: uniform values with optional geometric size scaling.
+template <u64 N = 8, u64 SIZE = 2048, u64 TAG = 11,
+          u64 CTR = 1, u64 HYST = 2, u64 U = 1,
+          u64 MINH = 2, u64 MAXH = 100, u64 SIZE_RATIO = 1>
+struct SweepTableConfig {
+  static constexpr u64 NUM_TABLES = N;
+  static constexpr u64 MINHIST = MINH;
+  static constexpr u64 MAXHIST = MAXH;
+  static constexpr auto TABLE_SIZE =
+      generate_table_sizes<N>(size_fn<SIZE, SIZE_RATIO>);
+  static constexpr auto TAG_WIDTH = uniform_array<u64, N>(TAG);
+  static constexpr auto CTR_WIDTH = uniform_array<u64, N>(CTR);
+  static constexpr auto HYST_WIDTH = uniform_array<u64, N>(HYST);
+  static constexpr auto U_WIDTH = uniform_array<u64, N>(U);
+  static constexpr auto HIST_LEN = geometric_hist<N>(MINH, MAXH);
+};
+
 // Allocation policy configuration.
 struct DefaultAllocConfig {
   static constexpr u64 MAX_ALLOC = 1;

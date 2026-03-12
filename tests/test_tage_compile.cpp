@@ -96,6 +96,15 @@ using T9 = Tage<CustomTableConfig, DefaultAllocConfig,
                 /*BR_P_ENTRY=*/1, /*NUM_BANKS=*/1,
                 /*USE_AHEAD=*/true>;
 
+// ---- Test 10: SweepTableConfig with defaults (should match DefaultTableConfig) ----
+using T10 = Tage<SweepTableConfig<>>;
+
+// ---- Test 11: SweepTableConfig with SIZE_RATIO=2 ----
+using T11 = Tage<SweepTableConfig<8, 2048, 11, 1, 2, 1, 2, 100, 2>>;
+
+// ---- Test 12: SweepTableConfig with different table count ----
+using T12 = Tage<SweepTableConfig<4, 1024, 9, 2, 2, 1, 4, 64>>;
+
 // Force instantiation of all types
 void force_instantiate() {
   // Direct mode types — just verify the struct can be constructed
@@ -110,10 +119,21 @@ void force_instantiate() {
   static_assert(T7::NUM_TABLES == 8);  // FF u-bits
   static_assert(T8::NUM_TABLES == 8);  // path history
   static_assert(T9::NUM_TABLES == 4);  // ahead + custom
+  static_assert(T10::NUM_TABLES == 8); // sweep default
+  static_assert(T11::NUM_TABLES == 8); // sweep ratio=2
+  static_assert(T12::NUM_TABLES == 4); // sweep 4 tables
+
+  // Verify SweepTableConfig<> matches DefaultTableConfig
+  static_assert(SweepTableConfig<>::TABLE_SIZE == DefaultTableConfig::TABLE_SIZE);
+  static_assert(SweepTableConfig<>::TAG_WIDTH == DefaultTableConfig::TAG_WIDTH);
+  static_assert(SweepTableConfig<>::CTR_WIDTH == DefaultTableConfig::CTR_WIDTH);
+  static_assert(SweepTableConfig<>::HYST_WIDTH == DefaultTableConfig::HYST_WIDTH);
+  static_assert(SweepTableConfig<>::U_WIDTH == DefaultTableConfig::U_WIDTH);
+  static_assert(SweepTableConfig<>::HIST_LEN == DefaultTableConfig::HIST_LEN);
 }
 
 int main() {
-  std::cerr << "Phase 1 compile test: all " << 9
+  std::cerr << "Phase 1 compile test: all " << 12
             << " instantiations compiled successfully.\n";
   return 0;
 }
