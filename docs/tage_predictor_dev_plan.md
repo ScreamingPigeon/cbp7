@@ -443,3 +443,55 @@ difference (likely from bimodal write gating change or minor fanout differences)
 | P1 latency | 0.937 | 0.937 |
 | P2 latency | 1.86 | 1.86 |
 | Energy/instr (fJ) | 1,903 | 1,868 |
+
+---
+
+## Parameter Sweep Results (2026-03-13)
+
+### Infrastructure
+
+Three sweep scripts in `scripts/`:
+- **`gaussian_sweep.py`** — broad Gaussian sampling around defaults
+- **`tage_sweep.py`** — systematic tier-based sweep (has its own `TageConfig`, not using `sweep_common`)
+- **`coordinate_descent.py`** — greedy local optimizer using `SweepConfig` from `sweep_common.py`
+
+Coordinate descent: iteratively sweep one parameter at a time through its full domain, greedily accept the best value, repeat until no parameter improves in a full iteration. Checkpointing via `checkpoint.json`; eval cache backed by results CSV.
+
+### Coordinate Descent (20 representative traces)
+
+**Baseline `Tage<>`**: VFS=0.8763, MPKI=6.00, EPI=1182, P2=2 cycles
+**Best config `5029c8a8`**: VFS=0.8870 (+1.2%), MPKI=5.85, EPI=1245, P2=2 cycles
+
+138 configs evaluated across ~2.5 iterations (converged partway through iter 3).
+
+#### Changes from baseline
+
+| Param | Baseline | Best | Rationale |
+|-------|----------|------|-----------|
+| `tag_width` | 11 | 12 | Fewer aliasing collisions |
+| `hyst_width` | 2 | 3 | More stable counters |
+| `minhist` | 2 | 8 | Shortest table uses more history |
+| `maxhist` | 100 | 130 | Longer history range |
+| `p1_table_size` | 16384 | 32768 | 2× P1 gshare improves fast prediction |
+| `p1_hist` | 6 | 10 | More P1 history bits |
+| `metabits` | 4 | 2 | Less meta inertia, faster adaptation |
+| `metapipe` | 2 | 1 | Single meta pipeline stage |
+
+Unchanged: `num_tables` (8), `base_size` (2048), `size_ratio` (1.0), `bimodal_size` (8192), `decay_ctr` (2048), `ctr_width` (1), `u_width` (1).
+
+#### Parameter sensitivity (VFS spread across swept domain)
+
+| Sensitivity | Params | Spread |
+|-------------|--------|--------|
+| **Critical** | `maxhist` (0.260), `p1_table_size` (0.257), `tag_width` (0.165) | >0.10 |
+| **Moderate** | `base_size` (0.075), `num_tables` (0.045), `bimodal_size` (0.035), `hyst_width` (0.034), `metabits` (0.026) | 0.02–0.08 |
+| **Low** | `minhist` (0.013), `p1_hist` (0.007), `decay_ctr` (0.006), `u_width` (0.004), `metapipe` (0.003) | <0.02 |
+
+#### Key findings
+
+1. **P1 is the biggest lever** — 2× P1 table + longer P1 history gave repeated gains across iterations. P1 accuracy directly determines L1 latency and pipeline utilization.
+2. **History range matters** — maxhist=130 and minhist=8 improved accuracy across diverse workloads.
+3. **Tag width has a cliff** — below 10 bits, aliasing destroys accuracy. 12 is the sweet spot.
+4. **Core table geometry already optimal** — num_tables, base_size, size_ratio unchanged from baseline.
+5. **Meta predictor prefers small/fast** — metabits 4→2 and metapipe 2→1 both helped.
+6. **Multi-trace shifts priorities** — single-trace gaussian sweep favored smaller tables (EPI savings); 20-trace descent kept base_size=2048 (accuracy matters more across diverse workloads).
