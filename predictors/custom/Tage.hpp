@@ -1049,8 +1049,13 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   reg<LOGLANES> XL;    // address bits for lane selection
   reg<LOGPATHS> path;  // path taken out of previous block
 
-  // Cached bank predictions: read in previous cycle, selected in current
-  // TODO: size and structure depends on TageTable ahead banking layout
+  // ======== Cached Bank Reads (populated in predict1 for next block) ========
+  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> cached_tag[PATHS];
+  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> cached_pred[PATHS];
+  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> cached_hyst[PATHS];
+  arr<reg<MAX_U_WIDTH>, NUM_TABLES> cached_u[PATHS];
+  arr<reg<1>, FETCH_WIDTH> cached_bim[PATHS];
+  arr<reg<1>, FETCH_WIDTH> cached_p1[PATHS];
 
   // ======== P1 State ========
   std::conditional_t<P1_USE_GSHARE_V, reg<P1_HIST_V>, EmptyMember>
@@ -1059,19 +1064,19 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   arr<reg<1>, FETCH_WIDTH> readp1;
   reg<FETCH_WIDTH> p1;
 
-  // P1 tables
-  hcm::ram<val<1>, P1_ENTRIES> table1_pred[FETCH_WIDTH]{"P1 pred"};
+  // P1 tables (banked for ahead paths)
+  hcm::ram<val<1>, P1_ENTRIES> table1_pred[FETCH_WIDTH * PATHS]{"P1 pred"};
 
   // ======== Bimodal (P2 base) ========
   reg<BINDEX_BITS> bindex[2]; // pipelined bimodal index
   arr<reg<1>, FETCH_WIDTH> readb;
-  hcm::ram<val<1>, BIM_ENTRIES> bim[FETCH_WIDTH]{"bpred"};
+  hcm::ram<val<1>, BIM_ENTRIES> bim[FETCH_WIDTH * PATHS]{"bpred"};
 
   // ======== P2 Result Registers ========
   arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> readt;
-  arr<reg<1>, NUM_TABLES> readc;
-  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> readh;
-  arr<reg<1>, NUM_TABLES> readu;
+  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> readc;
+  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> readh;
+  arr<reg<MAX_U_WIDTH>, NUM_TABLES> readu;
   reg<NUM_TABLES> notumask;
 
   // ======== Match Registers ========
@@ -1098,8 +1103,8 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
   // ======== UPDATE_ONLY Zone ========
   zone UPDATE_ONLY;
-  hcm::ram<val<1>, P1_ENTRIES> table1_hyst[FETCH_WIDTH]{"P1 hyst"};
-  hcm::ram<val<1>, BIM_ENTRIES> bhyst[FETCH_WIDTH]{"bhyst"};
+  hcm::ram<val<1>, P1_ENTRIES> table1_hyst[FETCH_WIDTH * PATHS]{"P1 hyst"};
+  hcm::ram<val<1>, BIM_ENTRIES> bhyst[FETCH_WIDTH * PATHS]{"bhyst"};
 
   // ======== Block State ========
   u64 num_branch = 0;
