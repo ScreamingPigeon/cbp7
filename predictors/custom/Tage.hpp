@@ -1016,7 +1016,10 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   static constexpr u64 BINDEX_BITS = Base::BINDEX_BITS;
   static constexpr u64 P1_INDEX_BITS = Base::P1_INDEX_BITS;
 
-  // ---- Computed RAM sizes ----
+  // ---- Computed constants ----
+  static constexpr u64 UCTRBITS = 8;
+  static constexpr u64 PATHBITS = Base::PATH_BITS;
+  static constexpr u64 LINEADDR_BITS = std::max(BINDEX_BITS, MAX_IDX_BITS);
   static constexpr u64 P1_ENTRIES = P1_TABLE_SIZE_V / FETCH_WIDTH;
   static constexpr u64 BIM_ENTRIES = BIMODAL_SIZE_V / FETCH_WIDTH;
   static constexpr u64 META_RAM_SIZE =
@@ -1049,13 +1052,13 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   reg<LOGLANES> XL;    // address bits for lane selection
   reg<LOGPATHS> path;  // path taken out of previous block
 
-  // ======== Cached Bank Reads (populated in predict1 for next block) ========
-  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> cached_tag[PATHS];
-  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> cached_pred[PATHS];
-  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> cached_hyst[PATHS];
-  arr<reg<MAX_U_WIDTH>, NUM_TABLES> cached_u[PATHS];
-  arr<reg<1>, FETCH_WIDTH> cached_bim[PATHS];
-  arr<reg<1>, FETCH_WIDTH> cached_p1[PATHS];
+  // ======== Cached Bank Reads (2-deep pipeline: [0]=current, [1]=previous) ========
+  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> cached_tag[2][PATHS];
+  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> cached_pred[2][PATHS];
+  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> cached_hyst[2][PATHS];
+  arr<reg<MAX_U_WIDTH>, NUM_TABLES> cached_u[2][PATHS];
+  arr<reg<1>, FETCH_WIDTH> cached_bim[2][PATHS];
+  arr<reg<1>, FETCH_WIDTH> cached_p1[2][PATHS];
 
   // ======== P1 State ========
   std::conditional_t<P1_USE_GSHARE_V, reg<P1_HIST_V>, EmptyMember>
@@ -1088,17 +1091,12 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   reg<FETCH_WIDTH> p2;
 
   // ======== Meta-prediction ========
-  std::conditional_t<USE_META_V && META_TABLE_SIZE_V == 0,
-                     arr<reg<METABITS_V, i64>, METAPIPE_V>, EmptyMember>
-      meta_global;
-  std::conditional_t<USE_META_V && (META_TABLE_SIZE_V > 0),
-                     hcm::ram<val<METABITS_V, i64>, META_RAM_SIZE>, EmptyMember>
-      meta_table;
+  std::conditional_t<USE_META_V,
+      arr<reg<METABITS_V, i64>, METAPIPE_V>, EmptyMember> meta;
   std::conditional_t<USE_META_V, arr<reg<1>, FETCH_WIDTH>, EmptyMember>
       newly_alloc;
 
   // ======== U-bit Management ========
-  static constexpr u64 UCTRBITS = 8;
   reg<UCTRBITS> uctr;
 
   // ======== UPDATE_ONLY Zone ========
@@ -1121,37 +1119,720 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     block_size = 1;
   }
 
-  val<1> predict1([[maybe_unused]] val<64> inst_pc) override {
-    // TODO: Phase 5.5 — ahead P1 predict
+  val<1> predict1(val<64> inst_pc) override {
+    inst_pc.fanout(hard<100>{});
     new_block(inst_pc);
-    return val<1>{0};
+
+    // ---- Pipeline shift ----
+    gindex[0].fanout(hard<100>{});
+    htag[0].fanout(hard<100>{});
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      gindex[1][i] = gindex[0][i];
+      htag[1][i] = htag[0][i];
+    }
+    gindex[1].fanout(hard<100>{});
+    htag[1].fanout(hard<100>{});
+    XB[0].fanout(hard<100>{});
+    XB[1] = XB[0];
+    XB[1].fanout(hard<100>{});
+    index1[0].fanout(hard<100>{});
+    index1[1] = index1[0];
+    index1[1].fanout(hard<100>{});
+    bindex[0].fanout(hard<100>{});
+    bindex[1] = bindex[0];
+    bindex[1].fanout(hard<100>{});
+
+    // ---- Compute new XB[0], XL ----
+    XB[0] = inst_pc >> 2;
+    XL = inst_pc >> 2;
+
+    // ---- Compute new P1 index ----
+    val<std::max(P1_INDEX_BITS, P1_HIST_V)> p1_lineaddr =
+        inst_pc >> (LOG_FETCH_WIDTH + 2);
+    p1_lineaddr.fanout(hard<100>{});
+    if constexpr (P1_USE_GSHARE_V) {
+      if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
+        index1[0] = p1_lineaddr ^
+                     (val<P1_INDEX_BITS>{global_history1}
+                          << (P1_INDEX_BITS - P1_HIST_V));
+      } else {
+        index1[0] = global_history1.make_array(val<P1_INDEX_BITS>{})
+                         .append(p1_lineaddr)
+                         .fold_xor();
+      }
+    } else {
+      index1[0] = p1_lineaddr;
+    }
+    index1[0].fanout(hard<100>{});
+
+    // ---- Compute new TAGE indices and tags ----
+    val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
+    lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
+    gfolds.fanout(hard<2>{});
+
+    bindex[0] = lineaddr;
+    bindex[0].fanout(hard<100>{});
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      gindex[0][i] = lineaddr ^ gfolds.template get<0>(i);
+    }
+    if constexpr (USE_PATH_HIST_V) {
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        gindex[0][i] = val<MAX_IDX_BITS>{gindex[0][i]} ^
+                        val<MAX_IDX_BITS>{path_hist};
+      }
+    }
+    gindex[0].fanout(hard<100>{});
+
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      htag[0][i] =
+          val<MAX_HTAGBITS>{lineaddr}.reverse() ^ gfolds.template get<1>(i);
+    }
+
+    // ---- Pipeline shift: save previous cycle's cached reads ----
+    for (u64 p = 0; p < PATHS; p++) {
+      cached_tag[0][p].fanout(hard<2>{});
+      cached_pred[0][p].fanout(hard<2>{});
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        cached_hyst[0][p].fanout(hard<2>{});
+      }
+      cached_u[0][p].fanout(hard<2>{});
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        cached_tag[1][p][i] = cached_tag[0][p][i];
+        cached_pred[1][p][i] = cached_pred[0][p][i];
+        if constexpr (MAX_HYST_WIDTH > 0) {
+          cached_hyst[1][p][i] = cached_hyst[0][p][i];
+        }
+        cached_u[1][p][i] = cached_u[0][p][i];
+      }
+      cached_p1[0][p].fanout(hard<2>{});
+      cached_bim[0][p].fanout(hard<2>{});
+      for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+        cached_p1[1][p][offset] = cached_p1[0][p][offset];
+        cached_bim[1][p][offset] = cached_bim[0][p][offset];
+      }
+    }
+
+    // ---- Read ALL path banks from TAGE tables into stage [0] ----
+    for (u64 p = 0; p < PATHS; p++) {
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        auto &t = std::get<I>(tables);
+        cached_tag[0][p][I] = t.tag_ram[t.tag_ram_idx(p)].read(gindex[0][I]);
+        cached_pred[0][p][I] = t.pred_ram[p].read(gindex[0][I]);
+        if constexpr (MAX_HYST_WIDTH > 0) {
+          cached_hyst[0][p][I] = t.hyst_ram[p].read(gindex[0][I]);
+        }
+        if constexpr (U_STOR_FF_V) {
+          cached_u[0][p][I] = t.u_ff[t.u_storage_idx(p)].select(gindex[0][I]);
+        } else {
+          cached_u[0][p][I] = t.u_ram[t.u_storage_idx(p)].read(gindex[0][I]);
+        }
+      });
+    }
+
+    // ---- Read ALL path banks from P1 and bimodal into stage [0] ----
+    for (u64 p = 0; p < PATHS; p++) {
+      for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+        cached_p1[0][p][offset] =
+            table1_pred[p * FETCH_WIDTH + offset].read(index1[0]);
+        cached_bim[0][p][offset] =
+            bim[p * FETCH_WIDTH + offset].read(bindex[0]);
+      }
+    }
+
+    // ---- Select from PREVIOUS cycle's cached reads (stage [1]) ----
+    for (u64 p = 0; p < PATHS; p++) {
+      cached_tag[1][p].fanout(hard<2>{});
+      cached_pred[1][p].fanout(hard<2>{});
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        cached_hyst[1][p].fanout(hard<2>{});
+      }
+      cached_u[1][p].fanout(hard<2>{});
+      cached_p1[1][p].fanout(hard<2>{});
+      cached_bim[1][p].fanout(hard<2>{});
+    }
+    path.fanout(hard<100>{});
+    val<LOGPATHS> bank_sel = path ^ XB[1];
+    bank_sel.fanout(hard<100>{});
+
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      readt[I] = select(bank_sel, cached_tag[1][1][I], cached_tag[1][0][I]);
+      readc[I] = select(bank_sel, cached_pred[1][1][I], cached_pred[1][0][I]);
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        readh[I] = select(bank_sel, cached_hyst[1][1][I], cached_hyst[1][0][I]);
+      }
+      readu[I] = select(bank_sel, cached_u[1][1][I], cached_u[1][0][I]);
+    });
+
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      readp1[offset] =
+          select(bank_sel, cached_p1[1][1][offset], cached_p1[1][0][offset]);
+      readb[offset] =
+          select(bank_sel, cached_bim[1][1][offset], cached_bim[1][0][offset]);
+    }
+
+    // ---- P1 prediction ----
+    readp1.fanout(hard<100>{});
+    p1 = readp1.concat();
+    p1.fanout(hard<100>{});
+    reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1)});
+    return (block_entry & p1) != hard<0>{};
   }
 
   val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) override {
-    // TODO: Phase 5.5 — ahead P1 reuse predict
-    return val<1>{0};
+    return ((block_entry << block_size) & p1) != hard<0>{};
   }
 
   val<1> predict2([[maybe_unused]] val<64> inst_pc) override {
-    // TODO: Phase 5.5 — ahead P2 predict (select from cached bank reads)
-    return val<1>{0};
+    // All values (readt, readc, readh, readu, readb) already populated in predict1.
+    // htag[1] holds the previous cycle's hashed tags.
+    readt.fanout(hard<FETCH_WIDTH + 1>{});
+    readc.fanout(hard<3>{});
+    if constexpr (MAX_HYST_WIDTH > 0) {
+      readh.fanout(hard<2>{});
+    }
+    readu.fanout(hard<2>{});
+    readb.fanout(hard<2>{});
+    notumask = ~readu.concat();
+    notumask.fanout(hard<2>{});
+
+    // gather prediction bits
+    val<NUM_TABLES> gpreds = [&]() -> val<NUM_TABLES> {
+      if constexpr (MAX_CTR_WIDTH == 1) {
+        return readc.concat();
+      } else {
+        arr<val<1>, NUM_TABLES> gpred_split = [&](int i) -> val<1> {
+          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
+        };
+        return gpred_split.fo1().concat();
+      }
+    }();
+    gpreds.fanout(hard<FETCH_WIDTH>{});
+    arr<val<NUM_TABLES + 1>, FETCH_WIDTH> preds = [&](u64 offset) {
+      return concat(readb[offset], gpreds);
+    };
+    preds.fanout(hard<2 * FETCH_WIDTH>{});
+
+    // tag comparisons (using htag[1] from previous predict1)
+    if constexpr (BR_P_ENTRY_V == 1) {
+      arr<val<1>, NUM_TABLES> htagcmp_split = [&](int i) {
+        return val<MAX_HTAGBITS>{readt[i]} == htag[1][i];
+      };
+      val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
+      htagcmp.fanout(hard<FETCH_WIDTH>{});
+
+      static_loop<FETCH_WIDTH>([&]<u64 offset>() {
+        arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
+          return val<LOG_FETCH_WIDTH>{readt[i] >> MAX_HTAGBITS} ==
+                 hard<offset>{};
+        };
+        match[offset] =
+            concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
+      });
+    } else {
+      arr<val<1>, NUM_TABLES> tagcmp_split = [&](int i) {
+        return val<MAX_TAG_WIDTH>{readt[i]} == htag[1][i];
+      };
+      val<NUM_TABLES> tagcmp = tagcmp_split.fo1().concat();
+      for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+        match[offset] = concat(val<1>{1}, tagcmp);
+      }
+    }
+    match.fanout(hard<2>{});
+
+    // find longest match and select primary prediction
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      match1[offset] = match[offset].one_hot();
+    }
+    match1.fanout(hard<3>{});
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
+    }
+    pred1.fanout(hard<2>{});
+
+    // find second longest match and select secondary prediction
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      match2[offset] = (match[offset] ^ match1[offset]).one_hot();
+    }
+    match2.fanout(hard<2>{});
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
+    }
+    pred2.fanout(hard<2>{});
+
+    if constexpr (USE_META_V) {
+      meta.fanout(hard<2>{});
+      arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
+        return readh[i] == hard<0>{};
+      };
+      val<NUM_TABLES> coldctr = notumask & weakctr.fo1().concat();
+      coldctr.fanout(hard<FETCH_WIDTH>{});
+      val<1> metasign = (meta[METAPIPE_V - 1] >= hard<0>{});
+      metasign.fanout(hard<FETCH_WIDTH>{});
+      for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+        newly_alloc[offset] = (match1[offset] & coldctr) != hard<0>{};
+      }
+      newly_alloc.fanout(hard<2>{});
+      arr<val<1>, FETCH_WIDTH> altsel = [&](u64 offset) {
+        arr<val<1>, 3> inputs = {metasign, newly_alloc[offset],
+                                 match2[offset] != hard<0>{}};
+        return inputs.fo1().fold_and();
+      };
+      p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
+             return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
+           }}.concat();
+    } else {
+      p2 = pred1.concat();
+    }
+
+    p2.fanout(hard<FETCH_WIDTH>{});
+    val<1> taken = (block_entry & p2) != hard<0>{};
+    taken.fanout(hard<2>{});
+    reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1)});
+    return taken;
   }
 
   val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) override {
-    // TODO: Phase 5.5 — ahead P2 reuse predict
-    return val<1>{0};
+    val<1> taken = ((block_entry << block_size) & p2) != hard<0>{};
+    taken.fanout(hard<2>{});
+    reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1 - block_size)});
+    block_size++;
+    return taken;
   }
 
-  void update_condbr([[maybe_unused]] val<64> branch_pc,
-                     [[maybe_unused]] val<1> taken,
+  void update_condbr(val<64> branch_pc, val<1> taken,
                      [[maybe_unused]] val<64> next_pc) override {
-    // TODO: Phase 5.5 — ahead update_condbr
+    assert(num_branch < FETCH_WIDTH);
+    branch_offset[num_branch] = branch_pc >> 2;
+    branch_dir[num_branch] = taken;
+    num_branch++;
+    if (num_branch == BR_P_ENTRY) {
+      reuse_prediction(0);
+    }
   }
 
-  void
-  update_cycle([[maybe_unused]] instruction_info &block_end_info) override {
-    // TODO: Phase 5.5 — ahead update_cycle (write to index[1], path banking)
-    // TODO: Phase 8 — loop predictor override
+  void update_cycle(instruction_info &block_end_info) override {
+    val<1> &mispredict = block_end_info.is_mispredict;
+    val<64> &next_pc = block_end_info.next_pc;
+
+    if (num_branch == 0) {
+      val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
+      val<1> actual_block = ~(true_block & line_end.fo1());
+      actual_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
+      execute_if(actual_block, [&]() {
+        next_pc.fanout(hard<2>{});
+        if constexpr (P1_USE_GSHARE_V) {
+          global_history1 =
+              (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
+        }
+        gfolds.update(val<PATHBITS>{next_pc >> 2});
+        if constexpr (USE_PATH_HIST_V) {
+          path_hist =
+              (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
+        }
+        true_block = 1;
+      });
+      path = 0;
+      return;
+    }
+
+    // compute bank for writes to previous block's entries
+    val<LOGPATHS> bank = path ^ XB[1];
+    bank.fanout(hard<NUM_TABLES * 8 + FETCH_WIDTH * 8 + 4>{});
+
+    mispredict.fanout(hard<NUM_TABLES + 2>{});
+    val<1> correct_pred = ~mispredict;
+    correct_pred.fanout(hard<NUM_TABLES + 2>{});
+    index1[1].fanout(hard<FETCH_WIDTH * 3>{});
+    p2.fanout(hard<2>{});
+    bindex[1].fanout(hard<FETCH_WIDTH * 3>{});
+    gindex[1].fanout(hard<4>{});
+    htag[1].fanout(hard<3>{});
+    readb.fanout(hard<2>{});
+    readt.fanout(hard<4>{});
+    readc.fanout(hard<2>{});
+    if constexpr (MAX_HYST_WIDTH > 0) {
+      readh.fanout(hard<3>{});
+    }
+    match1.fanout(hard<3>{});
+    match2.fanout(hard<2>{});
+    pred1.fanout(hard<2>{});
+    pred2.fanout(hard<2 + NUM_TABLES>{});
+    branch_offset.fanout(hard<FETCH_WIDTH + NUM_TABLES + 1>{});
+    branch_dir.fanout(hard<2 + LOGPATHS>{});
+    gfolds.fanout(hard<2>{});
+    readu.fanout(hard<2>{});
+    if constexpr (USE_META_V) {
+      meta.fanout(hard<2>{});
+    }
+    val<LOG_FETCH_WIDTH> last_offset = branch_offset[num_branch - 1];
+    last_offset.fanout(hard<4 * NUM_TABLES + 2>{});
+
+    u64 update_valid = (u64(1) << num_branch) - 1;
+    arr<val<FETCH_WIDTH>, FETCH_WIDTH> update_mask = [&](u64 offset) {
+      arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 i) {
+        return branch_offset[i] == offset;
+      };
+      return match_offset.fo1().concat() & update_valid;
+    };
+    update_mask.fanout(hard<2>{});
+
+    arr<val<1>, FETCH_WIDTH> is_branch = [&](u64 offset) {
+      return update_mask[offset] != hard<0>{};
+    };
+    is_branch.fanout(hard<6>{});
+
+    val<FETCH_WIDTH> branch_mask = is_branch.concat();
+    val<FETCH_WIDTH> actualdirs = branch_dir.concat();
+    actualdirs.fanout(hard<FETCH_WIDTH>{});
+
+    arr<val<1>, FETCH_WIDTH> branch_taken = [&](u64 offset) {
+      return (actualdirs & update_mask[offset]) != hard<0>{};
+    };
+    branch_taken.fanout(hard<3>{});
+
+    arr<val<NUM_TABLES + 1>, FETCH_WIDTH> actual_match1 = [&](u64 offset) {
+      return select(is_branch[offset], match1[offset],
+                    val<NUM_TABLES + 1>{0});
+    };
+    actual_match1.fanout(hard<2>{});
+
+    val<NUM_TABLES> primary_mask = actual_match1.fold_or();
+    primary_mask.fanout(hard<2>{});
+    arr<val<1>, NUM_TABLES> primary = primary_mask.make_array(val<1>{});
+    primary.fanout(hard<3>{});
+
+    arr<val<1>, FETCH_WIDTH> primary_wrong = [&](u64 offset) {
+      return pred1[offset] != branch_taken[offset];
+    };
+    primary_wrong.fanout(hard<1 + PATHS>{});
+
+    // select candidate entries for allocation
+    val<NUM_TABLES> mispmask =
+        mispredict.replicate(hard<NUM_TABLES>{}).concat();
+    arr<val<1>, NUM_TABLES> last_tagcmp = [&](int i) {
+      if constexpr (BR_P_ENTRY_V == 1) {
+        return readt[i] == concat(last_offset, htag[1][i]);
+      } else {
+        return val<MAX_TAG_WIDTH>{readt[i]} == htag[1][i];
+      }
+    };
+    val<NUM_TABLES + 1> last_match1 =
+        last_tagcmp.fo1().append(1).concat().one_hot();
+    last_match1.fanout(hard<2>{});
+    val<NUM_TABLES> postmask =
+        mispmask.fo1() & val<NUM_TABLES>(last_match1 - 1);
+    postmask.fanout(hard<2>{});
+    val<NUM_TABLES> candallocmask = postmask & notumask;
+    candallocmask.fanout(hard<2>{});
+    val<NUM_TABLES> collamask = candallocmask.reverse();
+    collamask.fanout(hard<2>{});
+    val<NUM_TABLES> collamask1 = collamask.one_hot();
+    collamask1.fanout(hard<3>{});
+    val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
+    val<NUM_TABLES> collamask12 = select(
+        val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
+    arr<val<1>, NUM_TABLES> allocate =
+        collamask12.fo1().reverse().make_array(val<1>{});
+    allocate.fanout(hard<7>{});
+
+    // associate a branch direction to each global table
+    arr<val<1>, NUM_TABLES> bdir = [&](u64 i) {
+      if constexpr (BR_P_ENTRY_V == 1) {
+        val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
+        val<LOG_FETCH_WIDTH> offset =
+            select(allocate[i], last_offset, tag_offset.fo1());
+        offset.fanout(hard<FETCH_WIDTH>{});
+        arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 j) {
+          return branch_offset[j] == offset;
+        };
+        return (match_offset.fo1().concat() & update_valid & actualdirs) !=
+               hard<0>{};
+      } else {
+        return branch_taken[0];
+      }
+    };
+    bdir.fanout(hard<1 + PATHS>{});
+
+    // tell if global prediction is incorrect
+    arr<val<1>, NUM_TABLES> badpred1 = [&](u64 i) -> val<1> {
+      if constexpr (MAX_CTR_WIDTH == 1) {
+        return readc[i] != bdir[i];
+      } else {
+        return (readc[i] >> hard<MAX_CTR_WIDTH - 1>{}) != bdir[i];
+      }
+    };
+    badpred1.fanout(hard<3>{});
+
+    // does primary differ from alt?
+    arr<val<1>, NUM_TABLES> altdiffer = [&](u64 i) -> val<1> {
+      auto pred_dir = [&]() -> val<1> {
+        if constexpr (MAX_CTR_WIDTH == 1) {
+          return readc[i];
+        } else {
+          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
+        }
+      }();
+      if constexpr (BR_P_ENTRY_V == 1) {
+        val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
+        return pred_dir != pred2.select(tag_offset.fo1());
+      } else {
+        return pred_dir != pred2[0];
+      }
+    };
+
+    // is owning branch's prediction correct?
+    arr<val<1>, NUM_TABLES> goodpred = [&](u64 i) {
+      if constexpr (BR_P_ENTRY_V == 1) {
+        val<LOG_FETCH_WIDTH> tag_offset = readt[i] >> MAX_HTAGBITS;
+        return (tag_offset.fo1() != last_offset) | correct_pred;
+      } else {
+        return correct_pred;
+      }
+    };
+    goodpred.fanout(hard<2>{});
+
+    // do P1 and P2 agree?
+    val<FETCH_WIDTH> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
+    disagree_mask.fanout(hard<2>{});
+    arr<val<1>, FETCH_WIDTH> disagree = disagree_mask.make_array(val<1>{});
+    disagree.fanout(hard<2>{});
+
+    // read the P1 hysteresis if P1 and P2 disagree (banked for ahead)
+    arr<val<1>, FETCH_WIDTH> p1_weak = [&](u64 offset) -> val<1> {
+      return execute_if(disagree[offset], [&]() -> val<1> {
+        // read from all path banks, select correct one
+        arr<val<1>, PATHS> reads = [&](u64 p) -> val<1> {
+          return table1_hyst[p * FETCH_WIDTH + offset].read(index1[1]);
+        };
+        return ~reads.select(bank);
+      });
+    };
+
+    // read the bimodal hysteresis if bimodal caused a misprediction (banked)
+    arr<val<1>, FETCH_WIDTH> b_weak = [&](u64 offset) -> val<1> {
+      val<1> bim_primary = actual_match1[offset] >> NUM_TABLES;
+      return execute_if(bim_primary.fo1() & primary_wrong[offset],
+                        [&]() -> val<1> {
+        arr<val<1>, PATHS> reads = [&](u64 p) -> val<1> {
+          return bhyst[p * FETCH_WIDTH + offset].read(bindex[1]);
+        };
+        return ~reads.select(bank);
+      });
+    };
+
+    // determine which primary global predictions are incorrect with weak hyst
+    arr<val<1>, NUM_TABLES> g_weak = [&](u64 i) -> val<1> {
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        return primary[i] & badpred1[i] & (readh[i] == hard<0>{});
+      } else {
+        return primary[i] & badpred1[i];
+      }
+    };
+    g_weak.fanout(hard<2>{});
+
+    // need extra cycle for modifying prediction bits and for TAGE allocation
+    val<1> some_badpred1 =
+        (primary_mask & badpred1.concat()) != hard<0>{};
+    val<1> extra_cycle =
+        some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
+    extra_cycle.fanout(hard<NUM_TABLES * 2 * PATHS + 1>{});
+    need_extra_cycle(extra_cycle);
+
+    // update meta counter
+    if constexpr (USE_META_V) {
+      arr<val<1>, FETCH_WIDTH> altdiff = [&](u64 offset) {
+        return (match2[offset] != hard<0>{}) &
+               (pred2[offset] != pred1[offset]);
+      };
+      arr<val<2, i64>, FETCH_WIDTH> meta_incr =
+          [&](u64 offset) -> val<2, i64> {
+        val<1> update_meta = is_branch[offset] & altdiff[offset].fo1() &
+                             newly_alloc[offset];
+        val<1> bad_pred2 = (pred2[offset] != branch_taken[offset]);
+        return select(update_meta.fo1(),
+                      concat(bad_pred2.fo1(), val<1>{1}), val<2>{0});
+      };
+      for (u64 i = METAPIPE_V - 1; i != 0; i--) {
+        meta[i] = meta[i - 1];
+      }
+      auto newmeta = meta[0] + meta_incr.fo1().fold_add();
+      newmeta.fanout(hard<3>{});
+      using meta_t = valt<decltype(meta[0])>;
+      meta[0] =
+          select(newmeta > meta_t::maxval, meta_t{meta_t::maxval},
+                 select(newmeta < meta_t::minval, meta_t{meta_t::minval},
+                        meta_t{newmeta}));
+    }
+
+    // overwrite the tag in the allocated entry (banked writes)
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(allocate[I], [&]() {
+        auto &t = std::get<I>(tables);
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            if constexpr (BR_P_ENTRY_V == 1) {
+              t.tag_ram[t.tag_ram_idx(p)].write(gindex[1][I],
+                                                 concat(last_offset, htag[1][I]));
+            } else {
+              t.tag_ram[t.tag_ram_idx(p)].write(gindex[1][I],
+                                                 val<MAX_TAG_WIDTH>{htag[1][I]});
+            }
+          });
+        });
+      });
+    });
+
+    // update the u bits (banked writes)
+    arr<val<1>, NUM_TABLES> update_u = [&](u64 i) {
+      return primary[i] & altdiffer[i].fo1();
+    };
+    val<1> noalloc = (candallocmask == hard<0>{});
+    val<NUM_TABLES> uclearmask =
+        postmask & noalloc.fo1().replicate(hard<NUM_TABLES>{}).concat();
+    arr<val<1>, NUM_TABLES> uclear =
+        uclearmask.fo1().make_array(val<1>{});
+    uclear.fanout(hard<2>{});
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(update_u[I].fo1() | allocate[I] | uclear[I], [&]() {
+        auto &t = std::get<I>(tables);
+        val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I];
+        newu.fanout(hard<PATHS>{});
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            if constexpr (U_STOR_FF_V) {
+              t.write_u_ff_arr(t.u_storage_idx(p), gindex[1][I], newu);
+            } else {
+              t.u_ram[t.u_storage_idx(p)].write(gindex[1][I], newu, extra_cycle);
+            }
+          });
+        });
+      });
+    });
+
+    // update P1 prediction if P1 and P2 disagree and hyst is weak (banked)
+    auto p2_split = p2.make_array(val<1>{});
+    p2_split.fanout(hard<PATHS>{});
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      execute_if(p1_weak[offset].fo1(), [&]() {
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            table1_pred[p * FETCH_WIDTH + offset].write(index1[1], p2_split[offset]);
+          });
+        });
+      });
+    }
+    // update P1 hysteresis (banked)
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      execute_if(is_branch[offset], [&]() {
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            table1_hyst[p * FETCH_WIDTH + offset].write(index1[1], ~disagree[offset]);
+          });
+        });
+      });
+    }
+
+    // update incorrect bimodal prediction if primary and hyst is weak (banked)
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      execute_if(b_weak[offset].fo1(), [&]() {
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            bim[p * FETCH_WIDTH + offset].write(bindex[1], branch_taken[offset]);
+          });
+        });
+      });
+    }
+    // update bimodal hysteresis if bimodal is primary (banked)
+    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+      val<1> bim_primary = match1[offset] >> NUM_TABLES;
+      execute_if(is_branch[offset] & bim_primary.fo1(), [&]() {
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            bhyst[p * FETCH_WIDTH + offset].write(bindex[1], ~primary_wrong[offset]);
+          });
+        });
+      });
+    }
+
+    // update global prediction counters (banked)
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(g_weak[I].fo1() | allocate[I], [&]() {
+        static_loop<PATHS>([&]<u64 p>() {
+          execute_if(bank == hard<p>{}, [&]() {
+            std::get<I>(tables).pred_ram[p].write(gindex[1][I], bdir[I]);
+          });
+        });
+      });
+    });
+    // update global prediction hysteresis (banked)
+    if constexpr (MAX_HYST_WIDTH > 0) {
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        execute_if(primary[I] | allocate[I], [&]() {
+          auto newhyst = select(allocate[I],
+                                val<std::max(u64(1), MAX_HYST_WIDTH)>{0},
+                                update_ctr(readh[I], ~badpred1[I]));
+          newhyst.fanout(hard<PATHS>{});
+          static_loop<PATHS>([&]<u64 p>() {
+            execute_if(bank == hard<p>{}, [&]() {
+              std::get<I>(tables).hyst_ram[p].write(gindex[1][I], newhyst, extra_cycle);
+            });
+          });
+        });
+      });
+    }
+
+    // u-bit epoch reset
+    uctr.fanout(hard<3>{});
+    val<NUM_TABLES> allocmask1 = collamask1.reverse();
+    allocmask1.fanout(hard<2>{});
+    val<1> faralloc =
+        (((last_match1 >> 3) | allocmask1).one_hot() ^ allocmask1) ==
+        hard<0>{};
+    val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
+    uctrsat.fanout(hard<2>{});
+    uctr = select(correct_pred, uctr,
+                  select(uctrsat, val<decltype(uctr)::size>{0},
+                         update_ctr(uctr, faralloc.fo1())));
+    if constexpr (U_STOR_FF_V) {
+      execute_if(uctrsat, [&]() {
+        static_loop<NUM_TABLES>([&]<u64 I>() {
+          std::get<I>(tables).reset_u(val<ResetFn_V::MODE_BITS>{0});
+        });
+      });
+    } else {
+      execute_if(uctrsat, [&]() {
+        static_loop<NUM_TABLES>([&]<u64 I>() {
+          auto &t = std::get<I>(tables);
+          static_loop<PATHS>([&]<u64 p>() {
+            t.u_ram[t.u_storage_idx(p)].reset();
+          });
+        });
+      });
+    }
+
+    // update global history
+    val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
+    true_block = correct_pred | branch_dir[num_branch - 1] | line_end.fo1();
+    true_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
+    execute_if(true_block, [&]() {
+      next_pc.fanout(hard<2>{});
+      if constexpr (P1_USE_GSHARE_V) {
+        global_history1 =
+            (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
+      }
+      gfolds.update(val<PATHBITS>{next_pc >> 2});
+      if constexpr (USE_PATH_HIST_V) {
+        path_hist =
+            (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
+      }
+    });
+
+    // record path: if last branch not-taken, path=0; else path=num_branch
+    path = num_branch &
+           branch_dir[num_branch - 1].replicate(hard<LOGPATHS>{}).concat();
+    path.fanout(hard<2>{});
+
+    num_branch = 0;
   }
 };
 

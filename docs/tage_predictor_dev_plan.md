@@ -336,29 +336,90 @@ Zero EPI/latency regression (EPI=1903, P2=1.86). All 9 compile test instantiatio
 
 ---
 
-## Phase 5.5: Validate Ahead Prediction
+## Phase 5.5: Ahead Prediction Mode — IN PROGRESS
 
 **Goal**: Implement and validate the ahead (1-branch-ahead) specialization.
 
-### 5.5.1 Implement ahead predict path
-- Pipeline registers (index[2], XB[2], XL, path)
-- Path banking: read all PATHS banks, select via `path ^ XB`
-- Lane XOR for even storage utilization
-- predict1/predict2 using previous block's cached reads
+**Architecture**: Ahead mode pre-reads table entries for the NEXT block during the current
+block's prediction, then selects the correct path variant when the next block arrives.
+All table reads move to predict1; predict2 becomes purely combinational. Updates write to
+`index[1]` (previous block) at bank `path ^ XB[1]`. Reference pattern: `gshareN_ahead.hpp`.
 
-### 5.5.2 Implement ahead update path
-- Write uses `index[1]` and `path ^ XB[1]`
-- Reuse shared update routines from Phase 2 (allocation, u-bit, meta, etc.)
+**Critical constraint**: Direct mode (USE_AHEAD=false) must have zero performance regression.
+Since direct and ahead are separate template specializations, direct mode code is untouched.
 
-### 5.5.3 Factor shared logic
-- Extract common update logic into free functions or CRTP base
-- Both direct and ahead specializations use the same helpers
+### 5.5.0 Expand ahead stub state ✓ COMPLETE
+- [x] Added `cached_tag/pred/hyst/u/bim/p1[PATHS]` arrays for multi-bank reads
+- [x] Fixed `readc` width (`reg<1>` → `reg<MAX_CTR_WIDTH>`) and `readu` (`reg<1>` → `reg<MAX_U_WIDTH>`)
+- [x] Expanded P1/bimodal RAMs to `[FETCH_WIDTH * PATHS]` for path banking
+- [x] Compile test passes (`make test-tage-compile`)
+- [x] Direct mode regression verified (identical output on gcc trace)
 
-### 5.5.4 Test
-- Ahead mode compiles and runs without crashes
-- HARCOM timing: verify read (current stage) and write (previous stage) don't conflict
-- Compare accuracy: ahead vs direct on same traces
-- Compare latency: ahead should have lower P2 critical path
+### 5.5.1 Implement ahead predict1 ✓ COMPLETE
+- Pipeline shift: `gindex[1]=gindex[0]`, `htag[1]=htag[0]`, `XB[1]=XB[0]`, `index1[1]=index1[0]`, `bindex[1]=bindex[0]`
+- Compute `XB[0]`, `XL` from inst_pc
+- Compute `gindex[0]`, `htag[0]`, `bindex[0]`, `index1[0]` (same formulas as direct mode)
+- Read ALL PATHS banks from all tables into `cached_*[p]` arrays
+- Read ALL PATHS banks from P1 + bimodal
+- Select from previous cycle's cached reads using `path ^ XB[1]` → populate `readt`, `readc`, `readh`, `readu`, `readb`, `readp1`
+- P1 prediction logic, return `(block_entry & p1) != 0`
+- **Note**: Ahead stub's meta is split into `meta_global`/`meta_table` vs direct mode's single `meta`
+
+### 5.5.2 Implement ahead predict2 ✓ COMPLETE
+- Purely combinational: no RAM reads, use pre-populated `readt`, `readc`, `readh`, `readu`, `readb`
+- Tag comparison uses `htag[1]` (from previous predict1)
+- Match, one_hot, meta select logic identical to direct mode
+- Return `(block_entry & p2) != 0`
+
+### 5.5.3 Implement reuse_predict1/2, update_condbr ✓ COMPLETE
+- Identical to direct mode (use cached per-offset predictions)
+
+### 5.5.4 Implement ahead update_cycle ✓ COMPLETE
+- Copy direct mode update_cycle with these changes:
+  - Replace `gindex` → `gindex[1]`, `bindex` → `bindex[1]`, `index1` → `index1[1]`, `htag` → `htag[1]`
+  - Compute `bank = path ^ XB[1]`
+  - Wrap ALL RAM writes in bank-selection: `static_loop<PATHS>([&]<u64 p>() { execute_if(bank == hard<p>{}, ...) })`
+    (`execute_if` with false condition skips RAM writes entirely — safe)
+  - Compute path: `path = num_branch & branch_dir[num_branch-1].replicate(hard<LOGPATHS>{}).concat()`
+  - `num_branch == 0` early return: set `path = 0`, update history
+
+**Bug found and fixed — PATHS fanout scaling**: When `PATHS > 1`, any value consumed
+inside `static_loop<PATHS>` is read PATHS times (execute_if always evaluates). Three types
+of fixes needed:
+1. **`.fo1()` inside path loop**: `newu.fo1()`, `p2_split[offset].fo1()`, `newhyst.fo1()` — each
+   consumed PATHS times but fo1() only allows 1 read. Fix: add `fanout(hard<PATHS>{})` before
+   the loop and remove `.fo1()`.
+2. **Fanout values that scale with PATHS**: `extra_cycle` needed `NUM_TABLES * 2 * PATHS + 1`
+   (was `NUM_TABLES * 2 + 1`); `primary_wrong` and `bdir` needed `1 + PATHS` (was `2`).
+3. **Root cause**: Direct mode has no `static_loop<PATHS>` (PATHS=1), so every RAM write
+   executes exactly once. The ahead mode wraps writes in path-selection loops, doubling the
+   read count for all values passed to writes. This is invisible in direct mode.
+
+### 5.5.5 Fanout tuning — TODO
+- predict1 currently uses `hard<100>{}` placeholder fanouts that need proper values
+- Key fanout needs: `gindex[0][I]` (PATHS+1), `index1[0]` (PATHS*FETCH_WIDTH), `bank_sel` (NUM_TABLES*4 + FETCH_WIDTH*2)
+- update_cycle fanouts adjusted for PATHS scaling (see 5.5.4 bug fix)
+- Tune after functional correctness is achieved
+
+### 5.5.6 Lane XOR (deferred)
+- Skip `XL`-based lane shuffling initially
+- Add later if utilization is uneven
+
+### 5.5.7 Validation — IN PROGRESS
+- [x] Direct mode: output on gcc trace identical to baseline (26,870 mispredictions)
+- [ ] Ahead compile: `make test-tage-compile` (T3, T9)
+- [ ] Ahead functional: runs on gcc trace without crash. **212,252 mispredictions** (vs 26,870 direct).
+  Logic bugs remain — accuracy gap is ~8x, not the expected ~1-5% from ahead lookahead error.
+- [ ] Ahead vs direct comparison: `make compare` on multiple traces
+- [ ] Full sweep: `scripts/quick_eval.sh` on 20 representative traces
+
+### Design decisions
+1. **All table reads in predict1** — predict2 is purely combinational
+2. **Dynamic bank selection via execute_if** — RAM array indices are compile-time u64
+3. **P1/bimodal banking** — arrays expanded to `[FETCH_WIDTH * PATHS]`
+4. **No lane XOR initially** — deferred for simplicity
+5. **Flat inline code** — no helper functions (Phase 3.6 finding: function calls cause EPI overhead)
+6. **No shared logic extraction** — keep direct and ahead fully independent to avoid regression risk
 
 ---
 
