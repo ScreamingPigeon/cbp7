@@ -1120,27 +1120,29 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   }
 
   val<1> predict1(val<64> inst_pc) override {
-    inst_pc.fanout(hard<100>{});
+    // inst_pc reads: new_block(1) + XB[0](1) + XL(1) + p1_lineaddr(1) + lineaddr(1) = 5
+    inst_pc.fanout(hard<5>{});
     new_block(inst_pc);
 
     // ---- Pipeline shift ----
-    gindex[0].fanout(hard<100>{});
-    htag[0].fanout(hard<100>{});
+    // Old values read once each for shift
+    gindex[0].fanout(hard<2>{});
+    htag[0].fanout(hard<2>{});
     for (u64 i = 0; i < NUM_TABLES; i++) {
       gindex[1][i] = gindex[0][i];
       htag[1][i] = htag[0][i];
     }
-    gindex[1].fanout(hard<100>{});
-    htag[1].fanout(hard<100>{});
-    XB[0].fanout(hard<100>{});
+    // gindex[1]/htag[1]: no reads in predict1, re-fanouted in update_cycle
+    XB[0].fanout(hard<2>{});
     XB[1] = XB[0];
-    XB[1].fanout(hard<100>{});
-    index1[0].fanout(hard<100>{});
+    // XB[1]: read once in predict1 (bank_sel) + once in update_cycle (bank)
+    XB[1].fanout(hard<2>{});
+    index1[0].fanout(hard<2>{});
     index1[1] = index1[0];
-    index1[1].fanout(hard<100>{});
-    bindex[0].fanout(hard<100>{});
+    // index1[1]: no reads in predict1, re-fanouted in update_cycle
+    bindex[0].fanout(hard<2>{});
     bindex[1] = bindex[0];
-    bindex[1].fanout(hard<100>{});
+    // bindex[1]: no reads in predict1, re-fanouted in update_cycle
 
     // ---- Compute new XB[0], XL ----
     XB[0] = inst_pc >> 2;
@@ -1149,7 +1151,7 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // ---- Compute new P1 index ----
     val<std::max(P1_INDEX_BITS, P1_HIST_V)> p1_lineaddr =
         inst_pc >> (LOG_FETCH_WIDTH + 2);
-    p1_lineaddr.fanout(hard<100>{});
+    p1_lineaddr.fanout(hard<2>{});
     if constexpr (P1_USE_GSHARE_V) {
       if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
         index1[0] = p1_lineaddr ^
@@ -1163,7 +1165,8 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     } else {
       index1[0] = p1_lineaddr;
     }
-    index1[0].fanout(hard<100>{});
+    // index1[0]: read PATHS * FETCH_WIDTH times for P1 table reads
+    index1[0].fanout(hard<PATHS * FETCH_WIDTH>{});
 
     // ---- Compute new TAGE indices and tags ----
     val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
@@ -1171,7 +1174,8 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     gfolds.fanout(hard<2>{});
 
     bindex[0] = lineaddr;
-    bindex[0].fanout(hard<100>{});
+    // bindex[0]: read PATHS * FETCH_WIDTH times for bimodal reads
+    bindex[0].fanout(hard<PATHS * FETCH_WIDTH>{});
     for (u64 i = 0; i < NUM_TABLES; i++) {
       gindex[0][i] = lineaddr ^ gfolds.template get<0>(i);
     }
@@ -1181,7 +1185,8 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                         val<MAX_IDX_BITS>{path_hist};
       }
     }
-    gindex[0].fanout(hard<100>{});
+    // gindex[0][I]: read PATHS * (tag + pred + hyst + u) = PATHS * 4 per element
+    gindex[0].fanout(hard<PATHS * 4>{});
 
     for (u64 i = 0; i < NUM_TABLES; i++) {
       htag[0][i] =
@@ -1250,9 +1255,11 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       cached_p1[1][p].fanout(hard<2>{});
       cached_bim[1][p].fanout(hard<2>{});
     }
-    path.fanout(hard<100>{});
+    // path: read once for bank_sel
+    path.fanout(hard<2>{});
     val<LOGPATHS> bank_sel = path ^ XB[1];
-    bank_sel.fanout(hard<100>{});
+    // bank_sel: NUM_TABLES * (tag+pred+hyst+u) + FETCH_WIDTH * (p1+bim) selects
+    bank_sel.fanout(hard<NUM_TABLES * 4 + FETCH_WIDTH * 2>{});
 
     static_loop<NUM_TABLES>([&]<u64 I>() {
       readt[I] = select(bank_sel, cached_tag[1][1][I], cached_tag[1][0][I]);
@@ -1271,9 +1278,10 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
 
     // ---- P1 prediction ----
-    readp1.fanout(hard<100>{});
+    readp1.fanout(hard<2>{});
     p1 = readp1.concat();
-    p1.fanout(hard<100>{});
+    // p1: predict1 return(1) + reuse_predict1(FW-1) + update_cycle disagree(1)
+    p1.fanout(hard<FETCH_WIDTH + 1>{});
     reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1)});
     return (block_entry & p1) != hard<0>{};
   }
