@@ -37,7 +37,7 @@ from sweep_common import (
 PARAM_DOMAINS = {
     "num_tables":    [4, 6, 8, 10, 12],
     "base_size":     [256, 512, 1024, 2048, 4096, 8192],
-    "size_ratio":    [1.0, 1.5, 2.0, 3.0, 4.0],
+    "size_ratio":    [1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
     "tag_width":     [7, 8, 9, 10, 11, 12, 13, 15],
     "ctr_width":     [1, 2, 3],
     "hyst_width":    [1, 2, 3],
@@ -45,18 +45,33 @@ PARAM_DOMAINS = {
     "minhist":       [2, 3, 4, 6, 8],
     "maxhist":       [50, 75, 100, 130, 160, 200, 300, 400],
     "bimodal_size":  [1024, 2048, 4096, 8192, 16384],
-    "decay_ctr":     [256, 512, 1024, 2048, 4096],
+    "decay_ctr":     [0, 6, 8, 10, 12],
+    "decay_gran":    [0, 2, 4, 6],
     "p1_table_size": [4096, 8192, 16384, 32768, 65536],
     "p1_hist":       [4, 5, 6, 7, 8, 10],
     "metabits":      [2, 3, 4, 6, 8],
     "metapipe":      [1, 2, 3],
+    # structural parameters
+    "shared_tag":       [True, False],
+    "shared_u":         [True, False],
+    "shared_hys":       [True, False],
+    "u_stor_ff":        [True, False],
+    "use_path_hist":    [True, False],
+    "path_hist_width":  [10, 16, 20, 27, 32],
+    "path_bits":        [3, 4, 6, 8],
 }
 
-# Sweep order: most impactful parameters first (based on prior sweep insights)
+# Sweep order: most impactful parameters first (based on prior sweep insights),
+# then never-evaluated params, then new structural params
 PARAM_ORDER = [
-    "maxhist", "minhist", "base_size", "num_tables", "tag_width",
-    "bimodal_size", "p1_table_size", "decay_ctr", "p1_hist",
-    "size_ratio", "ctr_width", "hyst_width", "metabits", "metapipe", "u_width",
+    "maxhist", "minhist",
+    # frozen for now: "num_tables", "tag_width",
+    #                  "bimodal_size", "p1_table_size", "hyst_width"
+    "decay_ctr", "decay_gran", "p1_hist",
+    "base_size", "size_ratio", "ctr_width", "metabits", "metapipe", "u_width",
+    # structural params
+    "use_path_hist", "path_hist_width", "path_bits",
+    "shared_tag", "shared_u", "shared_hys", "u_stor_ff",
 ]
 
 

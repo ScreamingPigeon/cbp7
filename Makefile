@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions compare compare-all quick-eval quick-eval-all gsweep gsweep-report sweep sweep-report clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all gsweep gsweep-report sweep sweep-report clean
 
 all: cbp reference
 
@@ -43,6 +43,7 @@ help:
 	@echo "  make cbp-profile-acc-regions    Accuracy mode with per-region breakdown"
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
+	@echo "  make cbp-monitor                Build+run with TAGE monitor (output to MONITOR_OUT)"
 	@echo "  make quick-eval                 Run current predictor on 20 representative traces"
 	@echo "  make quick-eval-all             Compare PRED_A vs PRED_B on representative traces"
 	@echo "  make trace-analyze    Build trace analysis tool"
@@ -106,6 +107,18 @@ cbp-profile-analyze: out/cbp-profile
 cbp-profile-analyze-regions: out/cbp-profile
 	./out/cbp-profile --format csv --mode analyze --profile --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
 	@echo "=== Per-Function Analysis with Regions ===" && tail -40 out/profile_analyze.txt
+
+# TAGE Monitor: build with SW instrumentation and run
+# Requires CHEATING_MODE for val<> data extraction. Zero cost when not enabled.
+MONITOR_FLAGS := -DTAGE_MONITOR -DCHEATING_MODE
+MONITOR_OUT ?= out/monitor.txt
+
+out/cbp-monitor: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | out
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) $(MONITOR_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
+
+cbp-monitor: out/cbp-monitor
+	./out/cbp-monitor $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 2> $(MONITOR_OUT)
+	@echo "=== TAGE Monitor ===" && cat $(MONITOR_OUT)
 
 # Compare two predictors side-by-side.
 # Single trace:  make compare TRACE=path/to/trace.gz

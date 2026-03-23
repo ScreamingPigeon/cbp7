@@ -100,11 +100,20 @@ class SweepConfig:
     minhist: int = 2
     maxhist: int = 100
     bimodal_size: int = 4096
-    decay_ctr: int = 1024
+    decay_ctr: int = 0
+    decay_gran: int = 0
     p1_table_size: int = 16384
     p1_hist: int = 6
     metabits: int = 4
     metapipe: int = 2
+    # structural parameters
+    shared_tag: bool = True
+    shared_u: bool = True
+    shared_hys: bool = True
+    u_stor_ff: bool = False
+    use_path_hist: bool = False
+    path_hist_width: int = 27
+    path_bits: int = 6
 
     @property
     def config_id(self) -> str:
@@ -124,13 +133,19 @@ class SweepConfig:
         tc = (f"SweepTableConfig<{self.num_tables},{self.base_size},"
               f"{self.tag_width},{self.ctr_width},{self.hyst_width},"
               f"{self.u_width},{self.minhist},{self.maxhist},{sr_int}>")
+        b = lambda v: "true" if v else "false"
         parts = [tc, "DefaultAllocConfig",
                  "16", str(self.bimodal_size), "1", "1",
-                 "false", "true", "true", "true", "false",
-                 str(self.decay_ctr), "DefaultResetFn", "false",
+                 "false",  # USE_AHEAD
+                 b(self.shared_tag), b(self.shared_u), b(self.shared_hys),
+                 b(self.u_stor_ff),
+                 str(self.decay_ctr), str(self.decay_gran),
+                 "DefaultResetFn", "false",  # USE_FF_CACHE
                  "true", str(self.p1_table_size), str(self.p1_hist),
                  "true", str(self.metabits), str(self.metapipe),
-                 "0", "false", "27", "6"]
+                 "0",  # META_TABLE_SIZE (not implemented)
+                 b(self.use_path_hist),
+                 str(self.path_hist_width), str(self.path_bits)]
         return f"Tage<{','.join(parts)}>"
 
     def replace(self, **kwargs) -> 'SweepConfig':

@@ -336,7 +336,7 @@ Zero EPI/latency regression (EPI=1903, P2=1.86). All 9 compile test instantiatio
 
 ---
 
-## Phase 5.5: Ahead Prediction Mode — FUNCTIONALLY COMPLETE
+## Phase 5.5: Ahead Prediction Mode — COMPLETE (SHELVED, VFS-negative)
 
 **Goal**: Implement and validate the ahead (1-branch-ahead) specialization.
 
@@ -410,12 +410,11 @@ of fixes needed:
 - Skip `XL`-based lane shuffling initially
 - Add later if utilization is uneven
 
-### 5.5.7 Validation — IN PROGRESS
+### 5.5.7 Validation — SHELVED (ahead mode VFS-negative)
 - [x] Direct mode: output on gcc trace identical to baseline (26,870 / 208,030 mispredictions at 5M/40M)
-- [ ] Ahead compile: `make test-tage-compile` (T3, T9)
 - [x] Ahead functional: runs without crash after PATHS fanout fix + pipeline shift fix
-- [ ] Ahead vs direct comparison: `make compare` on multiple traces
-- [ ] Full sweep: `scripts/quick_eval.sh` on 20 representative traces
+- Remaining items deprioritized (ahead mode shelved):
+  - Ahead compile tests, multi-trace comparison, full sweep
 
 **Results (gcc, 1M warmup, 5M measure, fanouts tuned):**
 
@@ -439,6 +438,29 @@ of fixes needed:
 - **EPI 3.6x higher**: Structural cost of doubled RAM banks + cached pipeline shift registers.
   Not from fanout placeholders (those have been tuned).
 
+**VFS Analysis (gcc, 5M):**
+
+| | Direct | Ahead |
+|---|---|---|
+| **VFS** | **0.7059** | **0.5379 (-24%)** |
+| L1/L2 (integer cycles) | 1/2 | 1/2 |
+| IPC | 3.95 | 3.10 |
+
+**Key finding**: VFS scoring rounds latencies to integer cycles (`ceil()`). Both modes get
+L2=2 cycles — the 1.86→1.51 improvement is invisible. Ahead mode pays full cost (3.6x EPI,
++19% mispredictions) for zero latency benefit. **Ahead mode only helps VFS if P2 < 1.0 cycle
+(L2=1 instead of L2=2).** Current P2=1.51 is too high.
+
+**Hardware profile (ahead vs direct):**
+
+| | Direct | Ahead | Delta |
+|---|---|---|---|
+| Transistors | 2.01M | 4.00M | +99% |
+| Storage | 288K bits | 576K bits | +100% |
+| SRAM Area | 0.013 mm² | 0.026 mm² | +100% |
+| predict1 E_avg | 808 fJ | 15,924 fJ | +19.7x |
+| predict2 E_avg | 6,492 fJ | 1,313 fJ | **-80%** |
+
 ### Design decisions
 1. **All table reads in predict1** — predict2 is purely combinational
 2. **Dynamic bank selection via execute_if** — RAM array indices are compile-time u64
@@ -446,6 +468,51 @@ of fixes needed:
 4. **No lane XOR initially** — deferred for simplicity
 5. **Flat inline code** — no helper functions (Phase 3.6 finding: function calls cause EPI overhead)
 6. **No shared logic extraction** — keep direct and ahead fully independent to avoid regression risk
+
+---
+
+## Sweep Parameter Bugs (fixed 2026-03-22)
+
+Bugs found when expanding coordinate descent to sweep structural parameters.
+
+### Build failures (fixed)
+
+1. **`ctr_width > 1`**: `(readc[i] >> hard<MAX_CTR_WIDTH - 1>{}) != bdir[i]` — shift doesn't
+   truncate in HARCOM, produces `val<MAX_CTR_WIDTH>` compared to `val<1>`.
+   **Fix**: Wrap in `val<1>{...}` to truncate: `val<1>{readc[i] >> hard<MAX_CTR_WIDTH - 1>{}} != bdir[i]`.
+   Applied to both direct and ahead mode (2 locations via replace_all).
+
+2. **`size_ratio > 1`**: `constexpr_pow(base, exp)` didn't handle negative exponents.
+   When `exp = t - 0.5` and `t=0`, `exp=-0.5` → linear interpolation produced negative scale
+   → `u64(-1024)` is not a constant expression.
+   **Fix**: Added `if (exp < 0.0) return 1.0 / constexpr_pow(base, -exp);` to handle negative exponents.
+
+3. **`use_path_hist=True`**: `gindex[i]` written twice in same cycle — first `gindex[i] = lineaddr ^ gfolds...`,
+   then `gindex[i] = val<>{gindex[i]} ^ val<>{path_hist}`. HARCOM enforces single register write per cycle.
+   **Fix**: Combined into single expression: `gindex[i] = lineaddr ^ gfolds... ^ val<>{path_hist}`.
+   Applied to both direct and ahead mode predict1.
+
+### Runtime failures (documented, not yet fixed)
+
+4. **`u_stor_ff=True`**: `write_u_ff_arr()` writes all u_ff entries (inside execute_if), then
+   `reset_u()` writes them again (inside another execute_if in same cycle). Both execute_if
+   always evaluate → double write. Requires structural fix (combine update+reset or add extra cycle).
+   **Excluded from sweep** until fixed.
+
+5. **`shared_u=False`, `size_ratio=1.5/2.0/3.0`**: Failed in earlier sweep runs due to wrong
+   working directory (running from `scripts/` instead of project root). Fixed by running sweep
+   from project root.
+
+### New features (implemented 2026-03-22)
+
+6. **Probabilistic u-bit decay (`DECAY_CTR`, `DECAY_GRAN`)**: Instead of epoch-resetting ALL
+   u-bits when `uctr` saturates, every touched entry has a probabilistic chance of being forced
+   to u=0. Background aging pressure proportional to allocation failure rate.
+   - `DECAY_CTR`: LFSR bit width (0=disabled/epoch reset, 8=1/256 base probability)
+   - `DECAY_GRAN`: Threshold update granularity (log2 of uctr tick interval, 0=every cycle, 6=every 64)
+   - `decay_threshold` register: adapts based on allocation pressure (decrements on uctr tick, increments on correct prediction)
+   - SRAM-only (`U_STOR_FF=false`); guarded by `if constexpr (USE_PROB_DECAY)`
+   - Results (gcc 5M): DECAY_CTR=8 GRAN=0: -2.2% mispredictions, +0.6% EPI vs epoch reset
 
 ---
 
@@ -465,32 +532,46 @@ difference (likely from bimodal write gating change or minor fanout differences)
 
 ---
 
-## Phase 7: Performance Counters and Logging
+## Phase 7: Performance Counters and Logging ✓ IMPLEMENTED
 
-**Goal**: Add runtime performance monitoring for parameter tuning.
+**Goal**: Runtime performance monitoring for identifying design inefficiencies.
 
-### 7.1 Predictor-level counters
-- Mispredictions (total, P1-only, P2-only)
-- Allocation attempts, successes, failures
-- U-bit decay events, epoch resets
-- Provider table distribution (which table provides prediction, histogram)
-- Meta-prediction: alt-used count, alt-correct count
-- Extra cycle count
+**Build**: `make cbp-monitor PREDICTOR_TYPE='Tage<...>' TRACE=... WARMUP=... MEASURE=...`
+**Output**: Window-by-window CSV + end-of-trace summary to stderr (saved to `MONITOR_OUT`).
+**Gate**: `-DTAGE_MONITOR -DCHEATING_MODE`. Zero cost when not defined.
 
-### 7.2 Per-table counters (in TageTable)
-- Hits, misses, allocations, evictions
-- Read/write counts
-- U-bit distribution (how many entries have u=0, u=1, etc.)
+### Implemented counters
 
-### 7.3 Logging infrastructure
-- Gated by `-DTAGE_MONITOR` compile flag (+ `-DCHEATING_MODE`)
-- Periodic snapshots (every N branches)
-- CSV output for analysis
-- Per-instance logs using HARCOM region names
+**Predictor-level** (per branch, in `predict2` + `update_cycle`):
+- [x] Provider table distribution (which table provides prediction)
+- [x] Provider accuracy (per-table correct/incorrect)
+- [x] Alt provider distribution
+- [x] Meta-prediction override count + accuracy
+- [x] Allocation attempts/success/fail + per-table allocation counts
+- [x] P1 vs P2 disagreement (and which was correct)
+- [x] Epoch reset count
 
-### 7.4 Summary stats
-- End-of-trace summary printed to stderr
-- Per-table accuracy contribution
+**Per-table state** (via shadow memory, `TageMonitor.hpp`):
+- [x] Occupancy (fraction of entries with tags written)
+- [x] Usefulness (fraction of occupied entries with u > 0)
+- [x] Average u-value of occupied entries
+- [x] U-bit set/clear counts + turnover rate
+
+**Windowed output** (every 100K branches):
+- Per-window CSV with mispred%, provider distribution, alloc success%, occupancy%, useful%, avg_u per table
+
+### Key files
+- `predictors/custom/TageMonitor.hpp` — monitor struct with counters + shadow memory + print
+- `predictors/custom/Tage.hpp` — instrumentation points in `#ifdef TAGE_MONITOR` blocks
+- `Makefile` — `cbp-monitor` target
+
+### Sample findings (gcc, 1M measure, default Tage<>)
+- T7 (shortest history) provides 92% of predictions but only 14% occupied
+- T0-T3 (long history) at 38-44% occupancy — right-sized
+- T5-T7 at 10-17% — oversized for long-history tables
+- Allocation success: 79%, fail: 21% (all u-bits set)
+- U-bit turnover: ~1% — almost all writes set u=1, epoch resets are only clearing mechanism
+- Non-uniform table sizes (base=256, sr=8) achieve 89% alloc success with 3.2x less storage
 
 ---
 
@@ -515,12 +596,67 @@ difference (likely from bimodal write gating change or minor fanout differences)
     (short/long/total), extra cycles, blocks, energy/instr, and all VFS components.
   - Directory mode: per-trace table + aggregate averages + overall VFS.
 
-## Priority Order
+## Strategic Assessment (2026-03-21)
 
-1. **Phase 4-5 (validation)** — cost/timing verification, multi-trace comparison
-2. **Phase 5.5 (ahead mode)** — pipeline optimization for lower P2 latency
-3. **Phase 7 (monitoring)** — performance counters for parameter tuning
-4. **Phase 8 (loop predictor)** — accuracy improvement
+### VFS Bottleneck Analysis
+
+Current direct mode VFS=0.706 (gcc 5M). The VFS formula rewards:
+1. **Lower MPI** (mispredictions per instruction) — improves IPC and speedup
+2. **Lower EPI** — directly reduces normalized energy
+3. **Lower P2 latency integer cycles** — L2=1 vs L2=2 is a step change in IPC
+
+Current P2 latency = 1.86 → ceil = L2=2. Crossing the L2=1 threshold (P2 < 1.0 cycle)
+would give a massive VFS boost but requires P2 to drop by 0.86 cycles — very aggressive.
+
+### Ahead Mode Status: SHELVED
+
+Ahead mode is functionally complete (Phase 5.5) but **VFS-negative** (-24%):
+- `ceil(1.51) = ceil(1.86) = 2` — zero latency benefit in scoring
+- 3.6x EPI from doubled RAM banks is a pure cost
+- +7% mispredictions from lookahead staleness
+
+Ahead mode would only help VFS if P2 < 1.0 (currently 1.51). This would require eliminating
+most of the combinational predict2 path (tag comparison mux chain, match logic). Not practical
+without a fundamentally different architecture.
+
+**Recommendation**: Keep ahead code for future exploration but do not use for competition.
+Focus optimization effort on direct mode.
+
+### TODO (priority order)
+
+#### A. Parameter tuning (VFS gains via accuracy)
+- [x] Implement probabilistic u-bit decay (`DECAY_CTR` + `DECAY_GRAN`)
+- [~] Coordinate descent sweep running (PID 1745410, iter 2, 17 params, log: sweep4.log)
+- [ ] Run best config on full trace set for final validation
+
+#### B–D: SHELVED (revisit after sweep completes)
+
+<details><summary>B. P2 latency reduction (target: P2 < 1.0 cycle)</summary>
+
+- [ ] Profile predict2 critical path to identify top latency contributors
+- [ ] Split packed `bank_ram` counter into separate pred/hyst RAMs (eliminates shift+mask)
+- [ ] Investigate replacing `ram` with `rwram` for ghyst/ubit (avoids extra_cycle gating)
+- [ ] Inline TageTable `read()` to eliminate function call overhead
+- [ ] Measure P2 latency after each change; target: P2 < 1.0 cycle
+</details>
+
+<details><summary>C. EPI reduction</summary>
+
+- [ ] Profile per-function energy breakdown to identify top contributors
+- [ ] Reduce unnecessary RAM reads (e.g. skip u-bit read when not needed)
+- [ ] Evaluate smaller table sizes that maintain accuracy (sweep may already cover this)
+</details>
+
+<details><summary>D. Structural improvements</summary>
+
+- [x] Phase 7: Performance monitor (`make cbp-monitor`) — IMPLEMENTED
+- [ ] Phase 8: Loop predictor for loop-heavy traces
+- [ ] Test base predictor variations: gshare base vs bimodal base for TAGE fallback.
+  Currently bimodal (PC-indexed). Gshare base would XOR global history into base index,
+  potentially improving fallback accuracy. Monitor shows bimodal provides <1% of predictions
+  but is the alt for meta-override and all allocation failures (21%).
+- [ ] Full-set trace validation with final config
+</details>
 
 ## Metrics Snapshot (gcc trace, 1K warmup, 5M measure)
 

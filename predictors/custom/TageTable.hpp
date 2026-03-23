@@ -72,7 +72,7 @@ template <
     bool SHARED_U = true,    // share one u-bit across branch-slot banks
     bool SHARED_HYS = true,  // share one hysteresis across BPB slots in a bank
     bool U_STOR_FF = true,   // true = u-bits in flip-flops, false = u-bits in SRAM (rwram)
-    u64 DECAY_CTR = 1024,    // probabilistic decay period (U_STOR_FF=false only)
+    u64 DECAY_CTR = 0,       // probabilistic decay LFSR width (0=disabled, use epoch reset)
     typename ResetFn = DefaultResetFn, // u-bit reset functor (U_STOR_FF=true only)
     bool USE_FF_CACHE = false // cache SRAM reads in FFs for block reuse
     >
