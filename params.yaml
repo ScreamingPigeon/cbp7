@@ -1,18 +1,67 @@
 # Predictor compile-time config used by `make cbp`.
-# Default: predictor + template_args list.
+# Generates PREDICTOR_TYPE via: predictor<template_args[0], template_args[1], ...>
+# Or override directly with predictor_type (bypasses predictor + template_args).
 predictor: Tage
+
+# Tage template args (positional — order matters):
+#
+#  0  TableCfg          typename  SweepTableConfig<N,SIZE,TAG,CTR,HYST,U,MINH,MAXH,SIZE_RATIO>
+#     SweepTableConfig defaults:  <8, 2048, 11, 1, 2, 1, 2, 100, 1>
+#  1  AllocCfg          typename  DefaultAllocConfig  (MAX_ALLOC=1, no filter, no protect)
+#  2  FETCH_WIDTH       u64       16
+#  3  BIMODAL_SIZE      u64       4096
+#  4  BR_P_ENTRY        u64       1           (1 or FETCH_WIDTH)
+#  5  NUM_BANKS         u64       1
+#  6  USE_AHEAD         bool      false
+#  7  SHARED_TAG        bool      true
+#  8  SHARED_U          bool      true
+#  9  SHARED_HYS        bool      true
+# 10  U_STOR_FF         bool      false
+# 11  DECAY_CTR         u64       8           (0=disabled, N=LFSR width for prob decay)
+# 12  DECAY_GRAN        u64       4           (threshold update rate: every 2^N updates)
+# 13  DECAY_POLICY      typename  DecayConservative
+#     Controls how the adaptive decay threshold adjusts over time.
+#     On each threshold_tick, apply(threshold, correct, uctrsat, misp) returns new threshold.
+#     Lower threshold = more decay fires = more aggressive u-bit clearing.
+#       DecayConservative  — dec on uctrsat, inc on correct (original, least aggressive)
+#       DecayMild          — dec on misprediction, inc on correct
+#       DecayAggressive    — dec on misprediction, no inc (one-directional pressure)
+#       DecayHybrid        — dec on misprediction OR uctrsat, inc on correct
+#       DecayMax           — always dec (threshold races to 0, maximum decay)
+#     Or define your own struct with: template<u64 W> static val<W> apply(val<W>, val<1>, val<1>, val<1>)
+# 14  ResetFn           typename  DefaultResetFn  (only used with U_STOR_FF=true)
+# 15  USE_FF_CACHE      bool      false
+# 16  P1_USE_GSHARE     bool      true
+# 17  P1_TABLE_SIZE     u64       4096
+# 18  P1_HIST           u64       6           (gshare history bits)
+# 19  USE_META          bool      true
+# 20  METABITS          u64       4
+# 21  METAPIPE          u64       2
+# 22  META_TABLE_SIZE   u64       0           (0=same as bimodal)
+# 23  USE_PATH_HIST     bool      false
+# 24  PATH_HIST_WIDTH   u64       27
+# 25  PATH_BITS         u64       6
+# 26  OVERRIDER         typename  LoopPredictor<TABLE_SIZE,ASSOC,TAG_BITS,ITER_BITS,CONF_BITS,FETCH_WIDTH>
+#     LoopPredictor defaults:     <64, 4, 10, 10, 3, 16>
+#     NoOverrider to disable
+#
+# Only specify up to the last arg you want to change. Everything after uses defaults.
+# Example: just change DECAY_CTR and DECAY_GRAN:
+#   template_args: [SweepTableConfig<>, DefaultAllocConfig, 16, 4096, 1, 1, false, true, true, true, false, 8, 4]
+# Example: all defaults + custom overrider:
+#   template_args: [SweepTableConfig<>, DefaultAllocConfig, 16, 4096, 1, 1, false, true, true, true, false, 8, 4, DefaultResetFn, false, true, 4096, 6, true, 4, 2, 0, false, 27, 6, "LoopPredictor<128, 8>"]
+
 template_args: []
 
-# Build/profile options (YAML-first compile tuning)
+# Build/profile options
 build_type: release # release | debug | relwithdebinfo
 warnings_as_errors: true
 native_arch: false
-# Some extra flags to add to the predictor build (e.g., -DTAGE_VERBOSE)
 sanitize: none
 defines: []
 extra_include_dirs: []
 
-trace: ../cbp-ng/traces/502-gcc-all_16112_trace.gz
+trace: traces/502-gcc-all_16112_trace.gz
 trace_name: gcc
 warmup: 1000000
 measure: 40000000
@@ -20,6 +69,3 @@ measure: 40000000
 # Escape hatch (appended as-is)
 extra_common_flags: ""
 extra_cbp_flags: ""
-# Or override parameters
-# predictor_type: "tage<6,8,11,12,11,120,14,8>"
-# extra_cbp_flags: "-DTAGE_VERBOSE"

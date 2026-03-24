@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all gsweep gsweep-report sweep sweep-report clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report clean
 
 all: cbp reference
 
@@ -71,41 +71,47 @@ predictor-config: $(PREDICTOR_MK)
 $(PREDICTOR_MK): scripts/gen_predictor_config.py $(PARAMS_FILE) | $(BUILD_DIR)
 	$(PYTHON) scripts/gen_predictor_config.py --input $(PARAMS_FILE) --output $@
 
-cbp: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK)
+$(BUILD_DIR)/cbp: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
 
-reference: reference.cpp $(TRACE_READER) seznec_cbp2025.h
+cbp: $(BUILD_DIR)/cbp
+
+$(BUILD_DIR)/reference: reference.cpp $(TRACE_READER) seznec_cbp2025.h | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(REFERENCE_WARN_FLAGS) -Itrace_files -o $@ reference.cpp -lz
 
-trace-analyze: trace_files/trace_analyzer.cpp trace_files/trace_reader.hpp
+reference: $(BUILD_DIR)/reference
+
+$(BUILD_DIR)/trace-analyze: trace_files/trace_analyzer.cpp trace_files/trace_reader.hpp | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ trace_files/trace_analyzer.cpp -lz
 
-run-cbp: cbp
-	./cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
+trace-analyze: $(BUILD_DIR)/trace-analyze
 
-run-reference: reference
-	./reference $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
+run-cbp: $(BUILD_DIR)/cbp
+	./$(BUILD_DIR)/cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
 
-run-trace-analyze: trace-analyze | out
-	./trace-analyze $(TRACE) $(REGION_SHIFT) | tee out/trace_analysis.txt
+run-reference: $(BUILD_DIR)/reference
+	./$(BUILD_DIR)/reference $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
 
-out/cbp-profile: cbp_profile.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK) | out
+run-trace-analyze: $(BUILD_DIR)/trace-analyze | out
+	./$(BUILD_DIR)/trace-analyze $(TRACE) $(REGION_SHIFT) | tee out/trace_analysis.txt
+
+$(BUILD_DIR)/cbp-profile: cbp_profile.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) -Itrace_files -o $@ cbp_profile.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)' -DENABLE_REGION_PROFILING
 
-cbp-profile-acc: out/cbp-profile
-	./out/cbp-profile --format csv --mode acc --no-score $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_acc.txt
+cbp-profile-acc: $(BUILD_DIR)/cbp-profile | out
+	./$(BUILD_DIR)/cbp-profile --format csv --mode acc --no-score $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_acc.txt
 	@echo "=== Accuracy Analysis ===" && tail -20 out/profile_acc.txt
 
-cbp-profile-acc-regions: out/cbp-profile
-	./out/cbp-profile --format csv --mode acc --no-score --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_acc.txt
+cbp-profile-acc-regions: $(BUILD_DIR)/cbp-profile | out
+	./$(BUILD_DIR)/cbp-profile --format csv --mode acc --no-score --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_acc.txt
 	@echo "=== Accuracy Analysis with Regions ===" && tail -40 out/profile_acc.txt
 
-cbp-profile-analyze: out/cbp-profile
-	./out/cbp-profile --format csv --mode analyze --profile $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
+cbp-profile-analyze: $(BUILD_DIR)/cbp-profile | out
+	./$(BUILD_DIR)/cbp-profile --format csv --mode analyze --profile $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
 	@echo "=== Per-Function Analysis ===" && tail -30 out/profile_analyze.txt
 
-cbp-profile-analyze-regions: out/cbp-profile
-	./out/cbp-profile --format csv --mode analyze --profile --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
+cbp-profile-analyze-regions: $(BUILD_DIR)/cbp-profile | out
+	./$(BUILD_DIR)/cbp-profile --format csv --mode analyze --profile --regions $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
 	@echo "=== Per-Function Analysis with Regions ===" && tail -40 out/profile_analyze.txt
 
 # TAGE Monitor: build with SW instrumentation and run
@@ -113,12 +119,23 @@ cbp-profile-analyze-regions: out/cbp-profile
 MONITOR_FLAGS := -DTAGE_MONITOR -DCHEATING_MODE
 MONITOR_OUT ?= out/monitor.txt
 
-out/cbp-monitor: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | out
+$(BUILD_DIR)/cbp-monitor: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) $(MONITOR_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
 
-cbp-monitor: out/cbp-monitor
-	./out/cbp-monitor $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE) 2> $(MONITOR_OUT)
-	@echo "=== TAGE Monitor ===" && cat $(MONITOR_OUT)
+MONITOR_MEASURE ?= $(MEASURE)
+PROFILE_MEASURE ?= 100000
+
+cbp-monitor: $(BUILD_DIR)/cbp-monitor $(BUILD_DIR)/cbp-profile | out
+	@echo "=== Running Monitor ($(MONITOR_MEASURE) instr) ==="
+	./$(BUILD_DIR)/cbp-monitor $(TRACE) $(TRACE_NAME) $(WARMUP) $(MONITOR_MEASURE) 1> out/monitor_csv.txt 2> $(MONITOR_OUT)
+	# @echo "=== Running Profile Analyze ($(PROFILE_MEASURE) instr) ==="
+	# ./$(BUILD_DIR)/cbp-profile --format csv --mode analyze --profile $(TRACE) $(TRACE_NAME) $(WARMUP) $(PROFILE_MEASURE) 1> out/profile.csv 2> out/profile_analyze.txt
+	@echo ""
+	# @echo "=== Profile ===" && tail -15 out/profile_analyze.txt
+	@echo ""
+	@echo "=== Monitor ===" && cat $(MONITOR_OUT)
+	@echo ""
+	@echo "Files: $(MONITOR_OUT), out/monitor_csv.txt"
 
 # Compare two predictors side-by-side.
 # Single trace:  make compare TRACE=path/to/trace.gz
@@ -132,34 +149,27 @@ compare:
 compare-all:
 	scripts/compare_predictors.sh --dir '$(PRED_A)' '$(PRED_B)' '$(TRACE_DIR)' $(WARMUP) $(MEASURE) '$(EXTRA_COMMON_FLAGS) $(EXTRA_CBP_FLAGS)'
 
-test-tage-compile: tests/test_tage_compile.cpp predictors/custom/Tage.hpp predictors/custom/TageTable.hpp harcom.hpp
+$(BUILD_DIR)/test-tage-compile: tests/test_tage_compile.cpp predictors/custom/Tage.hpp predictors/custom/TageTable.hpp harcom.hpp | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz
 
-test-tagetable-compile: tests/test_tagetable_compile.cpp predictors/custom/TageTable.hpp harcom.hpp
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz
-
-test-tagetable: tests/test_tagetable.cpp predictors/custom/TageTable.hpp harcom.hpp
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
-
-test-tagetable-sweep: tests/test_tagetable_sweep.cpp predictors/custom/TageTable.hpp harcom.hpp
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz && ./$@
+test-tage-compile: $(BUILD_DIR)/test-tage-compile
 
 # Quick evaluation on representative trace subset (20 traces)
 QUICK_JOBS ?= $(shell nproc)
 QUICK_OUT ?= out/quick
 
-quick-eval: cbp
-	scripts/quick_eval.sh ./cbp $(TRACE_DIR) $(QUICK_OUT) $(QUICK_JOBS)
+quick-eval: $(BUILD_DIR)/cbp
+	scripts/quick_eval.sh ./$(BUILD_DIR)/cbp $(TRACE_DIR) $(QUICK_OUT) $(QUICK_JOBS)
 
 # Compare two predictors on the representative subset
-quick-eval-all:
+quick-eval-all: | $(BUILD_DIR)
 	@echo "=== Building and evaluating: $(PRED_A) ==="
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o out/quick_a cbp.cpp -lz -DPREDICTOR='$(PRED_A)'
-	scripts/quick_eval.sh ./out/quick_a $(TRACE_DIR) out/quick_a_results $(QUICK_JOBS)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/quick_a cbp.cpp -lz -DPREDICTOR='$(PRED_A)'
+	scripts/quick_eval.sh ./$(BUILD_DIR)/quick_a $(TRACE_DIR) out/quick_a_results $(QUICK_JOBS)
 	@echo ""
 	@echo "=== Building and evaluating: $(PRED_B) ==="
-	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o out/quick_b cbp.cpp -lz -DPREDICTOR='$(PRED_B)'
-	scripts/quick_eval.sh ./out/quick_b $(TRACE_DIR) out/quick_b_results $(QUICK_JOBS)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/quick_b cbp.cpp -lz -DPREDICTOR='$(PRED_B)'
+	scripts/quick_eval.sh ./$(BUILD_DIR)/quick_b $(TRACE_DIR) out/quick_b_results $(QUICK_JOBS)
 
 GSWEEP_CONFIGS ?= 60
 GSWEEP_JOBS ?= $(shell nproc)
@@ -192,6 +202,8 @@ sweep-report:
 	$(PYTHON) scripts/tage_sweep.py --report out/sweep/results.csv --top 20
 
 clean:
-	rm -f cbp reference test-tage-compile test-tagetable test-tagetable-compile test-tagetable-sweep
+	rm -f $(BUILD_DIR)/cbp $(BUILD_DIR)/reference $(BUILD_DIR)/trace-analyze
+	rm -f $(BUILD_DIR)/cbp-profile $(BUILD_DIR)/cbp-monitor
+	rm -f $(BUILD_DIR)/test-tage-compile $(BUILD_DIR)/quick_a $(BUILD_DIR)/quick_b
 	rm -f $(PREDICTOR_MK)
 	rm -rf out/*

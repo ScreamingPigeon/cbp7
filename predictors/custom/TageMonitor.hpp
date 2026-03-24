@@ -13,7 +13,7 @@
 
 using u64 = uint64_t;
 
-template <u64 NUM_TABLES, u64 MAX_TABLE_SIZE>
+template <u64 NUM_TABLES, u64 MAX_TABLE_SIZE, u64 FETCH_WIDTH_V = 16>
 struct TageMonitor {
 
   static constexpr u64 WINDOW_SIZE = 100000; // branches per window
@@ -39,18 +39,27 @@ struct TageMonitor {
     std::array<u64, NUM_TABLES> u_set_count{};
     std::array<u64, NUM_TABLES> u_clear_count{};
     u64 decay_fire_count = 0;
+    u64 uctr_saturation_count = 0;
     u64 epoch_reset_count = 0;
-    // P1 accuracy
+    // P1 stats
     u64 p1_predictions = 0;
     u64 p1_correct = 0;
+    u64 p1_alone_correct = 0;   // P1 correct AND P2 wrong
+    u64 p2_alone_correct = 0;   // P2 correct AND P1 wrong
+    u64 p1_writes = 0;
+    u64 p1_entries_touched = 0; // unique entries written (updated at end)
     // Loop overrider
     u64 loop_overrides = 0;
     u64 loop_override_correct = 0;
     u64 loop_hits = 0;       // tag match in loop table
     u64 loop_lookups = 0;    // total lookups
+    // Per-table slot (fetch offset) distribution
+    std::array<std::array<u64, FETCH_WIDTH_V>, NUM_TABLES + 1> provider_slot{};
+    std::array<std::array<u64, FETCH_WIDTH_V>, NUM_TABLES + 1> alt_slot{};
+    // Block advance: which branch position (0..FW-1) ended the block
+    std::array<u64, FETCH_WIDTH_V> block_advance_slot{};
     // Aliasing
     u64 p1_alias_evictions = 0;   // P1 entry overwritten by different PC
-    u64 p1_writes = 0;
     std::array<u64, NUM_TABLES> tage_alias_evictions{};  // per TAGE table
     u64 loop_alias_evictions = 0; // loop table evictions due to aliasing
 
@@ -67,14 +76,21 @@ struct TageMonitor {
   struct EntryState {
     bool occupied = false;  // has this entry ever been written (tag allocated)
     uint8_t u_value = 0;    // current u-bit value
+    u64 writes = 0;         // number of tag allocations to this entry
   };
   std::array<std::array<EntryState, MAX_TABLE_SIZE>, NUM_TABLES> shadow_table{};
   std::array<u64, NUM_TABLES> table_size{};  // actual size per table (set at init)
 
-  // P1 shadow tags for aliasing detection
-  static constexpr u64 MAX_P1_ENTRIES = MAX_TABLE_SIZE;  // reuse max size
-  std::array<u64, MAX_P1_ENTRIES> p1_shadow_pc{};  // PC hash per P1 entry
-  u64 p1_entries = 0;
+  // P1 shadow state — per lane, per entry
+  static constexpr u64 MAX_P1_ENTRIES = MAX_TABLE_SIZE;
+  struct P1LaneState {
+    std::array<u64, MAX_P1_ENTRIES> shadow_pc{};
+    std::array<bool, MAX_P1_ENTRIES> occupied{};
+    std::array<u64, MAX_P1_ENTRIES> writes{};
+  };
+  std::array<P1LaneState, FETCH_WIDTH_V> p1_lanes{};
+  u64 p1_entries = 0;  // entries per lane
+  u64 p1_num_lanes = FETCH_WIDTH_V;
 
   // Loop predictor shadow for aliasing (per set, per way)
   static constexpr u64 MAX_LOOP_SETS = 64;
@@ -94,6 +110,7 @@ struct TageMonitor {
   void record_tag_write(u64 table, u64 index) {
     if (index < MAX_TABLE_SIZE) {
       shadow_table[table][index].occupied = true;
+      shadow_table[table][index].writes++;
     }
   }
 
@@ -106,14 +123,17 @@ struct TageMonitor {
     else { cum.u_clear_count[table]++; win.u_clear_count[table]++; }
   }
 
-  // P1 aliasing: called when P1 table is written (training)
-  void record_p1_write(u64 index, u64 pc_hash) {
-    if (index < MAX_P1_ENTRIES) {
+  // P1 write tracking: per-lane aliasing, occupancy, per-entry writes
+  void record_p1_write(u64 lane, u64 index, u64 pc_hash) {
+    if (lane < FETCH_WIDTH_V && index < MAX_P1_ENTRIES) {
       cum.p1_writes++; win.p1_writes++;
-      if (p1_shadow_pc[index] != 0 && p1_shadow_pc[index] != pc_hash) {
+      auto &l = p1_lanes[lane];
+      if (l.shadow_pc[index] != 0 && l.shadow_pc[index] != pc_hash) {
         cum.p1_alias_evictions++; win.p1_alias_evictions++;
       }
-      p1_shadow_pc[index] = pc_hash;
+      l.shadow_pc[index] = pc_hash;
+      l.occupied[index] = true;
+      l.writes[index]++;
     }
   }
 
@@ -163,6 +183,8 @@ struct TageMonitor {
     u64 occupied = 0;      // entries with tag written
     u64 total = 0;         // table size
     u64 u_nonzero = 0;     // entries with u > 0
+    u64 hot = 0;           // entries with >10 writes
+    u64 cold = 0;          // entries with <=1 write
     double avg_u = 0.0;    // avg u-value of occupied entries
   };
 
@@ -176,6 +198,8 @@ struct TageMonitor {
         s.occupied++;
         u_sum += e.u_value;
         if (e.u_value > 0) s.u_nonzero++;
+        if (e.writes > 10) s.hot++;
+        if (e.writes <= 1) s.cold++;
       }
     }
     s.avg_u = s.occupied > 0 ? static_cast<double>(u_sum) / s.occupied : 0.0;
@@ -223,6 +247,13 @@ struct TageMonitor {
     }
   }
 
+  void record_block_advance(u64 num_branch) {
+    if (num_branch > 0 && num_branch <= FETCH_WIDTH_V) {
+      cum.block_advance_slot[num_branch - 1]++;
+      win.block_advance_slot[num_branch - 1]++;
+    }
+  }
+
   void record_outcome(u64 offset, bool actual_taken, bool mispredict) {
     auto record = [&](Counters &c) {
       c.branches++;
@@ -231,9 +262,13 @@ struct TageMonitor {
       if (prov <= NUM_TABLES) {
         c.provider_count[prov]++;
         if (!mispredict) c.provider_correct[prov]++;
+        if (offset < FETCH_WIDTH_V) c.provider_slot[prov][offset]++;
       }
       u64 alt = shadow_alt[offset];
-      if (alt <= NUM_TABLES) c.alt_count[alt]++;
+      if (alt <= NUM_TABLES) {
+        c.alt_count[alt]++;
+        if (offset < FETCH_WIDTH_V) c.alt_slot[alt][offset]++;
+      }
       if (shadow_meta_overrode[offset]) {
         c.meta_override_count++;
         if (!mispredict) c.meta_override_correct++;
@@ -245,9 +280,13 @@ struct TageMonitor {
         if (p1_correct && !p2_correct) c.p1_correct_p2_wrong++;
         if (p2_correct && !p1_correct) c.p2_correct_p1_wrong++;
       }
-      // P1 accuracy
+      // P1 vs P2 accuracy breakdown
       c.p1_predictions++;
-      if (shadow_p1_pred[offset] == actual_taken) c.p1_correct++;
+      bool p1_ok = (shadow_p1_pred[offset] == actual_taken);
+      bool p2_ok = !mispredict;
+      if (p1_ok) c.p1_correct++;
+      if (p1_ok && !p2_ok) c.p1_alone_correct++;
+      if (p2_ok && !p1_ok) c.p2_alone_correct++;
       // Loop overrider
       if (shadow_loop_overrode[offset]) {
         c.loop_overrides++;
@@ -354,6 +393,40 @@ struct TageMonitor {
          << " |" << std::setw(7) << pct(c.tag_matches[i], c.tag_lookups[i]) << "%\n";
     }
 
+    os << "\nAlt Provider Distribution:\n";
+    os << "  Table     | Alt count\n";
+    os << "  ----------+----------\n";
+    os << "  Bimodal   |" << std::setw(10) << c.alt_count[0] << "\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(8 - (i >= 10 ? 2 : 1)) << ""
+         << "|" << std::setw(10) << c.alt_count[i + 1] << "\n";
+    }
+
+    // Per-table slot (fetch offset) distribution
+    os << "\nProvider Slot Distribution (rows=tables, cols=fetch offset):\n";
+    os << "  Table   ";
+    for (u64 j = 0; j < FETCH_WIDTH_V; j++) os << "| " << std::setw(5) << j << " ";
+    os << "\n  --------";
+    for (u64 j = 0; j < FETCH_WIDTH_V; j++) os << "+-------";
+    os << "\n  Bimodal ";
+    for (u64 j = 0; j < FETCH_WIDTH_V; j++)
+      os << "|" << std::setw(6) << c.provider_slot[0][j] << " ";
+    os << "\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(7 - (i >= 10 ? 1 : 0)) << "";
+      for (u64 j = 0; j < FETCH_WIDTH_V; j++)
+        os << "|" << std::setw(6) << c.provider_slot[i + 1][j] << " ";
+      os << "\n";
+    }
+
+    // Block advance slot distribution
+    os << "\nBlock Advance Slot (which branch# ended the block):\n";
+    os << "  Slot:  ";
+    for (u64 j = 0; j < FETCH_WIDTH_V; j++) os << std::setw(7) << j;
+    os << "\n  Count: ";
+    for (u64 j = 0; j < FETCH_WIDTH_V; j++) os << std::setw(7) << c.block_advance_slot[j];
+    os << "\n";
+
     os << "\nMeta Override: " << c.meta_override_count << " times";
     if (c.meta_override_count > 0)
       os << ", " << c.meta_override_correct << " correct ("
@@ -374,8 +447,8 @@ struct TageMonitor {
 
     // Table occupancy and usefulness
     os << "\nTable State (shadow memory):\n";
-    os << "  Table  | Size  | Occupied |  Occ%  | U>0  | Useful% | Avg U\n";
-    os << "  -------+-------+----------+--------+------+---------+------\n";
+    os << "  Table  | Size  | Occupied |  Occ%  | U>0  | Useful% | Avg U |   Hot  |  Cold\n";
+    os << "  -------+-------+----------+--------+------+---------+-------+--------+------\n";
     for (u64 i = 0; i < NUM_TABLES; i++) {
       auto s = const_cast<TageMonitor*>(this)->snapshot_table(i);
       os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << ""
@@ -384,7 +457,9 @@ struct TageMonitor {
          << " |" << std::setw(6) << pct(s.occupied, s.total) << "%"
          << " |" << std::setw(5) << s.u_nonzero
          << " |" << std::setw(7) << pct(s.u_nonzero, s.occupied) << "%"
-         << " |" << std::setw(5) << std::setprecision(2) << s.avg_u << "\n";
+         << " |" << std::setw(5) << std::setprecision(2) << s.avg_u
+         << " |" << std::setw(7) << s.hot
+         << " |" << std::setw(5) << s.cold << "\n";
     }
 
     // U-bit write stats
@@ -398,15 +473,45 @@ struct TageMonitor {
          << " |" << std::setw(9) << c.u_clear_count[i]
          << " |" << std::setw(7) << pct(c.u_clear_count[i], total_u) << "%\n";
     }
-    os << "  Decay fires: " << c.decay_fire_count
+    os << "  Uctr saturations: " << c.uctr_saturation_count
+       << "  Decay fires: " << c.decay_fire_count
        << "  Epoch resets: " << c.epoch_reset_count << "\n";
 
-    // P1 accuracy
-    os << "\nP1 Accuracy: " << c.p1_correct << "/" << c.p1_predictions
-       << " (" << pct(c.p1_correct, c.p1_predictions) << "%)\n";
-
-    // P1 aliasing
-    os << "P1 Aliasing: " << c.p1_alias_evictions << "/" << c.p1_writes
+    // P1 state — per lane
+    {
+      u64 p1_sz = p1_entries > 0 ? p1_entries : MAX_P1_ENTRIES;
+      u64 total_occupied = 0, total_hot = 0, total_cold = 0, total_entries = 0;
+      os << "\nP1 State (per lane, " << p1_sz << " entries/lane, "
+         << p1_num_lanes << " lanes, " << p1_sz * p1_num_lanes << " total):\n";
+      os << "  Lane | Occupied |  Occ%  | Hot(>10) | Cold(<=1)\n";
+      os << "  -----+----------+--------+----------+----------\n";
+      for (u64 lane = 0; lane < p1_num_lanes; lane++) {
+        u64 occupied = 0, hot = 0, cold = 0;
+        for (u64 i = 0; i < p1_sz; i++) {
+          if (p1_lanes[lane].occupied[i]) occupied++;
+          if (p1_lanes[lane].writes[i] > 10) hot++;
+          if (p1_lanes[lane].writes[i] <= 1) cold++;
+        }
+        os << "  " << std::setw(4) << lane
+           << " |" << std::setw(9) << occupied
+           << " |" << std::setw(6) << pct(occupied, p1_sz) << "%"
+           << " |" << std::setw(9) << hot
+           << " |" << std::setw(9) << cold << "\n";
+        total_occupied += occupied;
+        total_hot += hot;
+        total_cold += cold;
+        total_entries += p1_sz;
+      }
+      os << "  Total: " << total_occupied << "/" << total_entries
+         << " occupied (" << pct(total_occupied, total_entries) << "%)"
+         << "  Hot: " << total_hot << "  Cold: " << total_cold << "\n";
+    }
+    os << "P1 Accuracy: " << c.p1_correct << "/" << c.p1_predictions
+       << " (" << pct(c.p1_correct, c.p1_predictions) << "%)"
+       << "  P1-alone correct: " << c.p1_alone_correct
+       << "  P2-alone correct: " << c.p2_alone_correct << "\n";
+    os << "P1 Writes: " << c.p1_writes
+       << "  Aliasing: " << c.p1_alias_evictions
        << " evictions (" << pct(c.p1_alias_evictions, c.p1_writes) << "%)\n";
 
     // TAGE aliasing

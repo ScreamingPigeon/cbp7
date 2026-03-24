@@ -575,15 +575,53 @@ difference (likely from bimodal write gating change or minor fanout differences)
 
 ---
 
-## Phase 8: Loop Predictor (Deferred)
+## Phase 8: Loop Predictor — IN PROGRESS
 
-**Goal**: Add optional loop predictor component.
+**Goal**: Pluggable override mechanism + loop predictor that detects repeating branch patterns.
 
-- TODO: Design loop predictor table (loop count, current iteration, confidence)
-- TODO: `USE_LOOP_PRED` bool param, `LOOP_TABLE_SIZE` param
-- TODO: Override TAGE prediction when loop predictor is confident
-- TODO: Own HARCOM region
-- TODO: Validate on loop-heavy traces
+### TageOverrider Scaffolding ✓ COMPLETE
+- `TageOverrider.hpp`: `NoOverrider` (ENABLED=false, zero cost, bit-exact)
+- `LoopPredictor.hpp`: concrete loop predictor implementation
+- `docs/overrider.md`: interface documentation
+- Template param `typename Overrider = NoOverrider` (last param of Tage alias)
+- Overrider `lookup()` parallel with TAGE reads → returns `LookupResult` (vals)
+- TageImpl applies TAGE-confidence gate + final select mux
+- `train()` receives `extra_cycle` for rwram write gating
+- NoOverrider bit-exact verified
+
+### LoopPredictor Implementation ✓ FUNCTIONAL
+- Template: `LoopPredictor<TABLE_SIZE=64, ASSOC=1..4, TAG_BITS=10, ITER_BITS=10, CONF_BITS=3, FETCH_WIDTH=16>`
+- Entry: tag(10) + nb_iter(10) + current_iter(10) + confidence(3) + dir(1) + age(3) = 37 bits
+- Storage: `rwram` per way, writes gated by `extra_cycle` (same pattern as TAGE u-bits)
+- Override: when loop confidence > threshold AND TAGE confidence < 3
+- Allocation: 1/16 probability on misprediction miss
+- Monitor: lookups, hits, overrides, alloc/update writes wired to TageMonitor
+
+### Results (gcc, 5M measure)
+
+| Config | P1 | P2 | L1/L2 | Mispredictions | EPI |
+|--------|----|----|-------|---------------|-----|
+| NoOverrider (uniform 2048×8, P1=16K) | 0.937 | 1.863 | 1/2 | 26,914 | 1,867 |
+| + LoopPredictor<64,1> (P1=32K) | 1.003 | 2.193 | 2/3 | 20,127 | 2,521 |
+| + LoopPredictor<64,1> (**P1=4K**) | **0.870** | **2.113** | **1/3** | 20,311 | 2,219 |
+
+**P1=4K key insight**: Monitor showed P1=32K was 91% empty (8.8% occupied). Reducing to 4K → 62.5% occupied, P1 latency 0.87 (ceil=1), -45% transistors. Default changed to P1_TABLE_SIZE=4096.
+
+### Latency Optimization History
+- Initial (regs everywhere): P2 = 2.58
+- Val-return (no regs on critical path): P2 = 2.42
+- Merged predict(): P2 = 2.19
+- ASSOC=1: P2 = 2.15
+- Parallel lookup + reduced fanout: P2 = 2.13
+- rwram + extra_cycle: P2 = 2.07
+
+### Remaining
+- [x] Fix P1 > 1.0: changed default P1_TABLE_SIZE from 16384 to 4096. P1=0.87 (ceil=1).
+- [ ] Shave 0.11 cycles to get P2 < 2.0 (rwram banking mux adds ~0.2 cycles)
+- [ ] Improve loop hit rate (0.43%) and confidence (0 overrides — threshold too high?)
+- [ ] Full 20-trace VFS evaluation with optimized config
+- [ ] Test base predictor variations (gshare vs bimodal)
+- [ ] Add loop predictor to sweep as a configurable parameter
 
 ---
 
