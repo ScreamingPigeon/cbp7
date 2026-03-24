@@ -28,7 +28,7 @@ struct LoopPredictor {
   static constexpr u64 NUM_SETS = TABLE_SIZE / ASSOC;
   static constexpr u64 SET_BITS = clog2(NUM_SETS);
   static constexpr u64 AGE_BITS = 3;
-  static constexpr u64 CONF_THRESHOLD = 2;  // override when conf > this
+  static constexpr u64 CONF_THRESHOLD = 0;  // override when conf > 0 AND nb_iter >= 1
 
   // Entry layout (LSB-first for split<>):
   //   [TAG_BITS] [ITER_BITS] [ITER_BITS] [CONF_BITS] [1 dir] [AGE_BITS]
@@ -89,13 +89,24 @@ struct LoopPredictor {
     }
 
     // Per-way: single split, compute tag/conf/pred in one pass
+    // Confidence uses Ros-style: significant_bits(nb_iter * conf_counter).
+    // A loop with 30 iterations and conf=1 gets confidence=5 (30=11110b).
+    // This makes longer loops reach override threshold faster.
     arr<val<3>, ASSOC> way_results = [&](u64 w) -> val<3> {
       val<ENTRY_BITS> entry = loop_ram[w].read(set_idx);
       read_entries[w] = entry;
       auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
           split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(entry);
       val<1> tag_match = (val<TAG_BITS>{e_tag} == tag);
-      val<1> confident = (val<CONF_BITS>{e_conf} > hard<CONF_THRESHOLD>{});
+      // Ros confidence: conf > 0 AND nb_iter has enough significant bits
+      // Approximate significant_bits(nb_iter * conf) > CONF_THRESHOLD as:
+      // conf > 0 AND nb_iter >= (1 << CONF_THRESHOLD)
+      // This avoids a hardware multiply — the key insight is that longer
+      // loops need fewer correct exits to become confident.
+      val<1> conf_nonzero = (val<CONF_BITS>{e_conf} != hard<0>{});
+      val<1> iter_significant =
+          (val<ITER_BITS>{e_nb_iter} >= hard<(u64(1) << CONF_THRESHOLD)>{});
+      val<1> confident = conf_nonzero & iter_significant;
       val<ITER_BITS> next_iter =
           val<ITER_BITS>{val<ITER_BITS>{e_cur_iter} + hard<1>{}};
       val<1> at_exit = (next_iter == val<ITER_BITS>{e_nb_iter});

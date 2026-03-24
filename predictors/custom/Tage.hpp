@@ -158,8 +158,8 @@ struct DefaultAllocConfig {
 // Mode 0: Original — decrement on uctrsat only, increment on correct
 struct DecayConservative {
   template <u64 W>
-  static val<W> apply(val<W> t, val<1> correct, val<1> uctrsat,
-                      [[maybe_unused]] val<1> misp) {
+  static val<W> apply(val<W> &t, val<1> &correct, val<1> &uctrsat,
+                      [[maybe_unused]] val<1> &misp) {
     return select(uctrsat, update_ctr(t, hard<0>{}),
                   select(correct, update_ctr(t, hard<1>{}), val<W>{t}));
   }
@@ -168,8 +168,8 @@ struct DecayConservative {
 // Mode 1: Decrement on misprediction, increment on correct
 struct DecayMild {
   template <u64 W>
-  static val<W> apply(val<W> t, val<1> correct, [[maybe_unused]] val<1> uctrsat,
-                      val<1> misp) {
+  static val<W> apply(val<W> &t, val<1> &correct, [[maybe_unused]] val<1> &uctrsat,
+                      val<1> &misp) {
     return select(misp, update_ctr(t, hard<0>{}),
                   select(correct, update_ctr(t, hard<1>{}), val<W>{t}));
   }
@@ -178,7 +178,8 @@ struct DecayMild {
 // Mode 2: Decrement on misprediction, no increment (aggressive)
 struct DecayAggressive {
   template <u64 W>
-  static val<W> apply(val<W> t, val<1> correct, val<1> uctrsat, val<1> misp) {
+  static val<W> apply(val<W> &t, [[maybe_unused]] val<1> &correct,
+                      [[maybe_unused]] val<1> &uctrsat, val<1> &misp) {
     return select(misp, update_ctr(t, hard<0>{}), val<W>{t});
   }
 };
@@ -186,7 +187,7 @@ struct DecayAggressive {
 // Mode 3: Decrement on misprediction OR uctrsat, increment on correct
 struct DecayHybrid {
   template <u64 W>
-  static val<W> apply(val<W> t, val<1> correct, val<1> uctrsat, val<1> misp) {
+  static val<W> apply(val<W> &t, val<1> &correct, val<1> &uctrsat, val<1> &misp) {
     return select(misp | uctrsat, update_ctr(t, hard<0>{}),
                   select(correct, update_ctr(t, hard<1>{}), val<W>{t}));
   }
@@ -195,9 +196,9 @@ struct DecayHybrid {
 // Mode 4: Always decrement (threshold races to 0, maximum decay)
 struct DecayMax {
   template <u64 W>
-  static val<W> apply(val<W> t, [[maybe_unused]] val<1> correct,
-                      [[maybe_unused]] val<1> uctrsat,
-                      [[maybe_unused]] val<1> misp) {
+  static val<W> apply(val<W> &t, [[maybe_unused]] val<1> &correct,
+                      [[maybe_unused]] val<1> &uctrsat,
+                      [[maybe_unused]] val<1> &misp) {
     return update_ctr(t, hard<0>{});
   }
 };
@@ -382,6 +383,10 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   static constexpr u64 LINEADDR_BITS = std::max(BINDEX_BITS, MAX_IDX_BITS);
   static constexpr u64 P1_ENTRIES = P1_TABLE_SIZE_V / FETCH_WIDTH;
   static constexpr u64 BIM_ENTRIES = BIMODAL_SIZE_V / FETCH_WIDTH;
+  // Unhashed wordline bits: low ROW_DIRECT bits of gindex come straight from
+  // lineaddr (no XOR with history). Only upper bits are hashed. Removes the
+  // XOR gate delay from SRAM row-select critical path (EV8 technique).
+  static constexpr u64 ROW_DIRECT = std::min(u64(6), MAX_IDX_BITS);
 
   // Truncate gindex to per-table IDX_BITS (needed when size_ratio > 1)
   template <u64 I> auto tidx(auto &gi) {
@@ -619,6 +624,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       }
     }();
 
+    // compute indexes
     for (u64 i = 0; i < NUM_TABLES; i++) {
       if constexpr (USE_PATH_HIST_V) {
         gindex[i] =

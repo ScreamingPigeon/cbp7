@@ -258,7 +258,7 @@ public:
   }
 
   // Apply ResetFn to all u-bit flip-flops with the given mode (FF mode only).
-  void reset_u(val<ResetFn::MODE_BITS> mode) {
+  void reset_u(val<ResetFn::MODE_BITS> &mode) {
     static_assert(U_STOR_FF, "reset_u requires U_STOR_FF=true");
     for (u64 a = 0; a < U_STORAGE_COUNT; a++) {
       for (u64 i = 0; i < TABLE_SIZE; i++) {
