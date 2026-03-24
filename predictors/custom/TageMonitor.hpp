@@ -40,6 +40,19 @@ struct TageMonitor {
     std::array<u64, NUM_TABLES> u_clear_count{};
     u64 decay_fire_count = 0;
     u64 epoch_reset_count = 0;
+    // P1 accuracy
+    u64 p1_predictions = 0;
+    u64 p1_correct = 0;
+    // Loop overrider
+    u64 loop_overrides = 0;
+    u64 loop_override_correct = 0;
+    u64 loop_hits = 0;       // tag match in loop table
+    u64 loop_lookups = 0;    // total lookups
+    // Aliasing
+    u64 p1_alias_evictions = 0;   // P1 entry overwritten by different PC
+    u64 p1_writes = 0;
+    std::array<u64, NUM_TABLES> tage_alias_evictions{};  // per TAGE table
+    u64 loop_alias_evictions = 0; // loop table evictions due to aliasing
 
     void reset() { *this = Counters{}; }
   };
@@ -58,9 +71,24 @@ struct TageMonitor {
   std::array<std::array<EntryState, MAX_TABLE_SIZE>, NUM_TABLES> shadow_table{};
   std::array<u64, NUM_TABLES> table_size{};  // actual size per table (set at init)
 
+  // P1 shadow tags for aliasing detection
+  static constexpr u64 MAX_P1_ENTRIES = MAX_TABLE_SIZE;  // reuse max size
+  std::array<u64, MAX_P1_ENTRIES> p1_shadow_pc{};  // PC hash per P1 entry
+  u64 p1_entries = 0;
+
+  // Loop predictor shadow for aliasing (per set, per way)
+  static constexpr u64 MAX_LOOP_SETS = 64;
+  static constexpr u64 MAX_LOOP_ASSOC = 4;
+  std::array<std::array<u64, MAX_LOOP_ASSOC>, MAX_LOOP_SETS> loop_shadow_pc{};
+  u64 loop_sets = 0;
+  u64 loop_assoc = 0;
+
   void set_table_sizes(const std::array<u64, NUM_TABLES> &sizes) {
     table_size = sizes;
   }
+
+  void set_p1_size(u64 entries) { p1_entries = entries; }
+  void set_loop_size(u64 sets, u64 assoc) { loop_sets = sets; loop_assoc = assoc; }
 
   // Called when a tag is written (allocation) to a table entry
   void record_tag_write(u64 table, u64 index) {
@@ -76,6 +104,48 @@ struct TageMonitor {
     }
     if (new_u) { cum.u_set_count[table]++; win.u_set_count[table]++; }
     else { cum.u_clear_count[table]++; win.u_clear_count[table]++; }
+  }
+
+  // P1 aliasing: called when P1 table is written (training)
+  void record_p1_write(u64 index, u64 pc_hash) {
+    if (index < MAX_P1_ENTRIES) {
+      cum.p1_writes++; win.p1_writes++;
+      if (p1_shadow_pc[index] != 0 && p1_shadow_pc[index] != pc_hash) {
+        cum.p1_alias_evictions++; win.p1_alias_evictions++;
+      }
+      p1_shadow_pc[index] = pc_hash;
+    }
+  }
+
+  // TAGE aliasing: called when TAGE tag is written (allocation)
+  void record_tage_alias(u64 table, u64 index, [[maybe_unused]] u64 pc_hash) {
+    // The existing shadow_table tracks occupancy. For aliasing, check if
+    // the tag changed (different PC mapped to same entry).
+    // Simplified: count as alias if entry was occupied (tag overwrite).
+    if (index < MAX_TABLE_SIZE && shadow_table[table][index].occupied) {
+      cum.tage_alias_evictions[table]++; win.tage_alias_evictions[table]++;
+    }
+  }
+
+  // Loop aliasing: called when loop table entry is written
+  void record_loop_write(u64 set, u64 way, u64 pc_hash) {
+    if (set < MAX_LOOP_SETS && way < MAX_LOOP_ASSOC) {
+      if (loop_shadow_pc[set][way] != 0 && loop_shadow_pc[set][way] != pc_hash) {
+        cum.loop_alias_evictions++; win.loop_alias_evictions++;
+      }
+      loop_shadow_pc[set][way] = pc_hash;
+    }
+  }
+
+  // Loop hit/lookup tracking
+  void record_loop_lookup(bool hit) {
+    cum.loop_lookups++; win.loop_lookups++;
+    if (hit) { cum.loop_hits++; win.loop_hits++; }
+  }
+
+  // Loop override tracking (set in predict2, consumed in update_cycle)
+  void record_loop_override(u64 offset, bool overrode) {
+    shadow_loop_overrode[offset] = overrode;
   }
 
   // Called on epoch reset — clear all u-bits in shadow
@@ -119,6 +189,9 @@ struct TageMonitor {
   std::array<bool, MAX_FW> shadow_meta_overrode{};
   std::array<bool, MAX_FW> shadow_p1_pred{};
   std::array<bool, MAX_FW> shadow_p2_pred{};
+
+  // Shadow state for loop overrider (set in predict2, consumed in update_cycle)
+  std::array<bool, MAX_FW> shadow_loop_overrode{};
 
   // ======== Helpers ========
 
@@ -171,6 +244,14 @@ struct TageMonitor {
         bool p2_correct = (shadow_p2_pred[offset] == actual_taken);
         if (p1_correct && !p2_correct) c.p1_correct_p2_wrong++;
         if (p2_correct && !p1_correct) c.p2_correct_p1_wrong++;
+      }
+      // P1 accuracy
+      c.p1_predictions++;
+      if (shadow_p1_pred[offset] == actual_taken) c.p1_correct++;
+      // Loop overrider
+      if (shadow_loop_overrode[offset]) {
+        c.loop_overrides++;
+        if (!mispredict) c.loop_override_correct++;
       }
     };
     record(cum);
@@ -319,6 +400,34 @@ struct TageMonitor {
     }
     os << "  Decay fires: " << c.decay_fire_count
        << "  Epoch resets: " << c.epoch_reset_count << "\n";
+
+    // P1 accuracy
+    os << "\nP1 Accuracy: " << c.p1_correct << "/" << c.p1_predictions
+       << " (" << pct(c.p1_correct, c.p1_predictions) << "%)\n";
+
+    // P1 aliasing
+    os << "P1 Aliasing: " << c.p1_alias_evictions << "/" << c.p1_writes
+       << " evictions (" << pct(c.p1_alias_evictions, c.p1_writes) << "%)\n";
+
+    // TAGE aliasing
+    os << "\nTAGE Aliasing (evictions per table):\n";
+    os << "  Table  | Evictions\n";
+    os << "  -------+----------\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << ""
+         << "|" << std::setw(9) << c.tage_alias_evictions[i] << "\n";
+    }
+
+    // Loop predictor
+    os << "\nLoop Predictor:\n";
+    os << "  Lookups: " << c.loop_lookups
+       << "  Hits: " << c.loop_hits
+       << " (" << pct(c.loop_hits, c.loop_lookups) << "%)\n";
+    os << "  Overrides: " << c.loop_overrides
+       << "  Correct: " << c.loop_override_correct
+       << " (" << pct(c.loop_override_correct, c.loop_overrides) << "%)\n";
+    os << "  Alias evictions: " << c.loop_alias_evictions << "\n";
+
     os << "=== End TAGE Monitor ===\n\n";
   }
 };

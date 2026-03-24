@@ -19,8 +19,7 @@ template <u64 TABLE_SIZE = 64,      // total entries
           u64 TAG_BITS = 10,        // PC tag width
           u64 ITER_BITS = 10,       // iteration counter width
           u64 CONF_BITS = 3,        // confidence counter width (0..7)
-          u64 FETCH_WIDTH = 16,     // from parent TAGE
-          u64 BINDEX_BITS = 8>      // index bits from parent
+          u64 FETCH_WIDTH = 16>     // from parent TAGE
 struct LoopPredictor {
 
   static constexpr bool ENABLED = true;
@@ -36,16 +35,25 @@ struct LoopPredictor {
   static constexpr u64 ENTRY_BITS =
       TAG_BITS + ITER_BITS + ITER_BITS + CONF_BITS + 1 + AGE_BITS;
 
-  static constexpr u64 RWRAM_BANKS = 2;  // banking for rwram same-cycle read+write
+  static constexpr u64 RWRAM_BANKS = 4;  // banking for same-cycle read+write
+
+#ifdef TAGE_MONITOR
+  // SW counters for monitoring (zero HARCOM cost)
+  struct LoopStats {
+    u64 lookups = 0;
+    u64 hits = 0;           // tag match
+    u64 overrides = 0;      // confident override fired
+    u64 alloc_writes = 0;   // new entry allocations
+    u64 update_writes = 0;  // existing entry updates
+  } loop_stats;
+#endif
 
   static_assert(NUM_SETS >= 2, "Need at least 2 sets");
   static_assert(ASSOC >= 1, "Need at least 1 way");
   static_assert(TABLE_SIZE == NUM_SETS * ASSOC, "TABLE_SIZE must be NUM_SETS * ASSOC");
-  static_assert(NUM_SETS / RWRAM_BANKS > 1, "Need at least 2 entries per bank for rwram");
 
   // ======== HARCOM Storage ========
 
-  // One rwram per way — supports same-cycle read+write via banking
   rwram<ENTRY_BITS, NUM_SETS, RWRAM_BANKS> loop_ram[ASSOC]{"loop"};
 
   // Lookup results (set in lookup, consumed in override_predict and train)
@@ -69,7 +77,7 @@ struct LoopPredictor {
   // Returns LookupResult (vals) — TageImpl applies the TAGE gate later.
   // regs, so the reg timing only reflects the final write, not a read-back.
 
-  LookupResult lookup(val<64> &inst_pc, [[maybe_unused]] reg<BINDEX_BITS> &bindex) {
+  LookupResult lookup(val<64> &inst_pc, [[maybe_unused]] auto &bindex) {
     // Hash PC
     val<SET_BITS> set_idx = val<SET_BITS>{inst_pc >> 2};
     lookup_set = set_idx;
@@ -105,6 +113,11 @@ struct LoopPredictor {
         val<1> pred = val<1>{way_results[0] >> 2};
         hit = tag_match;
         hit_way = val<std::max(u64(1), clog2(ASSOC))>{0};
+#ifdef TAGE_MONITOR
+        loop_stats.lookups++;
+        if (static_cast<u64>(tag_match)) loop_stats.hits++;
+        if (static_cast<u64>(candidate)) loop_stats.overrides++;
+#endif
         return {candidate, pred};
       } else {
         // Multi-way: extract + priority encode
@@ -130,7 +143,11 @@ struct LoopPredictor {
         } else {
           hit_way = encode(first_hit);
         }
-
+#ifdef TAGE_MONITOR
+        loop_stats.lookups++;
+        if (static_cast<u64>(hit_mask) != 0) loop_stats.hits++;
+        if (static_cast<u64>(candidate_mask) != 0) loop_stats.overrides++;
+#endif
         return {(candidate_mask != hard<0>{}),
                 (first_candidate & way_pred.fo1().concat()) != hard<0>{}};
       }
@@ -146,7 +163,8 @@ struct LoopPredictor {
              val<1> &mispredict,
              val<1> &correct_pred,
              arr<reg<1>, FETCH_WIDTH> &override_active,
-             [[maybe_unused]] reg<FETCH_WIDTH> &p2_before_override) {
+             [[maybe_unused]] reg<FETCH_WIDTH> &p2_before_override,
+             val<1> &extra_cycle) {
     // Only train on offset 0 (first branch in block) for now
     val<1> actual = branch_taken[0];
     val<1> is_br = is_branch[0];
@@ -215,9 +233,18 @@ struct LoopPredictor {
           updated_entry, alloc_entry);
       val<1> do_write = (is_hit_way | do_alloc) & is_br;
 
+      // rwram write with extra_cycle as noconflict signal.
+      // When extra_cycle=1: write lands immediately (different cycle from read).
+      // When extra_cycle=0: rwram buffers write, lands when bank is free.
       execute_if(do_write, [&]() {
-        loop_ram[w].write(val<SET_BITS>{lookup_set}, write_entry, val<1>{0});
+        loop_ram[w].write(val<SET_BITS>{lookup_set}, write_entry, extra_cycle);
       });
+#ifdef TAGE_MONITOR
+      if (static_cast<u64>(do_alloc) && static_cast<u64>(is_br))
+        loop_stats.alloc_writes++;
+      if (static_cast<u64>(is_hit_way) && static_cast<u64>(is_br))
+        loop_stats.update_writes++;
+#endif
     });
   }
 };

@@ -418,7 +418,19 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       mon_init = true;
     }
   }
-  ~TageImpl() { mon.print_summary(std::cerr); }
+  ~TageImpl() {
+    if constexpr (Overrider::ENABLED) {
+      mon.cum.loop_lookups = overrider.loop_stats.lookups;
+      mon.cum.loop_hits = overrider.loop_stats.hits;
+      mon.cum.loop_overrides = overrider.loop_stats.overrides;
+    }
+    mon.print_summary(std::cerr);
+    if constexpr (Overrider::ENABLED) {
+      std::cerr << "Loop Predictor (detail):\n"
+                << "  Alloc writes: " << overrider.loop_stats.alloc_writes
+                << "  Update writes: " << overrider.loop_stats.update_writes << "\n";
+    }
+  }
 #endif
 
   // ======== Overrider (conditional) ========
@@ -678,6 +690,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
           override_active[offset] = offset == 0 ? do_override : val<1>{0};
         }
+#ifdef TAGE_MONITOR
+        mon.record_loop_override(0, static_cast<u64>(do_override) != 0);
+#endif
       }
     }
 
@@ -952,7 +967,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         (primary_mask & badpred1.concat()) != hard<0>{};
     val<1> extra_cycle =
         some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1>{});
+    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR>{});
     need_extra_cycle(extra_cycle);
 
     // update meta counter
@@ -994,8 +1009,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         }
       });
 #ifdef TAGE_MONITOR
-      if (static_cast<u64>(allocate[I]))
-        mon.record_tag_write(I, static_cast<u64>(tidx<I>(gindex[I])));
+      if (static_cast<u64>(allocate[I])) {
+        u64 idx = static_cast<u64>(tidx<I>(gindex[I]));
+        mon.record_tag_write(I, idx);
+        mon.record_tage_alias(I, idx, idx ^ (I << 16));
+      }
 #endif
     });
 
@@ -1054,6 +1072,10 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       execute_if(p1_weak[offset].fo1(), [&]() {
         table1_pred[offset].write(index1, p2_split[offset].fo1());
       });
+#ifdef TAGE_MONITOR
+      if (static_cast<u64>(p1_weak[offset]))
+        mon.record_p1_write(static_cast<u64>(index1), static_cast<u64>(index1) ^ (offset << 16));
+#endif
     }
     // update P1 hysteresis
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
@@ -1145,7 +1167,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // Overrider training (all args by reference — no HARCOM copies)
     if constexpr (Overrider::ENABLED) {
       overrider.train(branch_taken, is_branch, mispredict, correct_pred,
-                       override_active, p2_before_override);
+                       override_active, p2_before_override, extra_cycle);
     }
 
     // update global history
