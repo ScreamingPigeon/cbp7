@@ -481,10 +481,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // compute indexes
     bindex = lineaddr;
     bindex.fanout(hard<FETCH_WIDTH + OVR>{});
-    // Overrider parallel lookup (concurrent with TAGE table reads below)
-    if constexpr (Overrider::ENABLED) {
-      overrider.lookup(inst_pc, bindex);
-    }
     for (u64 i = 0; i < NUM_TABLES; i++) {
       if constexpr (USE_PATH_HIST_V) {
         gindex[i] = lineaddr ^ gfolds.template get<0>(i) ^
@@ -614,43 +610,36 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         return inputs.fo1().fold_and();
       };
       if constexpr (!Overrider::ENABLED) {
-        // No overrider: write p2 directly
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
                return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
              }}.concat();
       } else {
-        // With overrider: compute TAGE prediction as val, mux with override, write p2 once
         val<FETCH_WIDTH> tage_p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
                return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
              }}.concat();
-
         arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
           val<1> primary_eq_alt = pred1[offset] == pred2[offset];
           val<1> is_newly_alloc = [&]() -> val<1> {
-            if constexpr (USE_META_V) {
-              return newly_alloc[offset];
-            } else {
-              return val<1>{0};
-            }
+            if constexpr (USE_META_V) { return newly_alloc[offset]; }
+            else { return val<1>{0}; }
           }();
           val<1> is_bimodal = match1[offset] == hard<1>{};
           return select(is_newly_alloc, val<2>{0},
                  select(primary_eq_alt,
-                        select(is_bimodal, val<2>{3}, val<2>{2}),
-                        val<2>{1}));
+                        select(is_bimodal, val<2>{3}, val<2>{2}), val<2>{1}));
         };
-
-        overrider.override_predict(tage_confidence, tage_p2, inst_pc);
+        // Single call: overrider does lookup + decision, returns vals directly
+        auto ovr = overrider.predict(inst_pc, bindex, tage_confidence);
         p2_before_override = tage_p2;
         auto tage_p2_split = tage_p2.make_array(val<1>{});
-        // Single write to p2: mux TAGE prediction with overrider
+        ovr.ovr_valid.fanout(hard<2>{});
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-          return select(overrider.get_override_valid(offset),
-                        overrider.get_override_pred(offset),
+          return select(ovr.ovr_valid[offset],
+                        ovr.ovr_pred[offset],
                         tage_p2_split[offset]);
         }}.concat();
         for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-          override_active[offset] = overrider.get_override_valid(offset);
+          override_active[offset] = ovr.ovr_valid[offset];
         }
       }
     } else {
@@ -658,21 +647,20 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         p2 = pred1.concat();
       } else {
         val<FETCH_WIDTH> tage_p2 = pred1.concat();
-
         arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
-          return val<2>{2};  // no meta: always "agree, normal"
+          return val<2>{2};
         };
-
-        overrider.override_predict(tage_confidence, tage_p2, inst_pc);
+        auto ovr = overrider.predict(inst_pc, bindex, tage_confidence);
         p2_before_override = tage_p2;
         auto tage_p2_split = tage_p2.make_array(val<1>{});
+        ovr.ovr_valid.fanout(hard<2>{});
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-          return select(overrider.get_override_valid(offset),
-                        overrider.get_override_pred(offset),
+          return select(ovr.ovr_valid[offset],
+                        ovr.ovr_pred[offset],
                         tage_p2_split[offset]);
         }}.concat();
         for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-          override_active[offset] = overrider.get_override_valid(offset);
+          override_active[offset] = ovr.ovr_valid[offset];
         }
       }
     }

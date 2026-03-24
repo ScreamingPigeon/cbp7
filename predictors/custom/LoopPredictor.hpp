@@ -56,111 +56,95 @@ struct LoopPredictor {
   reg<clog2(ASSOC)> hit_way;  // which way matched
   reg<1> loop_has_candidate;  // confident match found (pre-computed in lookup)
 
-  // Override output
-  arr<reg<1>, FETCH_WIDTH> ovr_valid;
-  arr<reg<1>, FETCH_WIDTH> ovr_pred;
-  arr<reg<1>, FETCH_WIDTH> skip_alloc;
+  // Override result (returned as vals from predict(), no regs on critical path)
+  struct PredictResult {
+    arr<val<1>, FETCH_WIDTH> ovr_valid;
+    arr<val<1>, FETCH_WIDTH> ovr_pred;
+    arr<val<1>, FETCH_WIDTH> skip_alloc;
+  };
 
-  // ======== Phase 1: lookup() — parallel with TAGE reads ========
-  // Does ALL heavy work: RAM read, unpack, tag match, confidence check,
-  // prediction computation, priority encode. Results stored in regs.
-  // This runs in parallel with TAGE table reads — no serial dependency.
+  // ======== predict() — single call, all computation on vals ========
+  // Called once in predict2 after TAGE computes tage_confidence.
+  // Does RAM read + unpack + tag match + confidence + prediction + TAGE gate
+  // all in one function. No intermediate regs — vals flow directly to output
+  // regs, so the reg timing only reflects the final write, not a read-back.
 
-  void lookup(val<64> &inst_pc, [[maybe_unused]] reg<BINDEX_BITS> &bindex) {
-    // Hash PC to set index
+  PredictResult predict(val<64> &inst_pc, [[maybe_unused]] reg<BINDEX_BITS> &bindex,
+                         arr<val<2>, FETCH_WIDTH> &tage_confidence) {
+    // Hash PC
     val<SET_BITS> set_idx = val<SET_BITS>{inst_pc >> 2};
     lookup_set = set_idx;
-
-    // Compute tag from upper PC bits
     val<TAG_BITS> tag = val<TAG_BITS>{inst_pc >> (2 + SET_BITS)};
-    tag.fanout(hard<ASSOC>{});
+    tag.fanout(hard<ASSOC + 1>{});
     lookup_tag = tag;
+    set_idx.fanout(hard<ASSOC>{});
 
-    // Read all ways in parallel, unpack, match, compute prediction
+    // Read all ways, compute everything on raw vals
+    arr<val<ENTRY_BITS>, ASSOC> raw_entries = [&](u64 w) -> val<ENTRY_BITS> {
+      return loop_ram[w].read(set_idx);
+    };
+    raw_entries.fanout(hard<4>{});
+
     arr<val<1>, ASSOC> way_tag_match = [&](u64 w) -> val<1> {
-      val<ENTRY_BITS> entry = loop_ram[w].read(set_idx);
-      read_entries[w] = entry;  // save for train()
       auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
-          split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(entry);
+          split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(
+              raw_entries[w]);
       return val<TAG_BITS>{e_tag} == tag;
     };
 
     arr<val<1>, ASSOC> way_confident = [&](u64 w) -> val<1> {
       auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
           split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(
-              val<ENTRY_BITS>{read_entries[w]});
+              raw_entries[w]);
       return val<CONF_BITS>{e_conf} > hard<CONF_THRESHOLD>{};
     };
 
     arr<val<1>, ASSOC> way_pred = [&](u64 w) -> val<1> {
       auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
           split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(
-              val<ENTRY_BITS>{read_entries[w]});
+              raw_entries[w]);
       val<ITER_BITS> next_iter =
           val<ITER_BITS>{val<ITER_BITS>{e_cur_iter} + hard<1>{}};
       val<1> at_exit = (next_iter == val<ITER_BITS>{e_nb_iter});
       return select(at_exit, ~val<1>{e_dir}, val<1>{e_dir});
     };
 
-    // Priority encode: first matching way
+    // Priority encode
     val<ASSOC> hit_mask = way_tag_match.fo1().concat();
     val<ASSOC> confident_mask = way_confident.fo1().concat();
     val<ASSOC> candidate_mask = hit_mask & confident_mask;
     val<ASSOC> first_candidate = candidate_mask.one_hot();
     val<ASSOC> first_hit = hit_mask.one_hot();
 
-    // Pre-compute override prediction and hit info — store in regs
-    // These are ready BEFORE TAGE finishes, so override_predict() is just a mux.
-    ovr_pred[0] = (first_candidate & way_pred.fo1().concat()) != hard<0>{};
-    // ovr_valid[0] set later in override_predict (needs tage_confidence)
-    // For now store "loop is confident and matched" as a pre-signal
-    loop_has_candidate = (candidate_mask != hard<0>{});
+    // TAGE confidence gate — the only part that depends on TAGE timing
+    val<1> tage_weak = (tage_confidence[0] < hard<3>{});
+    val<1> has_candidate = (candidate_mask != hard<0>{});
+    val<1> do_override = has_candidate & tage_weak;
+    val<1> pred_val = (first_candidate & way_pred.fo1().concat()) != hard<0>{};
+
+    // Save state to regs for train() (different cycle — timing doesn't matter)
     hit = (hit_mask != hard<0>{});
     if constexpr (ASSOC <= 2) {
       hit_way = val<clog2(ASSOC)>{first_hit >> 1};
     } else {
       hit_way = encode(first_hit);
     }
-
-    // Other offsets: no prediction
-    for (u64 offset = 1; offset < FETCH_WIDTH; offset++) {
-      ovr_pred[offset] = val<1>{0};
+    for (u64 w = 0; w < ASSOC; w++) {
+      read_entries[w] = raw_entries[w];
     }
-  }
 
-  // ======== Phase 2: override_predict() ========
-  // Called AFTER TAGE computes confidence. Only does the final gate:
-  // override if loop has a confident candidate AND TAGE is weak.
-  // This adds only ~1 select mux to the critical path (~20ps).
-
-  void override_predict(arr<val<2>, FETCH_WIDTH> &tage_confidence,
-                         [[maybe_unused]] val<FETCH_WIDTH> &tage_p2,
-                         [[maybe_unused]] val<64> &inst_pc) {
-    // Final gate: only override when TAGE confidence < 3
-    val<1> tage_weak = (tage_confidence[0] < hard<3>{});
-    val<1> do_override = val<1>{loop_has_candidate} & tage_weak;
-
-    ovr_valid[0] = do_override;
-    skip_alloc[0] = do_override;
-
-    for (u64 offset = 1; offset < FETCH_WIDTH; offset++) {
-      ovr_valid[offset] = val<1>{0};
-      skip_alloc[offset] = val<1>{0};
-    }
-  }
-
-  // ======== Accessors ========
-
-  val<1> get_override_valid(u64 offset) {
-    return val<1>{ovr_valid[offset]};
-  }
-
-  val<1> get_override_pred(u64 offset) {
-    return val<1>{ovr_pred[offset]};
-  }
-
-  val<1> get_skip_tage_alloc(u64 offset) {
-    return val<1>{skip_alloc[offset]};
+    // Return vals directly — NO regs on the critical path
+    return PredictResult{
+      .ovr_valid = [&](u64 offset) -> val<1> {
+        return offset == 0 ? do_override : val<1>{0};
+      },
+      .ovr_pred = [&](u64 offset) -> val<1> {
+        return offset == 0 ? pred_val : val<1>{0};
+      },
+      .skip_alloc = [&](u64 offset) -> val<1> {
+        return offset == 0 ? do_override : val<1>{0};
+      },
+    };
   }
 
   // ======== Phase 3: train() ========
