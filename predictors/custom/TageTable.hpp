@@ -215,7 +215,7 @@ public:
   }
 
   // Write a single entry in a u-bit FF array at a dynamic val index.
-  void write_u_ff_arr(u64 arr_idx, val<IDX_BITS> index, val<U_WIDTH> u) {
+  void write_u_ff_arr(u64 arr_idx, val<IDX_BITS> &index, val<U_WIDTH> &u) {
     for (u64 i = 0; i < TABLE_SIZE; i++) {
       execute_if(index == val<IDX_BITS>{static_cast<unsigned>(i)},
                  [&]() { u_ff[arr_idx][i] = u; });

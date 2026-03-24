@@ -7,6 +7,8 @@
 #include "TageMonitor.hpp"
 #endif
 #include "TageTable.hpp"
+#include "TageOverrider.hpp"
+#include "LoopPredictor.hpp"
 
 using namespace hcm;
 
@@ -191,7 +193,8 @@ template <bool USE_AHEAD_V, typename TableCfg, typename AllocCfg,
           bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
           u64 META_TABLE_SIZE_V,
           // Path history params
-          bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V>
+          bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V,
+          typename Overrider_V>
 struct TageImpl;
 
 // ============================================================================
@@ -206,7 +209,7 @@ template <typename TableCfg, typename AllocCfg, u64 FETCH_WIDTH_V,
           bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V,
           u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
           u64 META_TABLE_SIZE_V, bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V,
-          u64 PATH_BITS_V>
+          u64 PATH_BITS_V, typename Overrider_V>
 struct TageBase {
   // ---- Import config ----
   static constexpr u64 NUM_TABLES = TableCfg::NUM_TABLES;
@@ -287,13 +290,17 @@ template <typename TableCfg, typename AllocCfg, u64 FETCH_WIDTH_V,
           typename ResetFn_V, bool USE_FF_CACHE_V, bool P1_USE_GSHARE_V,
           u64 P1_TABLE_SIZE_V, u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V,
           u64 METAPIPE_V, u64 META_TABLE_SIZE_V, bool USE_PATH_HIST_V,
-          u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V>
+          u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V, typename Overrider_V>
 struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                 BR_P_ENTRY_V, NUM_BANKS_V, SHARED_TAG_V, SHARED_U_V,
                 SHARED_HYS_V, U_STOR_FF_V, DECAY_CTR_V, DECAY_GRAN_V, ResetFn_V,
                 USE_FF_CACHE_V, P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V,
                 USE_META_V, METABITS_V, METAPIPE_V, META_TABLE_SIZE_V,
-                USE_PATH_HIST_V, PATH_HIST_WIDTH_V, PATH_BITS_V> : predictor {
+                USE_PATH_HIST_V, PATH_HIST_WIDTH_V, PATH_BITS_V,
+                Overrider_V> : predictor {
+
+  using Overrider = Overrider_V;
+  static constexpr u64 OVR = Overrider::ENABLED ? 1 : 0;
 
   using Base =
       TageBase<TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V, BR_P_ENTRY_V,
@@ -301,7 +308,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                U_STOR_FF_V, DECAY_CTR_V, DECAY_GRAN_V, ResetFn_V, USE_FF_CACHE_V,
                P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V,
                METABITS_V, METAPIPE_V, META_TABLE_SIZE_V, USE_PATH_HIST_V,
-               PATH_HIST_WIDTH_V, PATH_BITS_V>;
+               PATH_HIST_WIDTH_V, PATH_BITS_V, Overrider_V>;
 
   // ======== Constants ========
   static constexpr u64 NUM_TABLES = Base::NUM_TABLES;
@@ -414,6 +421,13 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   ~TageImpl() { mon.print_summary(std::cerr); }
 #endif
 
+  // ======== Overrider (conditional) ========
+  std::conditional_t<Overrider::ENABLED, Overrider, EmptyMember> overrider;
+  std::conditional_t<Overrider::ENABLED,
+      arr<reg<1>, FETCH_WIDTH>, EmptyMember> override_active;
+  std::conditional_t<Overrider::ENABLED,
+      reg<FETCH_WIDTH>, EmptyMember> p2_before_override;
+
   // ======== Predictor Interface ========
 
   void new_block(val<64> inst_pc) {
@@ -466,7 +480,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // compute indexes
     bindex = lineaddr;
-    bindex.fanout(hard<FETCH_WIDTH>{});
+    bindex.fanout(hard<FETCH_WIDTH + OVR>{});
+    // Overrider parallel lookup (concurrent with TAGE table reads below)
+    if constexpr (Overrider::ENABLED) {
+      overrider.lookup(inst_pc, bindex);
+    }
     for (u64 i = 0; i < NUM_TABLES; i++) {
       if constexpr (USE_PATH_HIST_V) {
         gindex[i] = lineaddr ^ gfolds.template get<0>(i) ^
@@ -561,11 +579,11 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       match1[offset] = match[offset].one_hot();
     }
-    match1.fanout(hard<3>{});
+    match1.fanout(hard<3 + OVR>{});
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
     }
-    pred1.fanout(hard<2>{});
+    pred1.fanout(hard<2 + OVR>{});
 
     // for each offset, find second longest match and select secondary prediction
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
@@ -575,7 +593,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
     }
-    pred2.fanout(hard<2>{});
+    pred2.fanout(hard<2 + OVR>{});
 
     if constexpr (USE_META_V) {
       meta.fanout(hard<2>{});
@@ -589,17 +607,74 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
         newly_alloc[offset] = (match1[offset] & coldctr) != hard<0>{};
       }
-      newly_alloc.fanout(hard<2>{});
+      newly_alloc.fanout(hard<2 + OVR>{});
       arr<val<1>, FETCH_WIDTH> altsel = [&](u64 offset) {
         arr<val<1>, 3> inputs = {metasign, newly_alloc[offset],
                                  match2[offset] != hard<0>{}};
         return inputs.fo1().fold_and();
       };
-      p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-             return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
-           }}.concat();
+      if constexpr (!Overrider::ENABLED) {
+        // No overrider: write p2 directly
+        p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
+               return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
+             }}.concat();
+      } else {
+        // With overrider: compute TAGE prediction as val, mux with override, write p2 once
+        val<FETCH_WIDTH> tage_p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
+               return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
+             }}.concat();
+
+        arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
+          val<1> primary_eq_alt = pred1[offset] == pred2[offset];
+          val<1> is_newly_alloc = [&]() -> val<1> {
+            if constexpr (USE_META_V) {
+              return newly_alloc[offset];
+            } else {
+              return val<1>{0};
+            }
+          }();
+          val<1> is_bimodal = match1[offset] == hard<1>{};
+          return select(is_newly_alloc, val<2>{0},
+                 select(primary_eq_alt,
+                        select(is_bimodal, val<2>{3}, val<2>{2}),
+                        val<2>{1}));
+        };
+
+        overrider.override_predict(tage_confidence, tage_p2, inst_pc);
+        p2_before_override = tage_p2;
+        auto tage_p2_split = tage_p2.make_array(val<1>{});
+        // Single write to p2: mux TAGE prediction with overrider
+        p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
+          return select(overrider.get_override_valid(offset),
+                        overrider.get_override_pred(offset),
+                        tage_p2_split[offset]);
+        }}.concat();
+        for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+          override_active[offset] = overrider.get_override_valid(offset);
+        }
+      }
     } else {
-      p2 = pred1.concat();
+      if constexpr (!Overrider::ENABLED) {
+        p2 = pred1.concat();
+      } else {
+        val<FETCH_WIDTH> tage_p2 = pred1.concat();
+
+        arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
+          return val<2>{2};  // no meta: always "agree, normal"
+        };
+
+        overrider.override_predict(tage_confidence, tage_p2, inst_pc);
+        p2_before_override = tage_p2;
+        auto tage_p2_split = tage_p2.make_array(val<1>{});
+        p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
+          return select(overrider.get_override_valid(offset),
+                        overrider.get_override_pred(offset),
+                        tage_p2_split[offset]);
+        }}.concat();
+        for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
+          override_active[offset] = overrider.get_override_valid(offset);
+        }
+      }
     }
 
 #ifdef TAGE_MONITOR
@@ -1063,6 +1138,12 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // Note: U_STOR_FF with DECAY_CTR=0 has no epoch reset — u-bits only
     // clear through uclear (allocation pressure). Consider using DECAY_CTR>0.
 
+    // Overrider training (all args by reference — no HARCOM copies)
+    if constexpr (Overrider::ENABLED) {
+      overrider.train(branch_taken, is_branch, mispredict, correct_pred,
+                       override_active, p2_before_override);
+    }
+
     // update global history
     val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
     true_block = correct_pred | branch_dir[num_branch - 1] | line_end.fo1();
@@ -1095,13 +1176,14 @@ template <typename TableCfg, typename AllocCfg, u64 FETCH_WIDTH_V,
           typename ResetFn_V, bool USE_FF_CACHE_V, bool P1_USE_GSHARE_V,
           u64 P1_TABLE_SIZE_V, u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V,
           u64 METAPIPE_V, u64 META_TABLE_SIZE_V, bool USE_PATH_HIST_V,
-          u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V>
+          u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V, typename Overrider_V>
 struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                 BR_P_ENTRY_V, NUM_BANKS_V, SHARED_TAG_V, SHARED_U_V,
                 SHARED_HYS_V, U_STOR_FF_V, DECAY_CTR_V, DECAY_GRAN_V, ResetFn_V,
                 USE_FF_CACHE_V, P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V,
                 USE_META_V, METABITS_V, METAPIPE_V, META_TABLE_SIZE_V,
-                USE_PATH_HIST_V, PATH_HIST_WIDTH_V, PATH_BITS_V> : predictor {
+                USE_PATH_HIST_V, PATH_HIST_WIDTH_V, PATH_BITS_V,
+                Overrider_V> : predictor {
 
   using Base =
       TageBase<TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V, BR_P_ENTRY_V,
@@ -1109,7 +1191,7 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                U_STOR_FF_V, DECAY_CTR_V, DECAY_GRAN_V, ResetFn_V, USE_FF_CACHE_V,
                P1_USE_GSHARE_V, P1_TABLE_SIZE_V, P1_HIST_V, USE_META_V,
                METABITS_V, METAPIPE_V, META_TABLE_SIZE_V, USE_PATH_HIST_V,
-               PATH_HIST_WIDTH_V, PATH_BITS_V>;
+               PATH_HIST_WIDTH_V, PATH_BITS_V, Overrider_V>;
 
   static constexpr u64 NUM_TABLES = Base::NUM_TABLES;
   static constexpr u64 FETCH_WIDTH = Base::FETCH_WIDTH;
@@ -2046,7 +2128,8 @@ template <typename TableCfg = DefaultTableConfig,
           u64 TAGE_METAPIPE = 2, u64 TAGE_META_TABLE_SIZE = 0,
           // Path history
           bool TAGE_USE_PATH_HIST = false, u64 TAGE_PATH_HIST_WIDTH = 27,
-          u64 TAGE_PATH_BITS = 6>
+          u64 TAGE_PATH_BITS = 6,
+          typename TAGE_OVERRIDER = NoOverrider>
 using Tage =
     TageImpl<TAGE_USE_AHEAD, TableCfg, AllocCfg, TAGE_FETCH_WIDTH,
              TAGE_BIMODAL_SIZE, TAGE_BR_P_ENTRY, TAGE_NUM_BANKS,
@@ -2055,4 +2138,4 @@ using Tage =
              ResetFn, TAGE_USE_FF_CACHE, TAGE_P1_USE_GSHARE, TAGE_P1_TABLE_SIZE,
              TAGE_P1_HIST, TAGE_USE_META, TAGE_METABITS, TAGE_METAPIPE,
              TAGE_META_TABLE_SIZE, TAGE_USE_PATH_HIST, TAGE_PATH_HIST_WIDTH,
-             TAGE_PATH_BITS>;
+             TAGE_PATH_BITS, TAGE_OVERRIDER>;
