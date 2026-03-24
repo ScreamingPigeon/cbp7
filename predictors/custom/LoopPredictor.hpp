@@ -53,98 +53,90 @@ struct LoopPredictor {
   reg<SET_BITS> lookup_set;
   reg<TAG_BITS> lookup_tag;
   reg<1> hit;             // any way matched
-  reg<clog2(ASSOC)> hit_way;  // which way matched
+  reg<std::max(u64(1), clog2(ASSOC))> hit_way;  // which way matched
   reg<1> loop_has_candidate;  // confident match found (pre-computed in lookup)
 
-  // Override result (returned as vals from predict(), no regs on critical path)
-  struct PredictResult {
-    arr<val<1>, FETCH_WIDTH> ovr_valid;
-    arr<val<1>, FETCH_WIDTH> ovr_pred;
-    arr<val<1>, FETCH_WIDTH> skip_alloc;
+  // Lookup result (returned as vals — no regs on critical path)
+  // TageImpl applies the TAGE-confidence gate on top.
+  struct LookupResult {
+    val<1> candidate;  // confident tag match found
+    val<1> pred;       // loop prediction (valid when candidate=1)
   };
 
-  // ======== predict() — single call, all computation on vals ========
-  // Called once in predict2 after TAGE computes tage_confidence.
-  // Does RAM read + unpack + tag match + confidence + prediction + TAGE gate
-  // all in one function. No intermediate regs — vals flow directly to output
+  // ======== lookup() — parallel with TAGE reads ========
+  // Called at START of predict2, concurrent with TAGE table reads.
+  // Does RAM read + unpack + tag match + confidence + prediction.
+  // Returns LookupResult (vals) — TageImpl applies the TAGE gate later.
   // regs, so the reg timing only reflects the final write, not a read-back.
 
-  PredictResult predict(val<64> &inst_pc, [[maybe_unused]] reg<BINDEX_BITS> &bindex,
-                         arr<val<2>, FETCH_WIDTH> &tage_confidence) {
+  LookupResult lookup(val<64> &inst_pc, [[maybe_unused]] reg<BINDEX_BITS> &bindex) {
     // Hash PC
     val<SET_BITS> set_idx = val<SET_BITS>{inst_pc >> 2};
     lookup_set = set_idx;
     val<TAG_BITS> tag = val<TAG_BITS>{inst_pc >> (2 + SET_BITS)};
     tag.fanout(hard<ASSOC + 1>{});
     lookup_tag = tag;
-    set_idx.fanout(hard<ASSOC>{});
+    if constexpr (ASSOC > 1) {
+      set_idx.fanout(hard<ASSOC>{});
+    }
 
-    // Read all ways, compute everything on raw vals
-    arr<val<ENTRY_BITS>, ASSOC> raw_entries = [&](u64 w) -> val<ENTRY_BITS> {
-      return loop_ram[w].read(set_idx);
-    };
-    raw_entries.fanout(hard<4>{});
-
-    arr<val<1>, ASSOC> way_tag_match = [&](u64 w) -> val<1> {
+    // Per-way: single split, compute tag/conf/pred in one pass
+    arr<val<3>, ASSOC> way_results = [&](u64 w) -> val<3> {
+      val<ENTRY_BITS> entry = loop_ram[w].read(set_idx);
+      read_entries[w] = entry;
       auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
-          split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(
-              raw_entries[w]);
-      return val<TAG_BITS>{e_tag} == tag;
-    };
-
-    arr<val<1>, ASSOC> way_confident = [&](u64 w) -> val<1> {
-      auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
-          split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(
-              raw_entries[w]);
-      return val<CONF_BITS>{e_conf} > hard<CONF_THRESHOLD>{};
-    };
-
-    arr<val<1>, ASSOC> way_pred = [&](u64 w) -> val<1> {
-      auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
-          split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(
-              raw_entries[w]);
+          split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(entry);
+      val<1> tag_match = (val<TAG_BITS>{e_tag} == tag);
+      val<1> confident = (val<CONF_BITS>{e_conf} > hard<CONF_THRESHOLD>{});
       val<ITER_BITS> next_iter =
           val<ITER_BITS>{val<ITER_BITS>{e_cur_iter} + hard<1>{}};
       val<1> at_exit = (next_iter == val<ITER_BITS>{e_nb_iter});
-      return select(at_exit, ~val<1>{e_dir}, val<1>{e_dir});
+      val<1> pred = select(at_exit, ~val<1>{e_dir}, val<1>{e_dir});
+      return concat(tag_match, confident, pred);
     };
 
-    // Priority encode
-    val<ASSOC> hit_mask = way_tag_match.fo1().concat();
-    val<ASSOC> confident_mask = way_confident.fo1().concat();
-    val<ASSOC> candidate_mask = hit_mask & confident_mask;
-    val<ASSOC> first_candidate = candidate_mask.one_hot();
-    val<ASSOC> first_hit = hit_mask.one_hot();
+    // Compute candidate + pred — IIFE to avoid val reassignment
+    auto result = [&]() -> LookupResult {
+      if constexpr (ASSOC == 1) {
+        // Direct-mapped: no priority encode, minimal gate chain
+        way_results.fanout(hard<3>{});
+        val<1> tag_match = val<1>{way_results[0]};
+        val<1> candidate = tag_match & val<1>{way_results[0] >> 1};
+        val<1> pred = val<1>{way_results[0] >> 2};
+        hit = tag_match;
+        hit_way = val<std::max(u64(1), clog2(ASSOC))>{0};
+        return {candidate, pred};
+      } else {
+        // Multi-way: extract + priority encode
+        way_results.fanout(hard<3>{});
+        arr<val<1>, ASSOC> way_tag_match = [&](u64 w) -> val<1> {
+          return val<1>{way_results[w]};
+        };
+        arr<val<1>, ASSOC> way_candidate = [&](u64 w) -> val<1> {
+          return val<1>{way_results[w]} & val<1>{way_results[w] >> 1};
+        };
+        arr<val<1>, ASSOC> way_pred = [&](u64 w) -> val<1> {
+          return val<1>{way_results[w] >> 2};
+        };
 
-    // TAGE confidence gate — the only part that depends on TAGE timing
-    val<1> tage_weak = (tage_confidence[0] < hard<3>{});
-    val<1> has_candidate = (candidate_mask != hard<0>{});
-    val<1> do_override = has_candidate & tage_weak;
-    val<1> pred_val = (first_candidate & way_pred.fo1().concat()) != hard<0>{};
+        val<ASSOC> hit_mask = way_tag_match.fo1().concat();
+        val<ASSOC> candidate_mask = way_candidate.fo1().concat();
+        val<ASSOC> first_candidate = candidate_mask.one_hot();
+        val<ASSOC> first_hit = hit_mask.one_hot();
 
-    // Save state to regs for train() (different cycle — timing doesn't matter)
-    hit = (hit_mask != hard<0>{});
-    if constexpr (ASSOC <= 2) {
-      hit_way = val<clog2(ASSOC)>{first_hit >> 1};
-    } else {
-      hit_way = encode(first_hit);
-    }
-    for (u64 w = 0; w < ASSOC; w++) {
-      read_entries[w] = raw_entries[w];
-    }
+        hit = (hit_mask != hard<0>{});
+        if constexpr (ASSOC <= 2) {
+          hit_way = val<std::max(u64(1), clog2(ASSOC))>{first_hit >> 1};
+        } else {
+          hit_way = encode(first_hit);
+        }
 
-    // Return vals directly — NO regs on the critical path
-    return PredictResult{
-      .ovr_valid = [&](u64 offset) -> val<1> {
-        return offset == 0 ? do_override : val<1>{0};
-      },
-      .ovr_pred = [&](u64 offset) -> val<1> {
-        return offset == 0 ? pred_val : val<1>{0};
-      },
-      .skip_alloc = [&](u64 offset) -> val<1> {
-        return offset == 0 ? do_override : val<1>{0};
-      },
-    };
+        return {(candidate_mask != hard<0>{}),
+                (first_candidate & way_pred.fo1().concat()) != hard<0>{}};
+      }
+    }();
+
+    return result;
   }
 
   // ======== Phase 3: train() ========
@@ -165,7 +157,9 @@ struct LoopPredictor {
     lookup_set.fanout(hard<ASSOC + 1>{});  // one per way write + one for alloc
     lookup_tag.fanout(hard<ASSOC + 1>{});
     hit.fanout(hard<ASSOC + 2>{});
-    hit_way.fanout(hard<ASSOC>{});
+    if constexpr (ASSOC > 1) {
+      hit_way.fanout(hard<ASSOC>{});
+    }
 
     // Combined update + allocation in a single loop (one RAM write per way max)
     val<1> should_alloc = ~val<1>{hit} & mispredict & is_br &
@@ -177,7 +171,7 @@ struct LoopPredictor {
               read_entries[w]);
 
       val<1> is_hit_way = val<1>{hit} &
-          (val<clog2(ASSOC)>{hit_way} == hard<w>{});
+          (val<std::max(u64(1), clog2(ASSOC))>{hit_way} == hard<w>{});
 
       // --- Update path (hit way) ---
       val<1> dir_flip = val<1>{e_dir} != actual;

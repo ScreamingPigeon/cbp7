@@ -481,6 +481,18 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // compute indexes
     bindex = lineaddr;
     bindex.fanout(hard<FETCH_WIDTH + OVR>{});
+
+    // Overrider parallel lookup — runs concurrently with TAGE table reads below.
+    // Returns vals with pre-computed prediction (no regs on critical path).
+    // Use IIFE to conditionally construct the result without val assignment.
+    auto ovr_lookup = [&]() {
+      if constexpr (Overrider::ENABLED) {
+        return overrider.lookup(inst_pc, bindex);
+      } else {
+        return EmptyMember{};
+      }
+    }();
+
     for (u64 i = 0; i < NUM_TABLES; i++) {
       if constexpr (USE_PATH_HIST_V) {
         gindex[i] = lineaddr ^ gfolds.template get<0>(i) ^
@@ -617,6 +629,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         val<FETCH_WIDTH> tage_p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
                return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
              }}.concat();
+        // TAGE confidence gate: combine lookup result (parallel) with confidence (serial)
+        // Only the AND + select is on the critical path after TAGE — ~20ps
         arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
           val<1> primary_eq_alt = pred1[offset] == pred2[offset];
           val<1> is_newly_alloc = [&]() -> val<1> {
@@ -628,18 +642,20 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
                  select(primary_eq_alt,
                         select(is_bimodal, val<2>{3}, val<2>{2}), val<2>{1}));
         };
-        // Single call: overrider does lookup + decision, returns vals directly
-        auto ovr = overrider.predict(inst_pc, bindex, tage_confidence);
+        val<1> tage_weak = (tage_confidence[0] < hard<3>{});
+        // Gate: override only when loop has candidate AND TAGE is weak
+        ovr_lookup.candidate.fanout(hard<2>{});
+        val<1> do_override = ovr_lookup.candidate & tage_weak;
         p2_before_override = tage_p2;
         auto tage_p2_split = tage_p2.make_array(val<1>{});
-        ovr.ovr_valid.fanout(hard<2>{});
+        do_override.fanout(hard<2>{});
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-          return select(ovr.ovr_valid[offset],
-                        ovr.ovr_pred[offset],
+          return select(offset == 0 ? do_override : val<1>{0},
+                        ovr_lookup.pred,
                         tage_p2_split[offset]);
         }}.concat();
         for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-          override_active[offset] = ovr.ovr_valid[offset];
+          override_active[offset] = offset == 0 ? do_override : val<1>{0};
         }
       }
     } else {
@@ -647,20 +663,20 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
         p2 = pred1.concat();
       } else {
         val<FETCH_WIDTH> tage_p2 = pred1.concat();
-        arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
-          return val<2>{2};
-        };
-        auto ovr = overrider.predict(inst_pc, bindex, tage_confidence);
+        // No meta: TAGE confidence is always "agree, normal" = 2
+        val<1> tage_weak = val<1>{1};  // confidence 2 < 3, always weak
+        ovr_lookup.candidate.fanout(hard<2>{});
+        val<1> do_override = ovr_lookup.candidate & tage_weak;
         p2_before_override = tage_p2;
         auto tage_p2_split = tage_p2.make_array(val<1>{});
-        ovr.ovr_valid.fanout(hard<2>{});
+        do_override.fanout(hard<2>{});
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-          return select(ovr.ovr_valid[offset],
-                        ovr.ovr_pred[offset],
+          return select(offset == 0 ? do_override : val<1>{0},
+                        ovr_lookup.pred,
                         tage_p2_split[offset]);
         }}.concat();
         for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-          override_active[offset] = ovr.ovr_valid[offset];
+          override_active[offset] = offset == 0 ? do_override : val<1>{0};
         }
       }
     }
