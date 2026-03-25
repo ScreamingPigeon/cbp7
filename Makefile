@@ -116,7 +116,7 @@ cbp-profile-analyze-regions: $(BUILD_DIR)/cbp-profile | out
 
 # TAGE Monitor: build with SW instrumentation and run
 # Requires CHEATING_MODE for val<> data extraction. Zero cost when not enabled.
-MONITOR_FLAGS := -DTAGE_MONITOR -DCHEATING_MODE
+MONITOR_FLAGS := -DTAGE_MONITOR -DCHEATING_MODE -DREAD_WRITE_RAM
 MONITOR_OUT ?= out/monitor.txt
 
 $(BUILD_DIR)/cbp-monitor: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)

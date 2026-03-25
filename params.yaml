@@ -41,8 +41,10 @@ predictor: Tage
 # 23  USE_PATH_HIST     bool      false
 # 24  PATH_HIST_WIDTH   u64       27
 # 25  PATH_BITS         u64       6
-# 26  OVERRIDER         typename  LoopPredictor<TABLE_SIZE,ASSOC,TAG_BITS,ITER_BITS,CONF_BITS,FETCH_WIDTH>
-#     LoopPredictor defaults:     <64, 4, 10, 10, 3, 16>
+# 26  OVERRIDER         typename  SCOverrider<BIAS_LOG,SC_CTR_BITS,FETCH_WIDTH,SC_CONF_THRESH>
+#     SCOverrider defaults:       <8, 6, 16, 4>  (3 bias tables, 256 entries, 6-bit signed, thresh=4)
+#     LoopPredictorA:             <TABLE_SIZE,TAG_BITS,ITER_BITS,CONF_BITS,FETCH_WIDTH,LWAYS>
+#     LoopPredictorA defaults:    <64, 10, 10, 3, 16, 2>
 #     NoOverrider to disable
 #
 # Only specify up to the last arg you want to change. Everything after uses defaults.

@@ -59,7 +59,7 @@ struct LoopPredictor {
     u64 cache_writes = 0;   // entry cache updates
     u64 conf_nonzero = 0;  // lookups where conf > 0
     u64 nb_iter_nonzero = 0; // lookups where nb_iter > 0
-  } loop_stats;
+  } stats;
 #endif
 
   static_assert(NUM_SETS >= 2, "Need at least 2 sets");
@@ -160,12 +160,12 @@ struct LoopPredictor {
           auto [ch, raw] = ecache.lookup(lookup_set_sw, w);
           if (ch) {
 #ifdef TAGE_MONITOR
-            loop_stats.cache_hits++;
+            stats.cache_hits++;
 #endif
             return val<ENTRY_BITS>{raw};
           }
 #ifdef TAGE_MONITOR
-          loop_stats.cache_misses++;
+          stats.cache_misses++;
 #endif
         }
         return ram_entry;
@@ -181,8 +181,8 @@ struct LoopPredictor {
       val<1> confident = conf_nz & iter_significant;
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(tag_match)) {
-        if (static_cast<u64>(conf_nz)) loop_stats.conf_nonzero++;
-        if (static_cast<u64>(e_nb_iter)) loop_stats.nb_iter_nonzero++;
+        if (static_cast<u64>(conf_nz)) stats.conf_nonzero++;
+        if (static_cast<u64>(e_nb_iter)) stats.nb_iter_nonzero++;
       }
 #endif
       val<ITER_BITS> next_iter =
@@ -203,9 +203,9 @@ struct LoopPredictor {
         hit = tag_match;
         hit_way = val<std::max(u64(1), clog2(ASSOC))>{0};
 #ifdef TAGE_MONITOR
-        loop_stats.lookups++;
-        if (static_cast<u64>(tag_match)) loop_stats.hits++;
-        if (static_cast<u64>(candidate)) loop_stats.overrides++;
+        stats.lookups++;
+        if (static_cast<u64>(tag_match)) stats.hits++;
+        if (static_cast<u64>(candidate)) stats.overrides++;
 #endif
         return {candidate, pred};
       } else {
@@ -233,9 +233,9 @@ struct LoopPredictor {
           hit_way = encode(first_hit);
         }
 #ifdef TAGE_MONITOR
-        loop_stats.lookups++;
-        if (static_cast<u64>(hit_mask) != 0) loop_stats.hits++;
-        if (static_cast<u64>(candidate_mask) != 0) loop_stats.overrides++;
+        stats.lookups++;
+        if (static_cast<u64>(hit_mask) != 0) stats.hits++;
+        if (static_cast<u64>(candidate_mask) != 0) stats.overrides++;
 #endif
         return {(candidate_mask != hard<0>{}),
                 (first_candidate & way_pred.fo1().concat()) != hard<0>{}};
@@ -342,7 +342,7 @@ struct LoopPredictor {
         if (static_cast<u64>(do_write)) {
           ecache.update(lookup_set_sw, w, static_cast<u64>(write_entry));
 #ifdef TAGE_MONITOR
-          loop_stats.cache_writes++;
+          stats.cache_writes++;
 #endif
         }
       }
@@ -350,9 +350,9 @@ struct LoopPredictor {
 
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_alloc) && static_cast<u64>(is_br))
-        loop_stats.alloc_writes++;
+        stats.alloc_writes++;
       if (static_cast<u64>(is_hit_way) && static_cast<u64>(is_br))
-        loop_stats.update_writes++;
+        stats.update_writes++;
 #endif
     });
   }

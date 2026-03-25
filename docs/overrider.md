@@ -2,162 +2,180 @@
 
 ## Overview
 
-The TAGE predictor supports an optional overrider component that can override P2 predictions. The overrider runs its own table lookup **in parallel** with TAGE's RAM reads, then makes a final override decision after TAGE signals are available. When no overrider is used (`NoOverrider`), all override code compiles away — zero cost, bit-exact with non-overrider code.
+The TAGE predictor supports an optional overrider component that can override P2 predictions. When no overrider is used (`NoOverrider`), all override code compiles away — zero cost.
+
+Two overriders are implemented:
+- **SCOverrider** — Statistical Corrector (perceptron-based, bias tables). Current default.
+- **LoopPredictorA** — Loop predictor (detects fixed-iteration loops).
 
 ## Quick Start
 
 ```cpp
-// Default: no override
-using MyPredictor = Tage<>;
+// SC overrider (default):
+using MyPredictor = Tage<>;  // uses SCOverrider<8, 6, FETCH_WIDTH, 4>
 
-// With loop predictor (last template parameter):
-using MyPredictor = Tage<DefaultTableConfig, DefaultAllocConfig,
-    16, 4096, 1, 1, false, true, true, true, false, 0, 0,
-    DefaultResetFn, false, true, 16384, 6, true, 4, 2, 0, false, 27, 6,
-    LoopPredictor<64>>;
+// Loop predictor:
+using MyPredictor = Tage<SweepTableConfig<>, DefaultAllocConfig,
+    16, 4096, 1, 1, false, true, true, true, false, 8, 2, DecayMild,
+    DefaultResetFn, false, true, 4096, 6, true, 4, 2, 0, false, 27, 6,
+    LoopPredictorA<64, 10, 10, 3, 16, 2>>;
+
+// No overrider:
+// Change last template param to NoOverrider
 ```
 
-## Architecture
+## Architecture — 4-Phase Interface
 
 ```
-predict2 timeline:
+predict1:     overrider.prefetch(block_pc, raw_pc)
+                → Read tables at line-level index
+                → Extract weights/tags into regs
 
-  t=0  ─── PARALLEL ───────────────────────────
-  │                                            │
-  │  TAGE: compute indexes                     │  Overrider: lookup(pc, bindex)
-  │  TAGE: read tag/pred/hyst/u RAMs           │    - read own tables
-  │  TAGE: tag compare → match1, match2        │    - unpack, tag match
-  │  TAGE: meta-prediction → tage_p2           │    - compute prediction
-  │  TAGE: compute tage_confidence             │    - store results in regs
-  │                                            │
-  t≈560ps ─────────────────────────────────────
-  │
-  │  override_predict(tage_confidence, tage_p2, pc)
-  │    - ONE select mux: gate on tage_confidence (~20ps)
-  │
-  │  TageImpl mux: p2 = select(ovr_valid, ovr_pred, tage_p2)
-  │
-  t≈580ps ── return prediction
+predict2:     overrider.lookup(inst_pc)
+reuse_p2:       → Pure COMBINATIONAL (no RAM access)
+                → Tag match / sum computation on pre-extracted regs
+                → Returns {candidate, pred}
+                → TageImpl: p2 = select(candidate, pred, tage_pred)
+
+update_condbr: overrider.save_branch(branch_pc, idx)
+                → Save branch info for training (plain C++)
+
+update_cycle:  overrider.train(branch_taken, is_branch, mispredict,
+                               correct_pred, extra_cycle, num_branch)
+                → Update table weights
+                → ram<> writes gated by execute_if(extra_cycle, ...)
 ```
 
 ## Writing a New Overrider
 
-Create a struct with these members and methods:
-
 ```cpp
-#include "TageOverrider.hpp"
-
-template <u64 TABLE_SIZE = 64, /* your params */>
+template <u64 TABLE_SIZE = 64, /* your params */, u64 FETCH_WIDTH = 16>
 struct MyOverrider {
     static constexpr bool ENABLED = true;
 
-    // --- Storage (HARCOM types) ---
-    // Your RAMs, regs, etc.
+    // --- Storage ---
+    hcm::ram<val<BITS>, SIZE> my_table{"name"};  // use ram<>, NOT rwram<>
+    arr<reg<BITS>, N> cached_weights;              // pre-extracted in prefetch
 
-    // --- Phase 1: lookup() ---
-    // Called at START of predict2, parallel with TAGE reads.
-    // Do ALL heavy work here: RAM reads, unpack, compare, prediction.
-    // Store results in regs for override_predict() to read.
-    void lookup(val<64> &inst_pc, reg<BINDEX_BITS> &bindex);
+    // --- Stats (for TageMonitor compatibility) ---
+#ifdef TAGE_MONITOR
+    struct LoopStats {  // must be named LoopStats for TageImpl compatibility
+        u64 lookups = 0;
+        u64 hits = 0;
+        u64 overrides = 0;
+        u64 alloc_writes = 0;
+        u64 update_writes = 0;
+        u64 prefetch_conf_nonzero = 0;
+        u64 prefetch_num_nonzero = 0;
+        // Add your own fields here
+    } stats;
+#endif
 
-    // --- Phase 2: override_predict() ---
-    // Called AFTER TAGE computes confidence + prediction.
-    // Should be MINIMAL: one select/AND gate using tage_confidence
-    // to decide whether to override. Heavy computation belongs in lookup().
-    void override_predict(arr<val<2>, FETCH_WIDTH> &tage_confidence,
-                           val<FETCH_WIDTH> &tage_p2,
-                           val<64> &inst_pc);
+    struct LookupResult { val<1> candidate; val<1> pred; };
 
-    // --- Accessors (called by TageImpl to build the final mux) ---
-    val<1> get_override_valid(u64 offset);   // should override at this offset?
-    val<1> get_override_pred(u64 offset);    // overrider's prediction
-    val<1> get_skip_tage_alloc(u64 offset);  // skip TAGE allocation?
+    // Phase 1: prefetch — called from predict1
+    void prefetch(val<64> &block_pc, u64 raw_pc) {
+        // Read RAM tables → store results in regs
+        // Save indices for training (plain C++)
+    }
 
-    // --- Phase 3: train() ---
-    // Called in update_cycle with outcome information.
+    // Phase 2: lookup — called from predict2 AND reuse_predict2
+    LookupResult lookup(val<64> &inst_pc) {
+        // PURE COMBINATIONAL — no RAM reads, no reg writes
+        // Compute prediction from pre-extracted regs
+        return {confident, prediction};
+    }
+
+    // Phase 3: save_branch — called from update_condbr
+    void save_branch(val<64> &branch_pc, u64 idx) {
+        // Save branch tag/info for training
+    }
+
+    // Phase 4: train — called from update_cycle
     void train(arr<val<1>, FETCH_WIDTH> &branch_taken,
                arr<val<1>, FETCH_WIDTH> &is_branch,
                val<1> &mispredict,
                val<1> &correct_pred,
-               arr<reg<1>, FETCH_WIDTH> &override_active,
-               reg<FETCH_WIDTH> &p2_before_override);
+               val<1> &extra_cycle,
+               u64 num_branch) {
+        // Update table weights, gated by extra_cycle
+        execute_if(extra_cycle, [&]() {
+            my_table.write(index, new_value);  // ram write in different cycle from read
+        });
+    }
 };
 ```
 
 ## Critical Rules
 
-### 1. Pass HARCOM types by reference, never by value
+### 1. Use ram<>, NOT rwram<>, for overrider tables
+`ram<>` with `execute_if(extra_cycle, ...)` for writes is the proven pattern.
+Read in predict1 (cycle N), write in update_cycle (cycle N+1 after `need_extra_cycle`).
+`rwram<>` causes bank conflicts under high write pressure.
+
+### 2. lookup() must be PURE COMBINATIONAL
+No RAM reads, no reg writes. Only read from pre-extracted regs filled in prefetch.
+This is called from both predict2 AND reuse_predict2 — must work in any cycle.
+
+### 3. Pass HARCOM types by reference
 ```cpp
-void lookup(val<64> &pc, reg<8> &idx);     // ✓ reference
-void lookup(val<64> pc, reg<8> idx);        // ✗ val copies add latency, reg copies CRASH
+void prefetch(val<64> &pc, u64 raw_pc);  // ✓ val by reference
+void prefetch(val<64> pc, u64 raw_pc);   // ✗ val by value = 50% latency penalty
 ```
 
-### 2. The overrider must NOT write to TageImpl's regs
-The overrider returns `val<1>` from accessors. TageImpl owns the final `p2` mux:
+### 4. Single p2 write — no modify-after-write
 ```cpp
-// TageImpl does this — NOT the overrider:
-p2 = select(overrider.get_override_valid(offset),
-            overrider.get_override_pred(offset),
-            tage_p2_split[offset]);
+// ✗ WRONG: writes p2 twice
+p2 = tage_prediction;
+p2 = select(override, ovr_pred, p2);
+
+// ✓ CORRECT: single expression
+p2 = arr<val<1>, FW>{[&](u64 offset) {
+       val<1> tage = ...;
+       if (offset == 0) return select(ovr.candidate, ovr.pred, tage);
+       return tage;
+     }}.concat();
 ```
 
-### 3. Keep override_predict() minimal
-All heavy computation (RAM reads, tag compare, prediction logic) belongs in `lookup()` which runs in parallel with TAGE. `override_predict()` should only gate on `tage_confidence` — typically one AND/select:
+### 5. val<> cannot be reassigned
+Use IIFE, arr::fold, or select chains instead:
 ```cpp
-void override_predict(...) {
-    val<1> tage_weak = (tage_confidence[0] < hard<3>{});
-    ovr_valid[0] = val<1>{precomputed_candidate} & tage_weak;  // ~20ps
-}
+arr<val<BITS, i64>, N> weights = [&](u64 i) { return ...; };
+auto sum = weights.fo1().fold_add();  // ✓ clean accumulation
 ```
 
-### 4. Avoid reg write→read in the same function
-Writing to a reg then reading it back in the same cycle adds latency:
-```cpp
-reg<8> temp;
-temp = some_val;            // write
-val<8> x = val<8>{temp};    // read back — adds reg write delay!
-```
-Use local vals for intermediate computation, regs only for final results.
+### 6. Fanout budget for extra_cycle
+The overrider's `execute_if(extra_cycle, ...)` calls consume extra_cycle fanout.
+TageImpl declares: `extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR * 5>{})`.
+If your overrider needs more, increase the `OVR * 5` multiplier.
 
-### 5. Use rwram for tables that need same-cycle read+write
-`ram<T,N>` enforces one access per cycle. If `lookup()` reads and `train()` writes in the same HARCOM cycle:
-```cpp
-rwram<ENTRY_BITS, NUM_SETS, 2> my_table{"mytable"};  // 2-bank rwram
-// write signature: my_table.write(addr, data, noconflict_signal);
-```
+### 7. CHEATING_MODE + ram<> writes require -DREAD_WRITE_RAM
+In CHEATING_MODE (monitor build), `execute_if` evaluates differently, causing
+`ram<>` read+write conflicts. Add `-DREAD_WRITE_RAM` to monitor build flags.
+Normal builds work fine without it.
 
-### 6. Use static_loop for compile-time iteration
-When indexing RAMs or using `hard<w>{}` with a way/bank index:
-```cpp
-static_loop<ASSOC>([&]<u64 w>() {
-    loop_ram[w].read(...);           // ✓ w is compile-time
-    execute_if(hit_way == hard<w>{}, ...);  // ✓
-});
-```
+### 8. No destructors on overrider structs
+HARCOM types (reg, ram, arr) cannot be destroyed. Don't add `~MyOverrider()`.
+Print stats by having TageImpl copy `overrider.stats` fields to TageMonitor.
 
-### 7. val<> cannot be reassigned
-```cpp
-val<1> x = val<1>{0};
-x = select(cond, val<1>{1}, x);  // ✗ move assignment is private
+## Existing Overriders
 
-// Use arrays + fold instead:
-arr<val<1>, N> results = [&](u64 i) { return ...; };
-val<1> x = results.fo1().fold_or();  // ✓
-```
+### SCOverrider (predictors/custom/SCOverrider.hpp)
+- 3 bias tables, 256 entries × 6-bit signed counters, PC-indexed
+- Prediction = sign(sum of weights). Confidence = |sum| > SC_CONF_THRESH.
+- Template: `SCOverrider<BIAS_LOG=8, SC_CTR_BITS=6, FETCH_WIDTH=16, SC_CONF_THRESH=4>`
+- On gcc: 4.31% mispred (vs 5.08% without SC). 11:1 correct/wrong ratio.
 
-## TAGE Confidence Encoding
-
-The `tage_confidence` array (per offset, 2 bits) encodes:
-
-| Value | Meaning |
-|-------|---------|
-| 0 | Newly allocated entry (weak, cold) |
-| 1 | Primary ≠ alt prediction (disagreement) |
-| 2 | Primary == alt, normal agreement |
-| 3 | Primary == alt, bimodal provider (highest confidence) |
+### LoopPredictorA (predictors/custom/LoopPredictorA.hpp)
+- Line-level RAM index + branch-level tag matching
+- 2-way set-associative, 64 entries, rwram storage
+- On NAMD: 97% override accuracy, 3.6% misprediction reduction
+- Template: `LoopPredictorA<TABLE_SIZE=64, TAG_BITS=10, ITER_BITS=10, CONF_BITS=3, FETCH_WIDTH=16, LWAYS=2>`
 
 ## Files
 
-- `predictors/custom/TageOverrider.hpp` — `NoOverrider` + concept docs
-- `predictors/custom/LoopPredictor.hpp` — Example: loop predictor implementation
-- `predictors/custom/Tage.hpp` — Scaffolding call sites (search for `Overrider::ENABLED`)
+- `predictors/custom/TageOverrider.hpp` — NoOverrider + concept docs
+- `predictors/custom/SCOverrider.hpp` — Statistical Corrector
+- `predictors/custom/LoopPredictorA.hpp` — Loop predictor
+- `predictors/custom/Tage.hpp` — Call sites (search for `Overrider::ENABLED`)
+- `docs/research_todos.md` — SC improvement roadmap (GEHL, dynamic threshold, etc.)

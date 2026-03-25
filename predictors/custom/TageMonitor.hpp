@@ -58,6 +58,12 @@ struct TageMonitor {
     std::array<std::array<u64, FETCH_WIDTH_V>, NUM_TABLES + 1> alt_slot{};
     // Block advance: which branch position (0..FW-1) ended the block
     std::array<u64, FETCH_WIDTH_V> block_advance_slot{};
+    // SC overrider
+    u64 sc_lookups = 0;
+    u64 sc_overrides = 0;       // confident SC overrides fired
+    u64 sc_correct = 0;         // SC override correct, TAGE was wrong
+    u64 sc_wrong = 0;           // SC override wrong, TAGE was right
+    u64 sc_updates = 0;         // SC weight updates
     // Aliasing
     u64 p1_alias_evictions = 0;   // P1 entry overwritten by different PC
     std::array<u64, NUM_TABLES> tage_alias_evictions{};  // per TAGE table
@@ -532,6 +538,16 @@ struct TageMonitor {
        << "  Correct: " << c.loop_override_correct
        << " (" << pct(c.loop_override_correct, c.loop_overrides) << "%)\n";
     os << "  Alias evictions: " << c.loop_alias_evictions << "\n";
+
+    // SC overrider
+    if (c.sc_lookups > 0) {
+      os << "\nSC Overrider:\n";
+      os << "  Lookups: " << c.sc_lookups
+         << "  Overrides: " << c.sc_overrides
+         << "  Updates: " << c.sc_updates << "\n";
+      os << "  SC correct (TAGE wrong): " << c.sc_correct
+         << "  SC wrong (TAGE right): " << c.sc_wrong << "\n";
+    }
 
     os << "=== End TAGE Monitor ===\n\n";
   }

@@ -135,7 +135,7 @@ struct LoopPredictorA {
     u64 prefetch_num_nonzero = 0;
     u64 lookup_conf_hit = 0;  // lookup tag match AND conf>0
     u64 lookup_both_hit = 0;  // lookup tag match AND conf>0 AND num>0
-  } loop_stats;
+  } stats;
 #endif
 
   // ======== Lookup result ========
@@ -180,8 +180,8 @@ struct LoopPredictorA {
       val<1> iter_sig = (num >= hard<1>{});
       lp_confidents[w] = conf_nz & iter_sig;
 #ifdef TAGE_MONITOR
-      if (static_cast<u64>(conf_nz)) loop_stats.prefetch_conf_nonzero++;
-      if (static_cast<u64>(num)) loop_stats.prefetch_num_nonzero++;
+      if (static_cast<u64>(conf_nz)) stats.prefetch_conf_nonzero++;
+      if (static_cast<u64>(num)) stats.prefetch_num_nonzero++;
 #endif
     }
 
@@ -223,20 +223,20 @@ struct LoopPredictorA {
     val<1> candidate = hit & confident & use_ok;
 
 #ifdef TAGE_MONITOR
-    loop_stats.lookups++;
+    stats.lookups++;
     if (static_cast<u64>(hit)) {
-      loop_stats.hits++;
-      if (static_cast<u64>(confident)) loop_stats.lookup_conf_hit++;
+      stats.hits++;
+      if (static_cast<u64>(confident)) stats.lookup_conf_hit++;
       // Check individual way match for num>0
       for (u64 w = 0; w < LWAYS; w++) {
         if (static_cast<u64>(tmatch[w]) && static_cast<u64>(lp_confidents[w])) {
           u64 entry_raw = static_cast<u64>(lp_saved[w]);
           u64 num_v = (entry_raw >> B_NUM) & ((u64(1) << ITER_BITS) - 1);
-          if (num_v > 0) loop_stats.lookup_both_hit++;
+          if (num_v > 0) stats.lookup_both_hit++;
         }
       }
     }
-    if (static_cast<u64>(candidate)) loop_stats.overrides++;
+    if (static_cast<u64>(candidate)) stats.overrides++;
 #endif
 
     return {candidate, loop_pred};
@@ -377,7 +377,7 @@ struct LoopPredictorA {
         ecache.update(lp_idx_sw, w, static_cast<u64>(updated));
 #endif
 #ifdef TAGE_MONITOR
-        loop_stats.update_writes++;
+        stats.update_writes++;
 #endif
       } else {
         // Allocation path: only if no match found and misprediction
@@ -405,7 +405,7 @@ struct LoopPredictorA {
           if (static_cast<u64>(do_alloc) && static_cast<u64>(lp_did_lookup)) {
             ecache.update(lp_idx_sw, w, static_cast<u64>(alloc_entry));
 #ifdef TAGE_MONITOR
-            loop_stats.alloc_writes++;
+            stats.alloc_writes++;
 #endif
           }
 #endif

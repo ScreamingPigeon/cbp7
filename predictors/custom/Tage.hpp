@@ -6,7 +6,7 @@
 #ifdef TAGE_MONITOR
 #include "TageMonitor.hpp"
 #endif
-#include "LoopPredictorA.hpp"
+#include "SCOverrider.hpp"
 #include "TageOverrider.hpp"
 #include "TageTable.hpp"
 
@@ -526,24 +526,18 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   }
   ~TageImpl() {
     if constexpr (Overrider::ENABLED) {
-      mon.cum.loop_lookups = overrider.loop_stats.lookups;
-      mon.cum.loop_hits = overrider.loop_stats.hits;
-      mon.cum.loop_overrides = overrider.loop_stats.overrides;
+      // Copy overrider stats to monitor (generic fields)
+      mon.cum.loop_lookups = overrider.stats.lookups;
+      mon.cum.loop_hits = overrider.stats.hits;
+      mon.cum.loop_overrides = overrider.stats.overrides;
+      // SC-specific fields (zero if overrider is not SC)
+      mon.cum.sc_lookups = overrider.stats.lookups;
+      mon.cum.sc_overrides = overrider.stats.overrides;
+      mon.cum.sc_updates = overrider.stats.update_writes;
+      mon.cum.sc_correct = overrider.stats.sc_correct;
+      mon.cum.sc_wrong = overrider.stats.sc_wrong;
     }
     mon.print_summary(std::cerr);
-    if constexpr (Overrider::ENABLED) {
-      std::cerr << "Loop Predictor (detail):\n"
-                << "  Alloc writes: " << overrider.loop_stats.alloc_writes
-                << "  Update writes: " << overrider.loop_stats.update_writes
-                << "\n  Prefetch conf>0: "
-                << overrider.loop_stats.prefetch_conf_nonzero
-                << "  Prefetch num>0: "
-                << overrider.loop_stats.prefetch_num_nonzero
-                << "\n  Lookup conf_hit: "
-                << overrider.loop_stats.lookup_conf_hit
-                << "  Lookup both_hit: " << overrider.loop_stats.lookup_both_hit
-                << "\n";
-    }
   }
 #endif
 
@@ -1075,7 +1069,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
     val<1> extra_cycle =
         some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR>{});
+    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR * 5>{});
     need_extra_cycle(extra_cycle);
 
     // update meta counter
@@ -2345,7 +2339,7 @@ template <typename TableCfg = SweepTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
           bool TAGE_USE_PATH_HIST = false, u64 TAGE_PATH_HIST_WIDTH = 27,
           u64 TAGE_PATH_BITS = 6,
           typename TAGE_OVERRIDER =
-              LoopPredictorA<64, 10, 10, 3, TAGE_FETCH_WIDTH, 2>>
+              SCOverrider<8, 6, TAGE_FETCH_WIDTH, 4>>
 
 // NOTE: Modify params here
 
