@@ -1073,17 +1073,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // need extra cycle for modifying prediction bits and for TAGE allocation
     val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
-    val<1> extra_cycle = [&]() -> val<1> {
-      val<1> base =
-          some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-      if constexpr (Overrider::ENABLED) {
-        // Force extra cycle to separate loop rwram read (predict1) from write
-        // (update_cycle)
-        return base | val<1>{1};
-      } else {
-        return base;
-      }
-    }();
+    val<1> extra_cycle =
+        some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
     extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR>{});
     need_extra_cycle(extra_cycle);
 
@@ -2352,8 +2343,9 @@ template <typename TableCfg = SweepTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
           u64 TAGE_METAPIPE = 2, u64 TAGE_META_TABLE_SIZE = 0,
           // Path history
           bool TAGE_USE_PATH_HIST = false, u64 TAGE_PATH_HIST_WIDTH = 27,
-          u64 TAGE_PATH_BITS = 6, typename TAGE_OVERRIDER = NoOverrider>
-// LoopPredictorA<64, 10, 10, 3, TAGE_FETCH_WIDTH, 2>>
+          u64 TAGE_PATH_BITS = 6,
+          typename TAGE_OVERRIDER =
+              LoopPredictorA<64, 10, 10, 3, TAGE_FETCH_WIDTH, 2>>
 
 // NOTE: Modify params here
 

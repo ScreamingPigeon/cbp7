@@ -73,7 +73,7 @@ struct LoopPredictorA {
   }
 
   // ======== Storage ========
-  hcm::ram<val<ENTRY_BITS>, NUM_SETS> lram[LWAYS]{"loopA"};
+  rwram<ENTRY_BITS, NUM_SETS, RWRAM_BANKS> lram[LWAYS]{"loopA"};
 
   // Pre-extracted regs (filled in prefetch, consumed in lookup)
   arr<reg<TAG_BITS>, LWAYS>      lp_tags;
@@ -263,7 +263,7 @@ struct LoopPredictorA {
              [[maybe_unused]] arr<val<1>, FETCH_WIDTH> &is_branch,
              val<1> &mispredict,
              [[maybe_unused]] val<1> &correct_pred,
-             [[maybe_unused]] val<1> &extra_cycle,
+             val<1> &extra_cycle,
              u64 num_branch) {
     if (num_branch == 0) return;
 
@@ -370,7 +370,7 @@ struct LoopPredictorA {
                      new_num, cur_after_flip, new_conf, o_age));
 
         execute_if(lp_did_lookup, [&]() {
-          lram[w].write(val<SET_BITS>{lp_idx}, updated);
+          lram[w].write(val<SET_BITS>{lp_idx}, updated, extra_cycle);
         });
 
 #ifdef CHEATING_MODE
@@ -398,7 +398,7 @@ struct LoopPredictorA {
               alloc_tag, alloc_dir, zero_iter, zero_iter, zero_conf, init_age);
 
           execute_if(do_alloc & lp_did_lookup, [&]() {
-            lram[w].write(val<SET_BITS>{lp_idx}, alloc_entry);
+            lram[w].write(val<SET_BITS>{lp_idx}, alloc_entry, extra_cycle);
           });
 
 #ifdef CHEATING_MODE
