@@ -6,7 +6,7 @@
 #ifdef TAGE_MONITOR
 #include "TageMonitor.hpp"
 #endif
-#include "LoopPredictor.hpp"
+#include "LoopPredictorA.hpp"
 #include "TageOverrider.hpp"
 #include "TageTable.hpp"
 
@@ -168,8 +168,8 @@ struct DecayConservative {
 // Mode 1: Decrement on misprediction, increment on correct
 struct DecayMild {
   template <u64 W>
-  static val<W> apply(val<W> &t, val<1> &correct, [[maybe_unused]] val<1> &uctrsat,
-                      val<1> &misp) {
+  static val<W> apply(val<W> &t, val<1> &correct,
+                      [[maybe_unused]] val<1> &uctrsat, val<1> &misp) {
     return select(misp, update_ctr(t, hard<0>{}),
                   select(correct, update_ctr(t, hard<1>{}), val<W>{t}));
   }
@@ -187,7 +187,8 @@ struct DecayAggressive {
 // Mode 3: Decrement on misprediction OR uctrsat, increment on correct
 struct DecayHybrid {
   template <u64 W>
-  static val<W> apply(val<W> &t, val<1> &correct, val<1> &uctrsat, val<1> &misp) {
+  static val<W> apply(val<W> &t, val<1> &correct, val<1> &uctrsat,
+                      val<1> &misp) {
     return select(misp | uctrsat, update_ctr(t, hard<0>{}),
                   select(correct, update_ctr(t, hard<1>{}), val<W>{t}));
   }
@@ -534,15 +535,22 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       std::cerr << "Loop Predictor (detail):\n"
                 << "  Alloc writes: " << overrider.loop_stats.alloc_writes
                 << "  Update writes: " << overrider.loop_stats.update_writes
+                << "\n  Prefetch conf>0: "
+                << overrider.loop_stats.prefetch_conf_nonzero
+                << "  Prefetch num>0: "
+                << overrider.loop_stats.prefetch_num_nonzero
+                << "\n  Lookup conf_hit: "
+                << overrider.loop_stats.lookup_conf_hit
+                << "  Lookup both_hit: " << overrider.loop_stats.lookup_both_hit
                 << "\n";
     }
   }
 #endif
 
   // ======== Overrider (conditional) ========
+  u64 last_raw_pc = 0; // SW shadow of last inst_pc for cache keying
   std::conditional_t<Overrider::ENABLED, Overrider, EmptyMember> overrider;
-  std::conditional_t<Overrider::ENABLED, reg<1>, EmptyMember> ovr_candidate_reg;
-  std::conditional_t<Overrider::ENABLED, reg<1>, EmptyMember> ovr_pred_reg;
+  // (overrider lookup now in P2, no cross-cycle regs needed)
   std::conditional_t<Overrider::ENABLED, arr<reg<1>, FETCH_WIDTH>, EmptyMember>
       override_active;
   std::conditional_t<Overrider::ENABLED, reg<FETCH_WIDTH>, EmptyMember>
@@ -558,7 +566,7 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   }
 
   val<1> predict1(val<64> inst_pc) override {
-    inst_pc.fanout(hard<2 + OVR>{});
+    inst_pc.fanout(hard<2>{});
     new_block(inst_pc);
     val<std::max(P1_INDEX_BITS, P1_HIST_V)> lineaddr =
         inst_pc >> (LOG_FETCH_WIDTH + 2);
@@ -582,11 +590,12 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     readp1.fanout(hard<2>{});
     p1 = readp1.concat();
     p1.fanout(hard<FETCH_WIDTH>{});
-    // Overrider lookup — runs in P1, results stored in regs for P2
+    // Overrider prefetch — read loop table at line-level index
     if constexpr (Overrider::ENABLED) {
-      auto ovr = overrider.lookup(inst_pc, index1);
-      ovr_candidate_reg = ovr.candidate;
-      ovr_pred_reg = ovr.pred;
+#ifdef CHEATING_MODE
+      last_raw_pc = static_cast<u64>(inst_pc);
+#endif
+      overrider.prefetch(inst_pc, last_raw_pc);
     }
     return (block_entry & p1) != hard<0>{};
   }
@@ -603,6 +612,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 #ifdef TAGE_MONITOR
     ensure_monitor_init();
 #endif
+    if constexpr (OVR > 0)
+      inst_pc.fanout(hard<1 + OVR>{});
     val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
     lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
     gfolds.fanout(hard<2>{});
@@ -610,19 +621,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // compute indexes
     bindex = lineaddr;
     bindex.fanout(hard<FETCH_WIDTH>{});
-
-    // Overrider results — looked up in P1, stored in regs, read here cheaply
-    struct OvrCached {
-      val<1> candidate;
-      val<1> pred;
-    };
-    auto ovr_lookup = [&]() {
-      if constexpr (Overrider::ENABLED) {
-        return OvrCached{val<1>{ovr_candidate_reg}, val<1>{ovr_pred_reg}};
-      } else {
-        return EmptyMember{};
-      }
-    }();
 
     // compute indexes
     for (u64 i = 0; i < NUM_TABLES; i++) {
@@ -635,7 +633,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
     gindex.fanout(hard<4>{});
 
-    // read tables — start RAM reads BEFORE tag hash (tag not needed until compare)
+    // read tables — start RAM reads BEFORE tag hash (tag not needed until
+    // compare)
     for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
       readb[offset] = bim[offset].read(bindex);
     }
@@ -759,64 +758,37 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
               return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
             }}.concat();
       } else {
-        val<FETCH_WIDTH> tage_p2 =
-            arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-              return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
-            }}.concat();
-        // TAGE confidence gate: combine lookup result (parallel) with
-        // confidence (serial) Only the AND + select is on the critical path
-        // after TAGE — ~20ps
-        arr<val<2>, FETCH_WIDTH> tage_confidence = [&](u64 offset) -> val<2> {
-          val<1> primary_eq_alt = pred1[offset] == pred2[offset];
-          val<1> is_newly_alloc = [&]() -> val<1> {
-            if constexpr (USE_META_V) {
-              return newly_alloc[offset];
-            } else {
-              return val<1>{0};
-            }
-          }();
-          val<1> is_bimodal = match1[offset] == hard<1>{};
-          return select(is_newly_alloc, val<2>{0},
-                        select(primary_eq_alt,
-                               select(is_bimodal, val<2>{3}, val<2>{2}),
-                               val<2>{1}));
-        };
-        val<1> tage_weak = (tage_confidence[0] < hard<3>{});
-        // Gate: override only when loop has candidate AND TAGE is weak
-        ovr_lookup.candidate.fanout(hard<2>{});
-        val<1> do_override = ovr_lookup.candidate & tage_weak;
-        p2_before_override = tage_p2;
-        auto tage_p2_split = tage_p2.make_array(val<1>{});
-        do_override.fanout(hard<2>{});
+        auto ovr = overrider.lookup(inst_pc);
+        // Build p2 with override baked in at offset 0 — single write
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-               return select(offset == 0 ? do_override : val<1>{0},
-                             ovr_lookup.pred, tage_p2_split[offset]);
+               val<1> tage_pred =
+                   select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
+               if (offset == 0)
+                 return select(ovr.candidate, ovr.pred, tage_pred);
+               return tage_pred;
              }}.concat();
-        for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-          override_active[offset] = offset == 0 ? do_override : val<1>{0};
-        }
+        override_active[0] = ovr.candidate;
+        for (u64 offset = 1; offset < FETCH_WIDTH; offset++)
+          override_active[offset] = val<1>{0};
+#ifdef TAGE_MONITOR
+        mon.record_loop_override(0, static_cast<u64>(ovr.candidate) != 0);
+#endif
       }
     } else {
       if constexpr (!Overrider::ENABLED) {
         p2 = pred1.concat();
       } else {
-        val<FETCH_WIDTH> tage_p2 = pred1.concat();
-        // No meta: TAGE confidence is always "agree, normal" = 2
-        val<1> tage_weak = val<1>{1}; // confidence 2 < 3, always weak
-        ovr_lookup.candidate.fanout(hard<2>{});
-        val<1> do_override = ovr_lookup.candidate & tage_weak;
-        p2_before_override = tage_p2;
-        auto tage_p2_split = tage_p2.make_array(val<1>{});
-        do_override.fanout(hard<2>{});
+        auto ovr = overrider.lookup(inst_pc);
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-               return select(offset == 0 ? do_override : val<1>{0},
-                             ovr_lookup.pred, tage_p2_split[offset]);
+               if (offset == 0)
+                 return select(ovr.candidate, ovr.pred, pred1[offset]);
+               return pred1[offset];
              }}.concat();
-        for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-          override_active[offset] = offset == 0 ? do_override : val<1>{0};
-        }
+        override_active[0] = ovr.candidate;
+        for (u64 offset = 1; offset < FETCH_WIDTH; offset++)
+          override_active[offset] = val<1>{0};
 #ifdef TAGE_MONITOR
-        mon.record_loop_override(0, static_cast<u64>(do_override) != 0);
+        mon.record_loop_override(0, static_cast<u64>(ovr.candidate) != 0);
 #endif
       }
     }
@@ -846,7 +818,16 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   }
 
   val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) override {
-    val<1> taken = ((block_entry << block_size) & p2) != hard<0>{};
+    val<1> tage_taken = ((block_entry << block_size) & p2) != hard<0>{};
+    val<1> taken = [&]() -> val<1> {
+      if constexpr (Overrider::ENABLED) {
+        inst_pc.fanout(hard<2>{});
+        auto ovr = overrider.lookup(inst_pc);
+        return select(ovr.candidate, ovr.pred, tage_taken);
+      } else {
+        return tage_taken;
+      }
+    }();
     taken.fanout(hard<2>{});
     reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1 - block_size)});
     block_size++;
@@ -858,6 +839,9 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     assert(num_branch < FETCH_WIDTH);
     branch_offset[num_branch] = branch_pc.fo1() >> 2;
     branch_dir[num_branch] = taken.fo1();
+    if constexpr (Overrider::ENABLED) {
+      overrider.save_branch(branch_pc, num_branch);
+    }
     num_branch++;
   }
 
@@ -1089,8 +1073,17 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
 
     // need extra cycle for modifying prediction bits and for TAGE allocation
     val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
-    val<1> extra_cycle =
-        some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
+    val<1> extra_cycle = [&]() -> val<1> {
+      val<1> base =
+          some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
+      if constexpr (Overrider::ENABLED) {
+        // Force extra cycle to separate loop rwram read (predict1) from write
+        // (update_cycle)
+        return base | val<1>{1};
+      } else {
+        return base;
+      }
+    }();
     extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR>{});
     need_extra_cycle(extra_cycle);
 
@@ -1234,18 +1227,18 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       });
     });
     // update global prediction hysteresis if primary provider or allocated
-    // entry. Skip silent writes (counter already saturated in update direction).
+    // entry. Skip silent writes (counter already saturated in update
+    // direction).
     if constexpr (MAX_HYST_WIDTH > 0) {
       static constexpr u64 HW = std::max(u64(1), MAX_HYST_WIDTH);
       static constexpr u64 HMAX = (u64(1) << HW) - 1;
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> would_change = allocate[I] |
-            (badpred1[I] & (readh[I] != hard<0>{})) |
-            (~badpred1[I] & (readh[I] != hard<HMAX>{}));
+                              (badpred1[I] & (readh[I] != hard<0>{})) |
+                              (~badpred1[I] & (readh[I] != hard<HMAX>{}));
         execute_if((primary[I] | allocate[I]) & would_change, [&]() {
-          auto newhyst =
-              select(allocate[I], val<HW>{0},
-                     update_ctr(readh[I], ~badpred1[I]));
+          auto newhyst = select(allocate[I], val<HW>{0},
+                                update_ctr(readh[I], ~badpred1[I]));
           std::get<I>(tables).hyst_ram[0].write(tidx<I>(gindex[I]),
                                                 newhyst.fo1(), extra_cycle);
         });
@@ -1303,10 +1296,10 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     // Note: U_STOR_FF with DECAY_CTR=0 has no epoch reset — u-bits only
     // clear through uclear (allocation pressure). Consider using DECAY_CTR>0.
 
-    // Overrider training (all args by reference — no HARCOM copies)
+    // Overrider training
     if constexpr (Overrider::ENABLED) {
       overrider.train(branch_taken, is_branch, mispredict, correct_pred,
-                      override_active, p2_before_override, extra_cycle);
+                      extra_cycle, num_branch);
     }
 
     // update global history
@@ -1835,7 +1828,16 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
   }
 
   val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) override {
-    val<1> taken = ((block_entry << block_size) & p2) != hard<0>{};
+    val<1> tage_taken = ((block_entry << block_size) & p2) != hard<0>{};
+    val<1> taken = [&]() -> val<1> {
+      if constexpr (Overrider::ENABLED) {
+        inst_pc.fanout(hard<2>{});
+        auto ovr = overrider.lookup(inst_pc);
+        return select(ovr.candidate, ovr.pred, tage_taken);
+      } else {
+        return tage_taken;
+      }
+    }();
     taken.fanout(hard<2>{});
     reuse_prediction(~val<1>{block_entry >> (FETCH_WIDTH - 1 - block_size)});
     block_size++;
@@ -2350,9 +2352,8 @@ template <typename TableCfg = SweepTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
           u64 TAGE_METAPIPE = 2, u64 TAGE_META_TABLE_SIZE = 0,
           // Path history
           bool TAGE_USE_PATH_HIST = false, u64 TAGE_PATH_HIST_WIDTH = 27,
-          u64 TAGE_PATH_BITS = 6,
-          typename TAGE_OVERRIDER =
-              LoopPredictor<32, 4, 10, 10, 3, TAGE_FETCH_WIDTH>>
+          u64 TAGE_PATH_BITS = 6, typename TAGE_OVERRIDER = NoOverrider>
+// LoopPredictorA<64, 10, 10, 3, TAGE_FETCH_WIDTH, 2>>
 
 // NOTE: Modify params here
 

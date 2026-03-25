@@ -19,7 +19,8 @@ template <u64 TABLE_SIZE = 64,      // total entries
           u64 TAG_BITS = 10,        // PC tag width
           u64 ITER_BITS = 10,       // iteration counter width
           u64 CONF_BITS = 3,        // confidence counter width (0..7)
-          u64 FETCH_WIDTH = 16>     // from parent TAGE
+          u64 FETCH_WIDTH = 16,     // from parent TAGE
+          u64 CACHE_ENTRIES = 2>    // entry cache size (0=disabled, N=N-entry cache)
 struct LoopPredictor {
 
   static constexpr bool ENABLED = true;
@@ -36,6 +37,14 @@ struct LoopPredictor {
       TAG_BITS + ITER_BITS + ITER_BITS + CONF_BITS + 1 + AGE_BITS;
 
   static constexpr u64 RWRAM_BANKS = 4;  // banking for same-cycle read+write
+#ifdef CHEATING_MODE
+  static constexpr bool USE_CACHE = (CACHE_ENTRIES > 0);
+#else
+  static constexpr bool USE_CACHE = false;
+#endif
+  // Cache key: set_idx + way (to distinguish entries in the same set)
+  static constexpr u64 WAY_BITS = (ASSOC > 1) ? clog2(ASSOC) : 1;
+  static constexpr u64 CACHE_KEY_BITS = SET_BITS + WAY_BITS;
 
 #ifdef TAGE_MONITOR
   // SW counters for monitoring (zero HARCOM cost)
@@ -45,6 +54,11 @@ struct LoopPredictor {
     u64 overrides = 0;      // confident override fired
     u64 alloc_writes = 0;   // new entry allocations
     u64 update_writes = 0;  // existing entry updates
+    u64 cache_hits = 0;     // entry cache hits
+    u64 cache_misses = 0;   // entry cache misses (fall through to RAM)
+    u64 cache_writes = 0;   // entry cache updates
+    u64 conf_nonzero = 0;  // lookups where conf > 0
+    u64 nb_iter_nonzero = 0; // lookups where nb_iter > 0
   } loop_stats;
 #endif
 
@@ -55,6 +69,47 @@ struct LoopPredictor {
   // ======== HARCOM Storage ========
 
   rwram<ENTRY_BITS, NUM_SETS, RWRAM_BANKS> loop_ram[ASSOC]{"loop"};
+
+  // ======== Entry Cache ========
+  // Small reg-based cache in front of rwram. Hot loop entries stay in cache,
+  // avoiding repeated rwram reads to the same bank. Writes go to both cache
+  // and rwram (rwram write may be delayed by banking, but cache is instant).
+
+  // Entry cache: pure SW shadow (plain C++ types, zero HARCOM cost).
+  // Tracks raw entry bits alongside the rwram. On cache hit, we construct
+  // a val<ENTRY_BITS> from the cached raw bits instead of using the RAM result.
+  // This avoids the rwram bank conflict problem for hot loop entries.
+  struct EntryCache {
+    u64 data[CACHE_ENTRIES] = {};       // raw entry bits
+    u64 keys[CACHE_ENTRIES] = {};       // set_idx ++ way
+    bool valids[CACHE_ENTRIES] = {};
+    u64 rp = 0;                         // FIFO replacement pointer
+
+    std::pair<bool, u64> lookup(u64 set_val, u64 way_val) const {
+      u64 target = (way_val << SET_BITS) | set_val;
+      for (u64 i = 0; i < CACHE_ENTRIES; i++) {
+        if (valids[i] && keys[i] == target) return {true, data[i]};
+      }
+      return {false, 0};
+    }
+
+    void update(u64 set_val, u64 way_val, u64 entry_bits) {
+      u64 target = (way_val << SET_BITS) | set_val;
+      for (u64 i = 0; i < CACHE_ENTRIES; i++) {
+        if (valids[i] && keys[i] == target) {
+          data[i] = entry_bits;
+          return;
+        }
+      }
+      // Miss — evict at rp (FIFO)
+      data[rp] = entry_bits;
+      keys[rp] = target;
+      valids[rp] = true;
+      rp = (rp + 1) % CACHE_ENTRIES;
+    }
+  };
+
+  std::conditional_t<USE_CACHE, EntryCache, EmptyMember> ecache;
 
   // Lookup results (set in lookup, consumed in override_predict and train)
   arr<reg<ENTRY_BITS>, ASSOC> read_entries;
@@ -71,13 +126,15 @@ struct LoopPredictor {
     val<1> pred;       // loop prediction (valid when candidate=1)
   };
 
-  // ======== lookup() — parallel with TAGE reads ========
-  // Called at START of predict2, concurrent with TAGE table reads.
-  // Does RAM read + unpack + tag match + confidence + prediction.
+  // ======== lookup() — called in predict1 ========
+  // Does RAM read (or cache hit) + unpack + tag match + confidence + prediction.
   // Returns LookupResult (vals) — TageImpl applies the TAGE gate later.
-  // regs, so the reg timing only reflects the final write, not a read-back.
 
-  LookupResult lookup(val<64> &inst_pc, [[maybe_unused]] auto &bindex) {
+  // SW shadow of last lookup set index (for cache keying, no HARCOM cost)
+  u64 lookup_set_sw = 0;
+
+  LookupResult lookup(val<64> &inst_pc, [[maybe_unused]] auto &bindex,
+                      u64 raw_pc = 0) {
     // Hash PC
     val<SET_BITS> set_idx = val<SET_BITS>{inst_pc >> 2};
     lookup_set = set_idx;
@@ -88,25 +145,46 @@ struct LoopPredictor {
       set_idx.fanout(hard<ASSOC>{});
     }
 
-    // Per-way: single split, compute tag/conf/pred in one pass
-    // Confidence uses Ros-style: significant_bits(nb_iter * conf_counter).
-    // A loop with 30 iterations and conf=1 gets confidence=5 (30=11110b).
-    // This makes longer loops reach override threshold faster.
+    // SW cache key derived from raw PC (no HARCOM cost)
+    lookup_set_sw = (raw_pc >> 2) & ((u64(1) << SET_BITS) - 1);
+
+    // Per-way: read entry (from cache or RAM), compute tag/conf/pred
+    // Confidence uses Ros-style: conf > 0 AND nb_iter >= (1 << CONF_THRESHOLD).
     arr<val<3>, ASSOC> way_results = [&](u64 w) -> val<3> {
-      val<ENTRY_BITS> entry = loop_ram[w].read(set_idx);
+      // Always do RAM read (HARCOM timing model)
+      val<ENTRY_BITS> ram_entry = loop_ram[w].read(set_idx);
+
+      // Check SW cache — on hit, override with cached raw bits
+      val<ENTRY_BITS> entry = [&]() -> val<ENTRY_BITS> {
+        if constexpr (USE_CACHE) {
+          auto [ch, raw] = ecache.lookup(lookup_set_sw, w);
+          if (ch) {
+#ifdef TAGE_MONITOR
+            loop_stats.cache_hits++;
+#endif
+            return val<ENTRY_BITS>{raw};
+          }
+#ifdef TAGE_MONITOR
+          loop_stats.cache_misses++;
+#endif
+        }
+        return ram_entry;
+      }();
+
       read_entries[w] = entry;
       auto [e_tag, e_nb_iter, e_cur_iter, e_conf, e_dir, e_age] =
           split<TAG_BITS, ITER_BITS, ITER_BITS, CONF_BITS, 1, AGE_BITS>(entry);
       val<1> tag_match = (val<TAG_BITS>{e_tag} == tag);
-      // Ros confidence: conf > 0 AND nb_iter has enough significant bits
-      // Approximate significant_bits(nb_iter * conf) > CONF_THRESHOLD as:
-      // conf > 0 AND nb_iter >= (1 << CONF_THRESHOLD)
-      // This avoids a hardware multiply — the key insight is that longer
-      // loops need fewer correct exits to become confident.
-      val<1> conf_nonzero = (val<CONF_BITS>{e_conf} != hard<0>{});
+      val<1> conf_nz = (val<CONF_BITS>{e_conf} != hard<0>{});
       val<1> iter_significant =
           (val<ITER_BITS>{e_nb_iter} >= hard<(u64(1) << CONF_THRESHOLD)>{});
-      val<1> confident = conf_nonzero & iter_significant;
+      val<1> confident = conf_nz & iter_significant;
+#ifdef TAGE_MONITOR
+      if (static_cast<u64>(tag_match)) {
+        if (static_cast<u64>(conf_nz)) loop_stats.conf_nonzero++;
+        if (static_cast<u64>(e_nb_iter)) loop_stats.nb_iter_nonzero++;
+      }
+#endif
       val<ITER_BITS> next_iter =
           val<ITER_BITS>{val<ITER_BITS>{e_cur_iter} + hard<1>{}};
       val<1> at_exit = (next_iter == val<ITER_BITS>{e_nb_iter});
@@ -175,8 +253,9 @@ struct LoopPredictor {
              val<1> &correct_pred,
              arr<reg<1>, FETCH_WIDTH> &override_active,
              [[maybe_unused]] reg<FETCH_WIDTH> &p2_before_override,
-             val<1> &extra_cycle) {
-    // Only train on offset 0 (first branch in block) for now
+             val<1> &extra_cycle,
+             [[maybe_unused]] u64 num_branch = 1) {
+    // Train on offset 0 — matches the block PC used for lookup keying
     val<1> actual = branch_taken[0];
     val<1> is_br = is_branch[0];
 
@@ -210,11 +289,19 @@ struct LoopPredictor {
           select(dir_flip, val<ITER_BITS>{0}, incremented_iter);
       val<1> iter_match =
           (val<ITER_BITS>{e_cur_iter} == val<ITER_BITS>{e_nb_iter});
+      // Confidence update:
+      //   dir_flip + iter_match (correct exit): increment
+      //   dir_flip + !iter_match (wrong exit): decrement
+      //   !dir_flip + nb_iter known: increment (correct iteration)
+      //   !dir_flip + nb_iter==0 (learning): unchanged
+      val<1> nb_known = (val<ITER_BITS>{e_nb_iter} != hard<0>{});
       val<CONF_BITS> new_conf = select(dir_flip,
           select(iter_match,
                  update_ctr(val<CONF_BITS>{e_conf}, val<1>{1}),
                  update_ctr(val<CONF_BITS>{e_conf}, val<1>{0})),
-          val<CONF_BITS>{e_conf});
+          select(nb_known,
+                 update_ctr(val<CONF_BITS>{e_conf}, val<1>{1}),
+                 val<CONF_BITS>{e_conf}));
       val<ITER_BITS> new_nb_iter = select(
           dir_flip & (val<ITER_BITS>{e_nb_iter} == hard<0>{}),
           val<ITER_BITS>{e_cur_iter},
@@ -244,12 +331,23 @@ struct LoopPredictor {
           updated_entry, alloc_entry);
       val<1> do_write = (is_hit_way | do_alloc) & is_br;
 
-      // rwram write with extra_cycle as noconflict signal.
-      // When extra_cycle=1: write lands immediately (different cycle from read).
-      // When extra_cycle=0: rwram buffers write, lands when bank is free.
+      // Write to rwram (may be delayed by banking)
       execute_if(do_write, [&]() {
         loop_ram[w].write(val<SET_BITS>{lookup_set}, write_entry, extra_cycle);
       });
+
+#ifdef CHEATING_MODE
+      // Write to entry cache (instant — pure SW, only active in CHEATING_MODE)
+      if constexpr (USE_CACHE) {
+        if (static_cast<u64>(do_write)) {
+          ecache.update(lookup_set_sw, w, static_cast<u64>(write_entry));
+#ifdef TAGE_MONITOR
+          loop_stats.cache_writes++;
+#endif
+        }
+      }
+#endif
+
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_alloc) && static_cast<u64>(is_br))
         loop_stats.alloc_writes++;
