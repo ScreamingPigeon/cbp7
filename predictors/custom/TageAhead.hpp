@@ -140,61 +140,38 @@ struct TageAhead : predictor {
 
   //======== Simulator Inteface ========
   val<1> predict1(val<64> inst_pc) override {
-    // block setup
-    // ===============
+    // BISECT: return val at each stage to measure its latency
     inst_pc.fanout(hard<2>{});
-
-    val<LOG_FETCH_WIDTH> offset =
-        inst_pc >> 2; // get the offset for the start of the block
-    blk_entry = offset.fo1().decode().concat(); // convert binary to one hot
-    blk_entry.fanout(hard<FETCH_WIDTH + 4>{});  // setup fanout
+    val<LOG_FETCH_WIDTH> offset = inst_pc >> 2;
+    blk_entry = offset.fo1().decode().concat();
+    blk_entry.fanout(hard<2 * FETCH_WIDTH + 4>{});
     blk_size = 1;
 
-    // p1 gshare logic
-    // ===============
-
-    // Take the instruction. Drop the Lowest
-    // LOG FETCH_WIDTH bits, and
-    // drop another 2 because instructions are 4 bytes wide
     val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
+    // BISECT A: return val<1>{lineaddr}; // lineaddr latency
 
-    // TODO: @Prakhar. Add fanout for this lineaddr
-
-    // compute the index
     if constexpr (P1_HIST <= P1_INDEX_BITS) {
-      p1_index1 = lineaddr.fo1() ^ (val<P1_INDEX_BITS>{p1_hist_reg}
-                                    << (P1_INDEX_BITS - P1_HIST));
+      p1_index1 = lineaddr.fo1() ^ (val<P1_INDEX_BITS>{p1_hist_reg} << (P1_INDEX_BITS - P1_HIST));
     } else {
-      p1_index1 = p1_hist_reg.make_array(val<P1_INDEX_BITS>{})
-                      .append(lineaddr.fo1())
-                      .fold_xor();
+      p1_index1 = p1_hist_reg.make_array(val<P1_INDEX_BITS>{}).append(lineaddr.fo1()).fold_xor();
     }
-    // TODO: @ Prakhar. Add p1_index1 fanout
+    // BISECT B: return val<1>{p1_index1}; // gshare index latency
+
     p1_index1.fanout(hard<FETCH_WIDTH>{});
-
     static_loop<FETCH_WIDTH>([&]<u64 l_offset>() {
-      readp1[l_offset] = p1_pred[l_offset].read(
-          p1_index1); // read prediction ram and load into regs
+      readp1[l_offset] = p1_pred[l_offset].read(p1_index1);
     });
+    // BISECT C: return readp1[0]; // table read latency
 
-    readp1.fanout(hard<2>{}); // read in p1 and in updat_cycle
+    readp1.fanout(hard<2>{});
     p1 = readp1.concat();
-    p1.fanout(hard<FETCH_WIDTH + 1>{}); // reuse P1 calls and updat_cycle
-                                        //
-    // Return: "is any branch from the current instruction onward predicted
-    // taken?" This looks wrong — if lane i is not-taken but lane i+3 is taken,
-    // we return 1 for lane i. But the simulator only checks P1 accuracy for
-    // conditional branches, and by the time we reach a branch at lane j via
-    // reuse_predict1 calls, the block_entry mask has shifted to start at lane j
-    // — so the prediction is correct for that branch. The != 0 reduction is
-    // equivalent to a per-lane mux but avoids the mux tree latency (~0.18
-    // cycles). All reference predictors use this pattern
-    return (blk_entry & p1) != hard<0>{};
+    p1.fanout(hard<2 * FETCH_WIDTH + 1>{});
+    return (blk_entry & p1) != hard<0>{}; // BISECT D: full
   };
   val<1> reuse_predict1(val<64> inst_pc) override {
     return ((blk_entry << blk_size) & p1) != hard<0>{};
   };
-  // P2 proxies P1 for now — will be replaced with ahead TAGE in Phase 3
+  // P2 proxies P1 for now
   val<1> predict2(val<64> inst_pc) override {
     val<1> taken = (blk_entry & p1) != hard<0>{};
     reuse_prediction(~val<1>{blk_entry >> (FETCH_WIDTH - 1)});
