@@ -63,6 +63,7 @@ struct instruction_info {
 
 struct predictor {
     friend class harcom_superuser;
+    u64 last_inst_pc = 0;  // raw PC of last predict1/predict2 call
     /*
      * predict1 or reuse_predict1 are the first prediction methods called for an instruction.
      */

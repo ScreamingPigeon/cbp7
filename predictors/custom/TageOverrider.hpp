@@ -7,52 +7,61 @@
 // its override decision after TAGE signals are available.
 //
 // When Overrider = NoOverrider (default), all override code compiles away
-// via if constexpr (Overrider::ENABLED). Zero cost — bit-exact with
-// non-overrider code.
+// via if constexpr (Overrider::ENABLED). Zero cost.
 //
-// === Overrider Concept ===
+// === Overrider 4-Phase Interface ===
 //
 // An overrider type must provide:
 //
 //   static constexpr bool ENABLED = true;
+//   static constexpr u64 EXTRA_CYCLE_BUDGET = N;  // extra_cycle fanout consumers
 //
-//   // Phase 1: Parallel lookup (called at start of predict2, concurrent with TAGE reads)
-//   // Overrider reads its own tables here.
-//   void lookup(val<64> &inst_pc, reg<BINDEX_BITS> &bindex);
+//   struct LookupResult { val<1> candidate; val<1> pred; };
 //
-//   // Phase 2: Override decision (called after TAGE computes confidence + p2)
-//   // Sets internal ovr_valid/ovr_pred registers.
-//   void override_predict(arr<val<2>, FETCH_WIDTH> &tage_confidence,
-//                          reg<FETCH_WIDTH> &p2, val<64> &inst_pc);
+//   // Phase 1: Prefetch (called from predict1)
+//   // Read RAM tables at line-level index, extract into regs.
+//   void prefetch(val<64> &block_pc, u64 raw_pc);
 //
-//   // Per-offset accessors for the override decision
-//   val<1> get_override_valid(u64 offset);  // should override TAGE?
-//   val<1> get_override_pred(u64 offset);   // overrider's prediction
+//   // Phase 2: Lookup (called from predict2 AND reuse_predict2)
+//   // PURE COMBINATIONAL — no RAM reads, no reg writes (except on first call).
+//   // tage_pred: TAGE's prediction for this branch
+//   // tage_low_conf: 1 if TAGE provider is newly allocated (low confidence)
+//   // Returns {candidate, pred} where candidate=1 means override is active.
+//   LookupResult lookup(val<64> &inst_pc, val<1> &tage_pred, val<1> &tage_low_conf);
 //
-//   // Signal to TageImpl: skip TAGE allocation when loop is confident provider
-//   val<1> get_skip_tage_alloc(u64 offset);
+//   // Phase 3: Save branch info (called from update_condbr)
+//   // Save branch info for training (plain C++).
+//   void save_branch(val<64> &branch_pc, u64 idx);
 //
-//   // Phase 3: Training (called in update_cycle with outcome signals)
+//   // Phase 4: Train (called from update_cycle)
+//   // Update table weights, gated by execute_if(extra_cycle, ...).
 //   void train(arr<val<1>, FETCH_WIDTH> &branch_taken,
 //              arr<val<1>, FETCH_WIDTH> &is_branch,
 //              val<1> &mispredict,
 //              val<1> &correct_pred,
-//              arr<reg<1>, FETCH_WIDTH> &override_active,
-//              reg<FETCH_WIDTH> &p2_before_override,
-//              val<IDX_BITS> tage_idx,   // temporary return val — by value OK
-//              reg<BINDEX_BITS> &bindex);
+//              val<1> &extra_cycle,
+//              u64 num_branch);
 //
-// === CRITICAL: Pass HARCOM types by REFERENCE ===
+// === Critical Rules ===
 //
-// All val<>, reg<>, arr<> arguments MUST be passed by reference (&), never by value:
-//   - reg<N> by value CRASHES (copy creates/destroys HARCOM storage)
-//   - val<N> by value adds ~50% latency overhead (FO2 inverter from copy)
-//   - arr<T,N> by value copies all elements (multiplied overhead)
+// 1. Use ram<>, NOT rwram<>, for overrider tables.
+//    Read in predict1 (cycle N), write in update_cycle (cycle N+1 via extra_cycle).
 //
-// Exception: temporary return values (e.g. from tidx<I>()) are fine by value.
-// HARCOM get() is not const-qualified, so use non-const & (not const &).
+// 2. lookup() must be PURE COMBINATIONAL.
+//    No RAM reads, no reg writes (except first-call saves guarded by bool).
+//    Called from both predict2 AND reuse_predict2.
+//
+// 3. Pass HARCOM types by reference, never by value.
+//    reg<N> by value CRASHES. val<N> by value adds ~50% latency.
+//
+// 4. No destructors on overrider structs.
+//    HARCOM types can't be destroyed. Use print_stats() instead.
+//
+// 5. extra_cycle fanout: declare EXTRA_CYCLE_BUDGET to cover all
+//    execute_if consumers in train().
 
 struct NoOverrider {
   static constexpr bool ENABLED = false;
-  // No methods needed — all call sites are behind if constexpr (Overrider::ENABLED)
+  static constexpr unsigned long long EXTRA_CYCLE_BUDGET = 0;
+  // No methods needed — all call sites behind if constexpr (Overrider::ENABLED)
 };

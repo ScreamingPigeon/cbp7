@@ -139,3 +139,79 @@ Ahead Prediction, Alt-Fetch, Omnipredictor, BranchNet, Branch Precomputation, Vi
 - Overrider confidence gate + mux chain adds ~20ps (now using P1 regs, but gate still in P2).
 - Extra fanout from OVR=1 on match1, pred1, pred2, newly_alloc.
 - Options: reduce tag width (11->9), fewer tables (8->6), disable meta.
+
+
+# Prakhar's TODOs:
+
+  CBP2016 TAGE-SC-L (#8)                                                                                                     
+  - Multi-GEHL SC — Your SC is bias-only. Adding 2-4 GEHL tables with geometric history lengths is the expected biggest SC
+  improvement (6-8% mispred reduction). Already Priority 1 in your todos.                                                    
+  - TAGE-SC chooser — 3 confidence cases with 2 monitoring counters. 0.7% reduction. Directly addresses your SC
+  cross-workload regression problem.                                                                                         
+  - Confidence-gated allocation (u-bit trick) — Only evict u=0 AND low-confidence entries. Nearly closes 1-bit vs 2-bit u    
+  gap. Zero extra storage. Already in your research_todos.                                                               
+  - Non-consecutive allocation — Allocated entries must be in non-consecutive tables. Reduces destructive interference.      
+  Simple check in allocation loop.                                                                                     
+                                                                                                                             
+  Ros Deep Dive (#14)
+  - Quadratic-to-super-exponential history series — Already planned (Priority 1). Eliminates need for set-associative tables,
+   denser medium-history coverage.                                                                                           
+  - Skip TAGE allocation on loop hits — Easy, already planned in overrider coordination.                                     
+  - Improved alt chooser — 256 counters, considers confidence < 2 (not just 0). Medium effort, moderate gain.                
+  - Improved TAGE-SC chooser — 16 counters indexed by TAGE confidence + SC sum bin. Better than CBP2016's simpler version.   
+  - Set u-bit of alternate bank — Trivial change, minor gain.                                                                
+  - Loop predictor is final — Don't let SC override loop. Already planned.                                                   
+                                                                                                                             
+  A New Case for TAGE (#6)                                                                                                   
+  - TAGE counter value as SC confidence — Add (2*ctr+1) * 8 to SC sum. Makes SC less likely to override high-confidence TAGE 
+  predictions. Directly fixes your SC over-correction problem.                                                               
+  - Simplified 1-bit u with global reset — You already use this pattern (DECAY_CTR). Validates your approach.                
+  - Multi-entry allocation (NNN=2-4) — Already planned Priority 1. Faster warming for larger predictors.                     
+  - Eliminating silent updates — Skip writes when old==new value. >90% write elimination. Would significantly reduce EPI.    
+  - Local Statistical Corrector (LSC) — 5 LGEHL tables with local history. >8% mispred reduction on top of TAGE. Different   
+  from global SC — targets the ~10 static branches causing most dynamic mispredictions.                                      
+                                                                                                                             
+  TAGE-SC original (#15)                                                                                                     
+  - GEHL-based SC (global history) — Same as CBP2016 but with implementation details. 5-6 bit counters (you already use      
+  6-bit). Prediction = sign(sum).                                                                                            
+  - Bias indexed by TAGE output — Removing TAGE direction from bias index increases mispred by 1.6%. Your current PC-only    
+  bias is missing this. But you found direction-indexed bias adds 2 cycles to P2 — the precomputed-sum trick (sum without    
+  TAGE vote, add TAGE vote at the end) should solve this.                                                                    
+  - Dynamic threshold (PC-indexed) — 32-entry table + global counter. 0.1% benefit. Low priority but addresses your threshold
+   runaway issue.                                                                                                            
+                                                                                                                             
+  Worth Investigating (medium effort, clear benefit)
+                                                                                                                             
+  Samsung Exynos (#9)                                                                                                        
+  - Scaled Hashed Perceptron (SHP) — This is the practical perceptron design Jimenez pointed to. 8-16 tables with geometric  
+  history, sign/magnitude weights, XOR hash. Your SC is already a lightweight version of this. The key insight: BTB BIAS     
+  weight — a per-branch dedicated weight stored in the BTB entry, doubled and added to sum. Eliminates the worst aliasing
+  problem. You could add a dedicated per-PC bias as a 4th bias table with wider indexing.                                    
+  - Always-taken branch filtering — Skip SC updates for always-taken branches. Reduces aliasing/pollution. Easy to add.
+  - Stochastic search for history lengths — Better than hand-tuned. Your coordinate descent sweep already does this    
+  partially.                                                                                                                 
+                                                                                                                             
+  L-TAGE (#10)                                                                                                               
+  - USE_ALT_ON_NA — You already have this (meta predictor). 4-bit counter, use alt when provider newly allocated + counter   
+  negative.                                                                                                                  
+  - Graceful u-bit reset (alternating bits) — Alternate clearing u0 then u1 every 512K branches. You have probabilistic decay
+   instead, which may be better.                                                                                             
+  - Tag computation overlapped with table read — Tag match spans during index computation. Zero added latency for complex tag
+   hashes. Relevant if you want wider tags without P2 cost.                                                                  
+                                                                                                                             
+  RUNLTS (#13)    
+  - IMLI components (BrIMLI + TaIMLI) — Already in your Priority 2 todos. Reduced MPKI by ≥1 on three traces. 20K bits       
+  storage. Good complement to loop predictor.                                                                                
+  - Thrashing detection + dynamic allocation throttling — Zero extra storage (repurposes rare counter/u-bit combos). Already 
+  in your todos.                                                                                                             
+  - Large bimodal (128K entries) — Your sweep already explored bimodal_size. Current 8192 may be optimal for your VFS budget.
+  - History length series — Same as Ros, validates the approach.                                                             
+                                                                                                                             
+  SONet (#12)                                                                                                                
+  - H2P identification + TAGE space reclamation — When overrider handles a branch, skip TAGE allocation. You already plan    
+  this. Validates the approach.                                                                                              
+  - Misprediction concentration — Top 8 branches cause ~65% of mispredictions. Suggests your SC should focus resources on few
+   branches rather than being general.                                                                                       
+  - Per-branch dedicated weights — Each H2P branch gets its own weight set (8 networks in CAM). Too complex for HARCOM, but  
+  the principle of per-branch specialization could inform a wider-indexed SC bias table.                                   
+                                                                                              

@@ -752,11 +752,14 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
               return select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
             }}.concat();
       } else {
-        auto ovr = overrider.lookup(inst_pc);
+        // Compute TAGE prediction for offset 0 to pass to SC overrider
+        altsel.fanout(hard<2>{});
+        val<1> tage_pred_0 = select(altsel[0], pred2[0], pred1[0]);
+        auto ovr = overrider.lookup(inst_pc, tage_pred_0, newly_alloc[0]);
         // Build p2 with override baked in at offset 0 — single write
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
                val<1> tage_pred =
-                   select(altsel[offset].fo1(), pred2[offset], pred1[offset]);
+                   select(altsel[offset], pred2[offset], pred1[offset]);
                if (offset == 0)
                  return select(ovr.candidate, ovr.pred, tage_pred);
                return tage_pred;
@@ -772,7 +775,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
       if constexpr (!Overrider::ENABLED) {
         p2 = pred1.concat();
       } else {
-        auto ovr = overrider.lookup(inst_pc);
+        val<1> no_low_conf = val<1>{0};
+        auto ovr = overrider.lookup(inst_pc, pred1[0], no_low_conf);
         p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
                if (offset == 0)
                  return select(ovr.candidate, ovr.pred, pred1[offset]);
@@ -816,7 +820,8 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     val<1> taken = [&]() -> val<1> {
       if constexpr (Overrider::ENABLED) {
         inst_pc.fanout(hard<2>{});
-        auto ovr = overrider.lookup(inst_pc);
+        val<1> no_low_conf = val<1>{0};
+        auto ovr = overrider.lookup(inst_pc, tage_taken, no_low_conf);
         return select(ovr.candidate, ovr.pred, tage_taken);
       } else {
         return tage_taken;
@@ -891,7 +896,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
     val<LOG_FETCH_WIDTH> last_offset = branch_offset[num_branch - 1];
     last_offset.fanout(hard<4 * NUM_TABLES + 2>{});
-
     u64 update_valid = (u64(1) << num_branch) - 1;
     arr<val<FETCH_WIDTH>, FETCH_WIDTH> update_mask = [&](u64 offset) {
       arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 i) {
@@ -1065,12 +1069,34 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     };
     g_weak.fanout(hard<2>{});
 
-    // need extra cycle for modifying prediction bits and for TAGE allocation
+    // SC: compute new weights BEFORE need_extra_cycle (no RAM writes)
+    if constexpr (Overrider::ENABLED) {
+      overrider.train_compute(branch_taken, is_branch, mispredict, correct_pred,
+                              num_branch);
+    }
+
+    // need extra cycle for modifying prediction bits, TAGE allocation, and SC writes
     val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
-    val<1> extra_cycle =
-        some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR * 5>{});
+    val<1> extra_cycle = [&]() -> val<1> {
+      val<1> base = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
+      if constexpr (Overrider::ENABLED) {
+        // SC always needs extra cycle when it has staged writes
+        return base | val<1>{overrider.should_write ? 1u : 0u};
+      } else {
+        return base;
+      }
+    }();
+    static constexpr u64 OVR_BUDGET = Overrider::ENABLED ? Overrider::EXTRA_CYCLE_BUDGET : 0;
+    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1 + OVR_BUDGET>{});
     need_extra_cycle(extra_cycle);
+
+    // SC: write staged data to RAM. extra_cycle is guaranteed=1 when
+    // should_write=true (we ORed it into the extra_cycle computation).
+    if constexpr (Overrider::ENABLED) {
+      if (overrider.should_write) {
+        overrider.train_write();
+      }
+    }
 
     // update meta counter
     if constexpr (USE_META_V) {
@@ -1280,12 +1306,6 @@ struct TageImpl<false, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
     // Note: U_STOR_FF with DECAY_CTR=0 has no epoch reset — u-bits only
     // clear through uclear (allocation pressure). Consider using DECAY_CTR>0.
-
-    // Overrider training
-    if constexpr (Overrider::ENABLED) {
-      overrider.train(branch_taken, is_branch, mispredict, correct_pred,
-                      extra_cycle, num_branch);
-    }
 
     // update global history
     val<1> line_end = block_entry >> (FETCH_WIDTH - block_size);
@@ -1817,7 +1837,8 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     val<1> taken = [&]() -> val<1> {
       if constexpr (Overrider::ENABLED) {
         inst_pc.fanout(hard<2>{});
-        auto ovr = overrider.lookup(inst_pc);
+        val<1> no_low_conf = val<1>{0};
+        auto ovr = overrider.lookup(inst_pc, tage_taken, no_low_conf);
         return select(ovr.candidate, ovr.pred, tage_taken);
       } else {
         return tage_taken;
@@ -1896,7 +1917,6 @@ struct TageImpl<true, TableCfg, AllocCfg, FETCH_WIDTH_V, BIMODAL_SIZE_V,
     }
     val<LOG_FETCH_WIDTH> last_offset = branch_offset[num_branch - 1];
     last_offset.fanout(hard<4 * NUM_TABLES + 2>{});
-
     u64 update_valid = (u64(1) << num_branch) - 1;
     arr<val<FETCH_WIDTH>, FETCH_WIDTH> update_mask = [&](u64 offset) {
       arr<val<1>, FETCH_WIDTH> match_offset = [&](u64 i) {
@@ -2339,7 +2359,7 @@ template <typename TableCfg = SweepTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
           bool TAGE_USE_PATH_HIST = false, u64 TAGE_PATH_HIST_WIDTH = 27,
           u64 TAGE_PATH_BITS = 6,
           typename TAGE_OVERRIDER =
-              SCOverrider<8, 6, TAGE_FETCH_WIDTH, 4>>
+              SCOverrider<3, 8, 6, TAGE_FETCH_WIDTH>>
 
 // NOTE: Modify params here
 
