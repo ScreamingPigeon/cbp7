@@ -157,3 +157,124 @@ Updated HARCOM: https://github.com/PierreMichaud-Inria/cbp-ng
 ### Pierre's Design Philosophy
 
 > If you can duplicate a bit at no cost, you can replicate the bit as many times as you want with no cost, and this would break the consistency of the HARCOM model. The philosophy of HARCOM is that inefficient implementations are possible, but implementations with an unrealistically low cost should not be possible without conspicuously violating the rules of the HARCOM language.
+
+
+
+### P1 Return Value: (block_entry & p1) != 0   
+                                                                                                               
+  P1 returns "is any branch from the current lane onward predicted taken?"
+  This is NOT a per-instruction prediction — it's an OR-reduce across all                                      
+  remaining lanes in the block.                                                                                
+                                         
+  Why this works:                                                                                              
+  - For the taken branch that ends the block: always correct (its bit is set,
+    OR-reduce returns 1).                                                                                      
+  - For not-taken branches before a later taken branch: returns 1 (wrong).
+    Costs a P1/P2 disagreement (pipeline bubble), not a full misprediction.                                    
+  - For non-branch instructions: simulator ignores the return value entirely.
+                                                                                                               
+  Why not per-lane select (readp1.select(offset)):                                                             
+  - Tested on reference tage, gcc trace: saves 5 disagreements (688→683)                                       
+    but adds 0.18 cycles P1 latency (0.937→1.12) and 52 extra P2                                               
+    mispredictions from shifted block boundaries.                                                              
+  - All reference predictors use the OR-reduce pattern.                                                        
+                                                                                                               
+  The critical prediction is the first taken branch — it ends the block and                                    
+  redirects fetch. The OR-reduce always gets this right.                                                       
+
+  This isn't really a forum cheat. more like i couldn't understand why the references
+did it like this.
+
+---
+
+## 6. VFS Non-Monotonic Behavior & IPCcbp0 = 8 Rationale
+
+**Source**: CBP-NG mailing list, 2026-03-30 to 2026-03-31 (Kim Wen, Pierre)
+
+### Background
+
+Kim Wen noted that `gshareN_ahead` achieves IPC=9.172, which already exceeds the reference IPCcbp0=8 used in `vfs.py`. He observed that further increasing IPC (with CPI and EPI held constant) actually **decreases** VFS — non-monotonic behavior.
+
+### Pierre's Response
+
+- The non-monotonic behavior is **intentional**, arising from two VFS assumptions: (1) average IPC is bottlenecked by the CBP; (2) core power budget is fixed.
+- `gshareN_ahead` exceeds IPCcbp0 but has poor prediction accuracy, so VFS is still rising (0.967).
+- IPCcbp0=8 was chosen to drive predictors toward **reasonably aggressive** configurations — not so low that throughput is insufficient for modern CPUs, not so high that accuracy is sacrificed for throughput.
+- **Winning predictor expected to have VFS close to 1. VFS can exceed 1 in theory.**
+- If you approach reference CPIcbp0, be careful not to overshoot IPCcbp — diminishing/negative returns.
+
+### Implications
+
+- Don't blindly maximize IPC. Once IPC approaches ~8, further throughput gains can hurt VFS.
+- The sweet spot is high accuracy + reasonable throughput + low energy.
+- `gshareN_ahead` (VFS=0.967) is not a reasonable configuration — it's an existence proof, not a target.
+
+---
+
+## 7. BTB Allocates Never-Taken Branches
+
+**Source**: CBP-NG mailing list, 2026-03-31 (Pierre)
+
+Pierre clarified an implicit assumption: **all branches are allocated in the BTB, including never-taken conditional branches**. This reduces the effective capacity of the CBP since the predictor sees (and must handle) branches that a real BTB might not track.
+
+> The BTB is ideal only to a certain extent.
+
+### Implications
+
+- Your predictor will be queried on trivially never-taken branches — aliasing pressure is higher than in a real system.
+- Filtering trivial branches (see §8) can reclaim that wasted capacity.
+
+---
+
+## 8. Bloom Filter for Trivial Branch Filtering
+
+**Source**: CBP-NG mailing list, 2026-03-31 (Daniel Jimenez)
+
+### The Idea
+
+Real processors commonly don't allocate BTB entries for never-taken branches, implicitly filtering trivial (always-taken or never-taken) branches. Since CBP-NG's BTB *does* allocate everything (§7), you can replicate this filtering explicitly.
+
+### Proposed Design
+
+- **Direct-mapped Bloom filter**: N entries × 2 bits, indexed by hashed PC.
+  - Bit 0: "observed as taken"
+  - Bit 1: "observed as not taken"
+- **Only consult/update the predictor if AND of both bits is true** (branch is non-trivial).
+- Trivial branches skip predictor lookup and update entirely — saves energy and eliminates aliasing.
+- Tune N to be larger than the predictor's capacity (covers more branches).
+- Widen array for parallelism as needed.
+
+### Jimenez's Assessment
+
+> Some benchmarks can have over half of their dynamic branches filtered by this idea, greatly reducing aliasing pressure on the branch predictor and improving MPKI.
+
+**Helps perceptron a lot** (hard time with aliasing). **Doesn't help TAGE much** — bimodal table already filters trivial branches well, so tagged tables naturally don't get polluted.
+
+### Organizer Clarification (Pierre)
+
+> If you implement such Bloom filter, it is considered part of the CBP.
+
+The filter's area/energy/latency counts against your predictor budget. Pierre acknowledged this is **unfair to tag-less predictors** (which don't naturally filter trivial branches like TAGE does) and noted future championships will likely provide a BTB or require contestants to implement one.
+
+### Implications
+
+- For our TAGE design: low priority. Bimodal already provides this filtering naturally.
+- If we add a perceptron component (see §4), a Bloom filter becomes more valuable.
+- The Bloom filter's HARCOM cost (ram area + energy) must be justified by the filtering benefit.
+- Could still help TAGE marginally by saving energy on trivial branch updates.
+
+---
+
+## 9. P2 Reusing P1 Results Is Allowed
+
+**Source**: CBP-NG mailing list, 2026-03-31 (Bing Guo, Pierre)
+
+Bing Guo asked whether it's architecturally justifiable for P2 to simply reuse P1's results (as `gshare_ahead` does), effectively eliminating the override mechanism. Pierre confirmed:
+
+> Are you asking if it is OK for contestants to use the same techniques that are used in the example predictors? If so, then the answer is yes.
+
+### Implications
+
+- P2=P1 is a valid design choice (trade accuracy for zero P2 overhead).
+- `gshare_ahead` proves this can yield high VFS (0.967) despite 56% higher MPKI than TAGE.
+- For competitive predictors, the question is whether P2 override accuracy justifies its latency/energy cost — not whether skipping it is "allowed".

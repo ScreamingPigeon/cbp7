@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean
 
 all: cbp reference
 
@@ -49,7 +49,9 @@ help:
 	@echo "  make trace-analyze    Build trace analysis tool"
 	@echo "  make run-trace-analyze Run trace analyzer on TRACE"
 	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
-	@echo "  make clean                  Remove generated build artifacts"
+	@echo "  make save                   Bookmark current cbp binary (SAVE_NAME=label)"
+	@echo "  make list-saved             List bookmarked binaries"
+	@echo "  make clean                  Remove generated build artifacts (preserves saved)"
 	@echo
 	@echo "Variables you can override:"
 	@echo "  TRACE=...            Trace file (default: $(TRACE))"
@@ -200,6 +202,19 @@ sweep:
 
 sweep-report:
 	$(PYTHON) scripts/tage_sweep.py --report out/sweep/results.csv --top 20
+
+SAVE_DIR := $(BUILD_DIR)/saved
+SAVE_NAME ?= $(shell date +%Y%m%d_%H%M%S)
+
+$(SAVE_DIR):
+	mkdir -p $@
+
+save: $(BUILD_DIR)/cbp | $(SAVE_DIR)
+	cp $(BUILD_DIR)/cbp $(SAVE_DIR)/$(SAVE_NAME)
+	@echo "Saved to $(SAVE_DIR)/$(SAVE_NAME)"
+
+list-saved:
+	@ls -lt $(SAVE_DIR)/ 2>/dev/null || echo "No saved binaries"
 
 clean:
 	rm -f $(BUILD_DIR)/cbp $(BUILD_DIR)/reference $(BUILD_DIR)/trace-analyze
