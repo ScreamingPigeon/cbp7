@@ -17,13 +17,18 @@ template <
     // Meta Prediction Params
     bool USE_META = true, u64 METABITS = 4, u64 METAPIPE = 2,
 
-    // Ahead-sepcific
-    u64 SEC_TAG_WIDTH = 4>
+    // Ahead-specific
+    u64 SEC_TAG_WIDTH = 4,
+    u64 AHEAD_BANKS = 3,     // N: physical banks instantiated
+    u64 AHEAD_BANK_BITS = 2> // log2(K): bank select width (K = 1 << AHEAD_BANK_BITS)
 
 struct TageAhead : predictor {
-  // Defining Constexpres
+  // Defining Constexprs
   static constexpr u64 NUM_TABLES = TableCfg::NUM_TABLES;
   static constexpr u64 LOG_FETCH_WIDTH = clog2(FETCH_WIDTH);
+  static constexpr u64 AHEAD_K = (1 << AHEAD_BANK_BITS);
+  static_assert(AHEAD_BANKS >= 1, "Need at least 1 bank");
+  static_assert(AHEAD_BANKS <= AHEAD_K, "Cannot have more banks than select values");
 
   static constexpr u64 MAX_TAG_WIDTH = array_max(TableCfg::TAG_WIDTH);
   static constexpr u64 MAX_CTR_WIDTH = array_max(TableCfg::CTR_WIDTH);
@@ -85,21 +90,27 @@ struct TageAhead : predictor {
   hcm::ram<val<1>, BIM_ENTRIES> bpred[FETCH_WIDTH];
   hcm::ram<val<1>, BIM_ENTRIES> bhyst[FETCH_WIDTH];
 
-  // Tage Tables
-  Tables tables;
+  // Tage Tables — one full set per bank (predecessor-indexed)
+  // SIZE in TableCfg is per-bank. Total storage = SIZE * NUM_TABLES * AHEAD_BANKS.
+  Tables tables[AHEAD_BANKS];
 
-  // Ahead Pipeline specific regs
-  // Note that the [2] is for 1 + N_AHEAD (1 in our case)
-  // [0] is for current read, and [1] is for whatever was 1 ahead (i.e run
-  // before)
-  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> ahead_tag[2];
-  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> ahead_pred[2];
-  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> ahead_hyst[2];
-  arr<reg<MAX_U_WIDTH>, NUM_TABLES> ahead_u[2];
+  // Ahead Pipeline regs — per-bank, 2-deep pipeline
+  // [stage][bank]: stage 0 = current read, stage 1 = previous (ready for predict2)
+  arr<reg<MAX_TAG_WIDTH>, NUM_TABLES> ahead_tag[2][AHEAD_BANKS];
+  arr<reg<MAX_CTR_WIDTH>, NUM_TABLES> ahead_pred[2][AHEAD_BANKS];
+  arr<reg<std::max(u64(1), MAX_HYST_WIDTH)>, NUM_TABLES> ahead_hyst[2][AHEAD_BANKS];
+  arr<reg<MAX_U_WIDTH>, NUM_TABLES> ahead_u[2][AHEAD_BANKS];
+
+  // Shared across banks (same index for all banks of a predecessor)
   arr<reg<MAX_IDX_BITS>, NUM_TABLES> tage_indexes[2];
   arr<reg<MAX_HTAGBITS>, NUM_TABLES> ahead_htag[2];
-  reg<SEC_TAG_WIDTH> secondary_tag; // this is needed to determine when to use
-                                    // bimodal on speculated next block
+
+  // Bank selection state
+  reg<AHEAD_BANK_BITS> XB[2];  // address bits for bank scrambling, pipelined
+  reg<AHEAD_BANK_BITS> path;   // path out of previous block (set in update_cycle)
+
+  // Secondary tag — disambiguates when bank selection lands on a phantom bank
+  reg<SEC_TAG_WIDTH> secondary_tag;
 
   // P2 result registers
   reg<NUM_TABLES> not_u_mask; // bitmask tracking usefulness =!=0
@@ -141,20 +152,20 @@ struct TageAhead : predictor {
   //======== Simulator Inteface ========
   val<1> predict1(val<64> inst_pc) override {
     // ---- Block setup ----
-    inst_pc.fanout(hard<2>{});
+    inst_pc.fanout(hard<4>{}); // P1 offset(1) + P1 lineaddr(1) + TAGE lineaddr(1) + XB(1)
     val<LOG_FETCH_WIDTH> offset = inst_pc >> 2;
     blk_entry = offset.fo1().decode().concat();
     blk_entry.fanout(hard<2 * FETCH_WIDTH + 4>{});
     blk_size = 1;
 
     // ---- P1 gshare ----
-    val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
+    val<LINEADDR_BITS> p1_lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
     if constexpr (P1_HIST <= P1_INDEX_BITS) {
-      p1_index1 = lineaddr.fo1() ^ (val<P1_INDEX_BITS>{p1_hist_reg}
-                                    << (P1_INDEX_BITS - P1_HIST));
+      p1_index1 = p1_lineaddr.fo1() ^ (val<P1_INDEX_BITS>{p1_hist_reg}
+                                       << (P1_INDEX_BITS - P1_HIST));
     } else {
       p1_index1 = p1_hist_reg.make_array(val<P1_INDEX_BITS>{})
-                      .append(lineaddr.fo1())
+                      .append(p1_lineaddr.fo1())
                       .fold_xor();
     }
     p1_index1.fanout(hard<FETCH_WIDTH>{});
@@ -165,7 +176,69 @@ struct TageAhead : predictor {
     p1 = readp1.concat();
     p1.fanout(hard<2 * FETCH_WIDTH + 1>{});
 
-    // ---- Phase 2: ahead TAGE reads will go here ----
+    // ---- Phase 2: ahead TAGE reads (predecessor-indexed, banked) ----
+
+    // Pipeline shift: [0] → [1] for all banks
+    for (u64 b = 0; b < AHEAD_BANKS; b++) {
+      ahead_tag[0][b].fanout(hard<2>{});
+      ahead_pred[0][b].fanout(hard<2>{});
+      if constexpr (MAX_HYST_WIDTH > 0) {
+        ahead_hyst[0][b].fanout(hard<2>{});
+      }
+      ahead_u[0][b].fanout(hard<2>{});
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        ahead_tag[1][b][i]  = ahead_tag[0][b][i];
+        ahead_pred[1][b][i] = ahead_pred[0][b][i];
+        if constexpr (MAX_HYST_WIDTH > 0) {
+          ahead_hyst[1][b][i] = ahead_hyst[0][b][i];
+        }
+        ahead_u[1][b][i] = ahead_u[0][b][i];
+      }
+    }
+    // Pipeline shift: shared index/tag state
+    tage_indexes[0].fanout(hard<2>{});
+    ahead_htag[0].fanout(hard<2>{});
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      tage_indexes[1][i] = tage_indexes[0][i];
+      ahead_htag[1][i] = ahead_htag[0][i];
+    }
+    // Pipeline shift: bank selection
+    XB[0].fanout(hard<2>{});
+    XB[1] = XB[0];
+    XB[1].fanout(hard<2>{}); // read in predict2 bank_sel + update_cycle
+
+    // Compute XB[0] from current PC
+    XB[0] = inst_pc >> 2;
+
+    // Compute TAGE indices for current block (shared across banks)
+    val<LINEADDR_BITS> tage_lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
+    tage_lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
+    tage_folded_hists.fanout(hard<2>{});
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      tage_indexes[0][i] = tage_lineaddr ^ tage_folded_hists.template get<0>(i);
+    }
+    tage_indexes[0].fanout(hard<AHEAD_BANKS * 4>{}); // each bank reads tag+pred+hyst+u
+
+    // Compute hashed tags (parallel with RAM reads, shared across banks)
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      ahead_htag[0][i] = val<MAX_HTAGBITS>{tage_lineaddr}.reverse()
+                          ^ tage_folded_hists.template get<1>(i);
+    }
+
+    // Read ALL banks into ahead_*[0][bank]
+    for (u64 b = 0; b < AHEAD_BANKS; b++) {
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        auto &t = std::get<I>(tables[b]);
+        ahead_tag[0][b][I]  = t.tag_ram[0].read(tidx<I>(tage_indexes[0][I]));
+        ahead_pred[0][b][I] = t.pred_ram[0].read(tidx<I>(tage_indexes[0][I]));
+        if constexpr (MAX_HYST_WIDTH > 0) {
+          ahead_hyst[0][b][I] = t.hyst_ram[0].read(tidx<I>(tage_indexes[0][I]));
+        }
+        ahead_u[0][b][I] = t.u_ram[0].read(tidx<I>(tage_indexes[0][I]));
+      });
+    }
+
+    // TODO: compute + store secondary tag
 
     return (blk_entry & p1) != hard<0>{};
   };

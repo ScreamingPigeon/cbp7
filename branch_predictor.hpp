@@ -1,7 +1,7 @@
 #include "predictors/always_taken.hpp"
 #include "predictors/bimodal.hpp"
 #include "predictors/bimodalN.hpp"
-#include "predictors/custom/Tage.hpp"
+// #include "predictors/custom/Tage.hpp"
 #include "predictors/experiment_perceptron.hpp"
 #include "predictors/gshare.hpp"
 #include "predictors/gshareN.hpp"
@@ -11,7 +11,7 @@
 #include "predictors/tage.hpp"
 #include "predictors/tage_tagetable.hpp"
 #include "predictors/tutorial/tutorial.hpp"
-// #include "predictors/custom/TageAhead.hpp"
+#include "predictors/custom/TageAhead.hpp"
 
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args> using perceptron = experiment_perceptron<Args...>;

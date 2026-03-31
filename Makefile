@@ -46,8 +46,10 @@ help:
 	@echo "  make cbp-monitor                Build+run with TAGE monitor (output to MONITOR_OUT)"
 	@echo "  make quick-eval                 Run current predictor on 20 representative traces"
 	@echo "  make quick-eval-all             Compare PRED_A vs PRED_B on representative traces"
-	@echo "  make trace-analyze    Build trace analysis tool"
-	@echo "  make run-trace-analyze Run trace analyzer on TRACE"
+	@echo "  make trace-analyze              Build trace analysis tool"
+	@echo "  make run-trace-analyze          Run trace analyzer on TRACE"
+	@echo "  make block-analyze              Build block analyzer for ahead banking"
+	@echo "  make run-block-analyze          Run block analyzer (BLOCK_FW, BLOCK_BANKS, BLOCK_INSTR)"
 	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
 	@echo "  make save                   Bookmark current cbp binary (SAVE_NAME=label)"
 	@echo "  make list-saved             List bookmarked binaries"
@@ -87,6 +89,17 @@ $(BUILD_DIR)/trace-analyze: trace_files/trace_analyzer.cpp trace_files/trace_rea
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ trace_files/trace_analyzer.cpp -lz
 
 trace-analyze: $(BUILD_DIR)/trace-analyze
+
+$(BUILD_DIR)/block-analyze: trace_files/block_analyzer.cpp trace_files/trace_reader.hpp | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) -Wall -Wextra -Itrace_files -o $@ trace_files/block_analyzer.cpp -lz
+
+block-analyze: $(BUILD_DIR)/block-analyze
+
+BLOCK_FW ?= 16
+BLOCK_BANKS ?= 8
+BLOCK_INSTR ?= 0
+run-block-analyze: $(BUILD_DIR)/block-analyze | out
+	./$(BUILD_DIR)/block-analyze $(TRACE) $(BLOCK_FW) $(BLOCK_BANKS) $(BLOCK_INSTR) | tee out/block_analysis.txt
 
 run-cbp: $(BUILD_DIR)/cbp
 	./$(BUILD_DIR)/cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
