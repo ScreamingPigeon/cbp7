@@ -140,33 +140,34 @@ struct TageAhead : predictor {
 
   //======== Simulator Inteface ========
   val<1> predict1(val<64> inst_pc) override {
-    // BISECT: return val at each stage to measure its latency
+    // ---- Block setup ----
     inst_pc.fanout(hard<2>{});
     val<LOG_FETCH_WIDTH> offset = inst_pc >> 2;
     blk_entry = offset.fo1().decode().concat();
     blk_entry.fanout(hard<2 * FETCH_WIDTH + 4>{});
     blk_size = 1;
 
+    // ---- P1 gshare ----
     val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
-    // BISECT A: return val<1>{lineaddr}; // lineaddr latency
-
     if constexpr (P1_HIST <= P1_INDEX_BITS) {
-      p1_index1 = lineaddr.fo1() ^ (val<P1_INDEX_BITS>{p1_hist_reg} << (P1_INDEX_BITS - P1_HIST));
+      p1_index1 = lineaddr.fo1() ^ (val<P1_INDEX_BITS>{p1_hist_reg}
+                                    << (P1_INDEX_BITS - P1_HIST));
     } else {
-      p1_index1 = p1_hist_reg.make_array(val<P1_INDEX_BITS>{}).append(lineaddr.fo1()).fold_xor();
+      p1_index1 = p1_hist_reg.make_array(val<P1_INDEX_BITS>{})
+                      .append(lineaddr.fo1())
+                      .fold_xor();
     }
-    // BISECT B: return val<1>{p1_index1}; // gshare index latency
-
     p1_index1.fanout(hard<FETCH_WIDTH>{});
     static_loop<FETCH_WIDTH>([&]<u64 l_offset>() {
       readp1[l_offset] = p1_pred[l_offset].read(p1_index1);
     });
-    // BISECT C: return readp1[0]; // table read latency
-
     readp1.fanout(hard<2>{});
     p1 = readp1.concat();
     p1.fanout(hard<2 * FETCH_WIDTH + 1>{});
-    return (blk_entry & p1) != hard<0>{}; // BISECT D: full
+
+    // ---- Phase 2: ahead TAGE reads will go here ----
+
+    return (blk_entry & p1) != hard<0>{};
   };
   val<1> reuse_predict1(val<64> inst_pc) override {
     return ((blk_entry << blk_size) & p1) != hard<0>{};
