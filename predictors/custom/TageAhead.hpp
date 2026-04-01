@@ -106,6 +106,10 @@ struct TageAhead : predictor {
   arr<reg<MAX_HYST_WIDTH>, NUM_TABLES> ahead_hyst[2][AHEAD_BANKS];
   arr<reg<MAX_U_WIDTH>, NUM_TABLES> ahead_u[2][AHEAD_BANKS];
 
+  // Precomputed in predict1: per-bank hashed tag compare result
+  // Moves tag compare out of predict2's critical path.
+  reg<NUM_TABLES> ahead_htagcmp[2][AHEAD_BANKS];
+
   // Shared across banks (same index for all banks of a predecessor)
   arr<reg<MAX_IDX_BITS>, NUM_TABLES> tage_indexes[2];
   arr<reg<MAX_HTAGBITS>, NUM_TABLES> ahead_htag[2];
@@ -201,6 +205,7 @@ struct TageAhead : predictor {
         ahead_hyst[0][b].fanout(hard<2>{});
       }
       ahead_u[0][b].fanout(hard<2>{});
+      ahead_htagcmp[0][b].fanout(hard<2>{});
       for (u64 i = 0; i < NUM_TABLES; i++) {
         ahead_tag[1][b][i] = ahead_tag[0][b][i];
         ahead_pred[1][b][i] = ahead_pred[0][b][i];
@@ -209,6 +214,7 @@ struct TageAhead : predictor {
         }
         ahead_u[1][b][i] = ahead_u[0][b][i];
       }
+      ahead_htagcmp[1][b] = ahead_htagcmp[0][b];
     }
     // Pipeline shift: shared index/tag state
     tage_indexes[0].fanout(hard<2>{});
@@ -248,6 +254,18 @@ struct TageAhead : predictor {
         }
         ahead_u[0][b][I] = t.u_ram[0].read(tidx<I>(tage_indexes[0][I]));
       });
+    }
+
+    // ---- Precompute hashed tag compare per bank ----
+    // ahead_htag[0] and ahead_tag[0][b] were just written by RAM reads above.
+    // Comparing them here moves the tag compare out of predict2's critical path.
+    ahead_htag[0].fanout(hard<AHEAD_BANKS * NUM_TABLES>{});
+    for (u64 b = 0; b < AHEAD_BANKS; b++) {
+      ahead_tag[0][b].fanout(hard<NUM_TABLES>{}); // one read per table for compare
+      arr<val<1>, NUM_TABLES> cmp = [&](int i) -> val<1> {
+        return val<MAX_HTAGBITS>{ahead_tag[0][b][i]} == ahead_htag[0][i];
+      };
+      ahead_htagcmp[0][b] = cmp.fo1().concat();
     }
 
     // TODO: compute + store secondary tag
@@ -356,15 +374,18 @@ struct TageAhead : predictor {
     };
     preds.fanout(hard<2 * FETCH_WIDTH>{});
 
-    // Tag compare: hashed portion (same for all offsets) + offset portion
-    ahead_htag[1].fanout(hard<5>{}); // predict2(2) + update_cycle(3)
-    arr<val<1>, NUM_TABLES> htagcmp_split = [&](int i) {
-      return val<MAX_HTAGBITS>{v_tag[i]} == ahead_htag[1][i];
+    // Tag compare: hashed portion — precomputed per bank in predict1.
+    // Select the correct bank's precomputed result.
+    ahead_htag[1].fanout(hard<3>{}); // update_cycle only now
+    for (u64 b = 0; b < AHEAD_BANKS; b++)
+      ahead_htagcmp[1][b].fanout(hard<2>{});
+    arr<val<NUM_TABLES>, AHEAD_BANKS> htagcmp_opts = [&](u64 b) -> val<NUM_TABLES> {
+      return ahead_htagcmp[1][b];
     };
-    val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
+    val<NUM_TABLES> htagcmp = htagcmp_opts.fo1().select(bank_sel);
     htagcmp.fanout(hard<FETCH_WIDTH>{});
 
-    // BR_P_ENTRY=1: offset encoded in upper tag bits
+    // BR_P_ENTRY=1: offset encoded in upper tag bits (still computed here)
     static_loop<FETCH_WIDTH>([&]<u64 offset>() {
       arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
         return val<LOG_FETCH_WIDTH>{v_tag[i] >> MAX_HTAGBITS} == hard<offset>{};
