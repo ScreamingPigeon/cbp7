@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>VFS Explorer</title>
+<style>
+  body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 20px; }
+  h1 { color: #00d4ff; }
+  .container { display: flex; gap: 30px; flex-wrap: wrap; }
+  .panel { background: #16213e; padding: 20px; border-radius: 8px; min-width: 300px; }
+  .slider-row { margin: 10px 0; }
+  .slider-row label { display: inline-block; width: 140px; }
+  .slider-row input[type=range] { width: 200px; vertical-align: middle; }
+  .slider-row .val { display: inline-block; width: 80px; text-align: right; color: #00d4ff; font-weight: bold; }
+  .result { font-size: 48px; color: #00ff88; font-weight: bold; text-align: center; margin: 20px 0; }
+  .result-label { font-size: 14px; color: #888; text-align: center; }
+  .breakdown { margin: 10px 0; }
+  .breakdown td { padding: 4px 12px; }
+  .breakdown .num { color: #00d4ff; text-align: right; }
+  .ref-table { border-collapse: collapse; margin: 10px 0; }
+  .ref-table th, .ref-table td { border: 1px solid #333; padding: 6px 12px; }
+  .ref-table th { background: #0f3460; }
+  .ref-btn { background: #0f3460; color: #e0e0e0; border: 1px solid #00d4ff; padding: 4px 10px; cursor: pointer; border-radius: 4px; margin: 2px; }
+  .ref-btn:hover { background: #00d4ff; color: #000; }
+  .bar { height: 16px; background: #00d4ff; border-radius: 3px; transition: width 0.2s; }
+  .bar-bg { background: #0a0a1a; border-radius: 3px; width: 200px; display: inline-block; vertical-align: middle; margin-left: 8px; }
+</style>
+</head>
+<body>
+
+<h1>VFS Explorer</h1>
+
+<div class="container">
+  <div class="panel">
+    <h3>Predictor Parameters</h3>
+    <div class="slider-row">
+      <label>MPKI:</label>
+      <input type="range" id="mpki" min="0.5" max="25" step="0.25" value="5.85">
+      <span class="val" id="mpki-val">5.85</span>
+    </div>
+    <div class="slider-row">
+      <label>P1 ceil (cycles):</label>
+      <input type="range" id="p1" min="1" max="5" step="1" value="1">
+      <span class="val" id="p1-val">1</span>
+    </div>
+    <div class="slider-row">
+      <label>P2 ceil (cycles):</label>
+      <input type="range" id="p2" min="1" max="5" step="1" value="2">
+      <span class="val" id="p2-val">2</span>
+    </div>
+    <div class="slider-row">
+      <label>EPI (fJ):</label>
+      <input type="range" id="epi" min="100" max="8000" step="50" value="1245">
+      <span class="val" id="epi-val">1245</span>
+    </div>
+    <div class="slider-row">
+      <label>Extra cyc ratio:</label>
+      <input type="range" id="extra" min="0" max="0.5" step="0.01" value="0.05">
+      <span class="val" id="extra-val">0.05</span>
+    </div>
+    <div class="slider-row">
+      <label>Instr/block:</label>
+      <input type="range" id="ipb" min="1" max="16" step="0.5" value="4.5">
+      <span class="val" id="ipb-val">4.5</span>
+    </div>
+    <div class="slider-row">
+      <label>Diverge ratio:</label>
+      <input type="range" id="diverge" min="0" max="0.1" step="0.005" value="0.01">
+      <span class="val" id="diverge-val">0.01</span>
+    </div>
+    <div class="slider-row">
+      <label>Diverge@end frac:</label>
+      <input type="range" id="divend" min="0" max="1" step="0.05" value="0.8">
+      <span class="val" id="divend-val">0.80</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="result-label">VFS Score</div>
+    <div class="result" id="vfs-result">0.0000</div>
+
+    <h3>Derived Metrics</h3>
+    <table class="breakdown">
+      <tr><td>IPC:</td><td class="num" id="d-ipc">-</td>
+          <td><div class="bar-bg"><div class="bar" id="bar-ipc"></div></div></td></tr>
+      <tr><td>CPI:</td><td class="num" id="d-cpi">-</td>
+          <td><div class="bar-bg"><div class="bar" id="bar-cpi"></div></div></td></tr>
+      <tr><td>MPI:</td><td class="num" id="d-mpi">-</td>
+          <td><div class="bar-bg"><div class="bar" id="bar-mpi"></div></div></td></tr>
+      <tr><td>Speedup:</td><td class="num" id="d-speedup">-</td>
+          <td><div class="bar-bg"><div class="bar" id="bar-speedup"></div></div></td></tr>
+      <tr><td>Norm EPI:</td><td class="num" id="d-nepi">-</td>
+          <td><div class="bar-bg"><div class="bar" id="bar-nepi"></div></div></td></tr>
+    </table>
+
+    <h3>Presets</h3>
+    <button class="ref-btn" onclick="loadPreset(5.85,1,2,1245,0.05,4.5,0.01,0.8)">Direct Tage (best)</button>
+    <button class="ref-btn" onclick="loadPreset(13.57,1,2,3049,0.10,4.2,0.02,0.8)">TageAhead (current)</button>
+    <button class="ref-btn" onclick="loadPreset(3.4,1,2,1500,0.05,4.5,0.01,0.8)">TAGE-SC-L (paper)</button>
+    <button class="ref-btn" onclick="loadPreset(2.0,1,1,1000,0.03,5.0,0.005,0.8)">Dream predictor</button>
+  </div>
+
+  <div class="panel" style="min-width: 400px;">
+    <h3>Comparison Table</h3>
+    <table class="ref-table" id="ref-table">
+      <tr>
+        <th>Config</th><th>MPKI</th><th>P1</th><th>P2</th><th>EPI</th><th>Extra</th><th>Div@end</th><th>VFS</th><th></th>
+      </tr>
+    </table>
+    <button class="ref-btn" onclick="addSnapshot()" style="margin-top:10px">+ Snapshot Current</button>
+    <button class="ref-btn" onclick="clearSnapshots()">Clear All</button>
+  </div>
+</div>
+
+<script>
+// VFS formula constants (from vfs.py)
+const IPCcbp0 = 8;
+const CPIcbp0 = 0.0315;
+const EPIcbp0 = 1000;
+const ALPHA = 1.625;
+const BETA = 4 * ALPHA / (ALPHA - 1) ** 2;
+const GAMMA = 2 / (ALPHA - 1);
+const cbp_energy_ratio = 0.05;
+// Updated per forum fix (§3): penalty 8→9, CPI subtracts P1 latency
+const P2_TO_EXEC_STAGES = 9;
+
+function computeVFS(mpki, p1_ceil, p2_ceil, epi, extra_ratio, ipb, diverge_ratio, divend_frac) {
+  // IPC: instructions per cycle (from predictor_metrics.py logic)
+  const mpi = mpki / 1000;
+  const diverge_at_end_ratio = diverge_ratio * divend_frac;
+
+  let cycles_per_instr;
+  if (p2_ceil <= p1_ceil) {
+    // P2 is fast enough — no divergence penalty
+    cycles_per_instr = Math.max(1, p2_ceil) / ipb;
+  } else {
+    // P2 > P1: base at P1 speed + divergence penalties
+    // Mid-block diverge: full P2 cost. Block-end diverge: P2 - P1 (would have paid P1 anyway)
+    const mid_diverge = diverge_ratio - diverge_at_end_ratio;
+    cycles_per_instr = Math.max(1, p1_ceil) / ipb
+      + mid_diverge * p2_ceil
+      + diverge_at_end_ratio * (p2_ceil - Math.max(1, p1_ceil));
+  }
+  cycles_per_instr += extra_ratio / ipb; // extra cycles
+
+  const ipc = 1.0 / cycles_per_instr;
+  // CPI: updated formula subtracts P1 latency to avoid double-counting
+  const cpi = mpi * (P2_TO_EXEC_STAGES + p2_ceil - p1_ceil);
+
+  const WPI0 = IPCcbp0 * CPIcbp0;
+  const WPI = ipc * cpi;
+  const speedup = (ipc / IPCcbp0) * (1 + WPI0) / (1 + WPI);
+  const LAMBDA = 1 / (1 + WPI0 / 2) - cbp_energy_ratio;
+  const normalizedEPI = ((epi / EPIcbp0) * cbp_energy_ratio + LAMBDA * Math.pow(speedup, GAMMA)) * (1 + WPI / 2);
+  const vfs = speedup * ALPHA * (1 - 2 / (1 + Math.sqrt(1 + BETA / (speedup * normalizedEPI))));
+
+  return { vfs, ipc, cpi, mpi, speedup, normalizedEPI };
+}
+
+const sliders = ['mpki', 'p1', 'p2', 'epi', 'extra', 'ipb', 'diverge', 'divend'];
+
+function getValues() {
+  return {
+    mpki: parseFloat(document.getElementById('mpki').value),
+    p1: parseInt(document.getElementById('p1').value),
+    p2: parseInt(document.getElementById('p2').value),
+    epi: parseFloat(document.getElementById('epi').value),
+    extra: parseFloat(document.getElementById('extra').value),
+    ipb: parseFloat(document.getElementById('ipb').value),
+    diverge: parseFloat(document.getElementById('diverge').value),
+    divend: parseFloat(document.getElementById('divend').value),
+  };
+}
+
+function update() {
+  const v = getValues();
+
+  // Update display values
+  document.getElementById('mpki-val').textContent = v.mpki.toFixed(2);
+  document.getElementById('p1-val').textContent = v.p1;
+  document.getElementById('p2-val').textContent = v.p2;
+  document.getElementById('epi-val').textContent = v.epi.toFixed(0);
+  document.getElementById('extra-val').textContent = v.extra.toFixed(2);
+  document.getElementById('ipb-val').textContent = v.ipb.toFixed(1);
+  document.getElementById('diverge-val').textContent = v.diverge.toFixed(3);
+  document.getElementById('divend-val').textContent = v.divend.toFixed(2);
+
+  const r = computeVFS(v.mpki, v.p1, v.p2, v.epi, v.extra, v.ipb, v.diverge, v.divend);
+
+  // Color VFS based on value
+  const el = document.getElementById('vfs-result');
+  el.textContent = r.vfs.toFixed(4);
+  if (r.vfs >= 0.9) el.style.color = '#00ff88';
+  else if (r.vfs >= 0.8) el.style.color = '#88ff00';
+  else if (r.vfs >= 0.7) el.style.color = '#ffaa00';
+  else el.style.color = '#ff4444';
+
+  // Derived metrics
+  document.getElementById('d-ipc').textContent = r.ipc.toFixed(3);
+  document.getElementById('d-cpi').textContent = r.cpi.toFixed(4);
+  document.getElementById('d-mpi').textContent = r.mpi.toFixed(4);
+  document.getElementById('d-speedup').textContent = r.speedup.toFixed(4);
+  document.getElementById('d-nepi').textContent = r.normalizedEPI.toFixed(4);
+
+  // Bars
+  document.getElementById('bar-ipc').style.width = Math.min(200, r.ipc / 10 * 200) + 'px';
+  document.getElementById('bar-cpi').style.width = Math.min(200, r.cpi / 0.1 * 200) + 'px';
+  document.getElementById('bar-mpi').style.width = Math.min(200, r.mpi / 0.02 * 200) + 'px';
+  document.getElementById('bar-speedup').style.width = Math.min(200, r.speedup / 1.5 * 200) + 'px';
+  document.getElementById('bar-nepi').style.width = Math.min(200, r.normalizedEPI / 2 * 200) + 'px';
+}
+
+function loadPreset(mpki, p1, p2, epi, extra, ipb, diverge, divend) {
+  document.getElementById('mpki').value = mpki;
+  document.getElementById('p1').value = p1;
+  document.getElementById('p2').value = p2;
+  document.getElementById('epi').value = epi;
+  document.getElementById('extra').value = extra;
+  document.getElementById('ipb').value = ipb;
+  document.getElementById('diverge').value = diverge;
+  document.getElementById('divend').value = divend || 0.8;
+  update();
+}
+
+let snapshots = [];
+function addSnapshot() {
+  const v = getValues();
+  const r = computeVFS(v.mpki, v.p1, v.p2, v.epi, v.extra, v.ipb, v.diverge, v.divend);
+  snapshots.push({ ...v, vfs: r.vfs });
+  renderSnapshots();
+}
+
+function clearSnapshots() {
+  snapshots = [];
+  renderSnapshots();
+}
+
+function renderSnapshots() {
+  const table = document.getElementById('ref-table');
+  // Remove old snapshot rows
+  while (table.rows.length > 1) table.deleteRow(1);
+
+  snapshots.forEach((s, i) => {
+    const row = table.insertRow(-1);
+    row.innerHTML = `
+      <td>#${i + 1}</td>
+      <td>${s.mpki.toFixed(2)}</td>
+      <td>${s.p1}</td>
+      <td>${s.p2}</td>
+      <td>${s.epi.toFixed(0)}</td>
+      <td>${s.extra.toFixed(2)}</td>
+      <td>${s.divend.toFixed(2)}</td>
+      <td style="color:${s.vfs >= 0.9 ? '#00ff88' : s.vfs >= 0.8 ? '#88ff00' : '#ffaa00'};font-weight:bold">${s.vfs.toFixed(4)}</td>
+      <td><button class="ref-btn" onclick="loadPreset(${s.mpki},${s.p1},${s.p2},${s.epi},${s.extra},${s.ipb},${s.diverge},${s.divend})">Load</button></td>
+    `;
+  });
+}
+
+// Attach listeners
+sliders.forEach(id => {
+  document.getElementById(id).addEventListener('input', update);
+});
+
+// Initial
+update();
+</script>
+</body>
+</html>

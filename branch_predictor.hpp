@@ -6,6 +6,7 @@
 #include "predictors/gshare.hpp"
 #include "predictors/gshareN.hpp"
 #include "predictors/gshareN_ahead.hpp"
+#include "predictors/gshareN_ahead_best.hpp"
 #include "predictors/never_taken.hpp"
 #include "predictors/perceptron.hpp"
 #include "predictors/tage.hpp"

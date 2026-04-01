@@ -449,7 +449,6 @@ struct TageAhead : predictor {
              return select(bank_hit, ahead, readb[offset]);
            }}.concat();
     } else {
-      // No meta: primary prediction with bank_hit fallback
       p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
              return select(bank_hit, tage_pred1[offset], readb[offset]);
            }}.concat();

@@ -1,0 +1,35 @@
+  ┌────────────────────┬─────────────────────────────────┬─────────────────────────────────────────────────┐
+  │      Feature       │          gshareN_ahead          │               gshareN_ahead_best                │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Defaults           │ GHIST=10, N=4                   │ GHIST=16, N=7                                   │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ LINEINST           │ 64                              │ 1024 (much wider blocks)                        │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ XB handling        │ XB[2] pipelined, path ^ XB[1]   │ Single XB, path = XB + num_branch +             │
+  │                    │                                 │ ~last_condbr_dir (no XOR, additive)             │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ XL lane scramble   │ XOR-based:                      │ Rotation-based: XL.rotate_left(i), AND-reduce   │
+  │                    │ unordered.select(i^XL)          │                                                 │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Block continuation │ Always re-read; true_block      │ true_block gates re-reading index/RAM;          │
+  │                    │ gates history                   │ continues from previous if not true block       │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Block entry        │ val<LOGLINEINST> decoded to     │ reg<LOGLINEINST> — can accumulate block_entry + │
+  │                    │ mask                            │  block_size across non-true blocks              │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ rank tracking      │ None — uses num_branch == N to  │ reg<N+1> rank one-hot tracks branch position;   │
+  │                    │ end block                       │ last_pred() checks if predictions exhausted     │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Global history     │ Shift by 1 per block: (ghist << │ Shift by num_branch: shifts history by actual   │
+  │ update             │  1) ^ next_pc                   │ branch count, not block count                   │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ Path computation   │ path = num_branch &             │ path = XB + num_branch + ~last_condbr_dir —     │
+  │                    │ branch_dir.replicate()          │ encodes direction AND position                  │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ reuse_prediction   │ Ends at num_branch == N         │ Ends at `line_end()                             │
+  │ end                │                                 │                                                 │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ UPDATE_ONLY zone   │ ctr_lo in UPDATE_ONLY zone      │ No zone — ctr_lo in main zone                   │
+  ├────────────────────┼─────────────────────────────────┼─────────────────────────────────────────────────┤   
+  │ No-branch history  │ Conditional on `~true_block     │ uncond_jump`                                    │
+  └────────────────────┴─────────────────────────────────┴─────────────────────────────────────────────────┘  
