@@ -13,6 +13,7 @@
 #include "predictors/tage_tagetable.hpp"
 #include "predictors/tutorial/tutorial.hpp"
 #include "predictors/custom/TageAhead.hpp"
+#include "predictors/custom/TageAheadV2.hpp"
 
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args> using perceptron = experiment_perceptron<Args...>;
