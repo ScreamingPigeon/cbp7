@@ -101,13 +101,15 @@ struct TageAheadV2 : predictor {
   // ======== Bimodal ========
   hcm::ram<val<1>, BIM_ENTRIES> bpred[FETCH_WIDTH];
 
-  // ======== Ahead pipeline [0]=current, [1]=previous ========
-  // One packed entry per table per bank
-  arr<reg<ENTRY_BITS>, NUM_TABLES> ahead_entry[2][AHEAD_BANKS];
+  // ======== Ahead pipeline: single stage ========
+  // Written by RAM reads in predict1. Read in the NEXT predict1 (after next_cycle
+  // resets timing) for precomputation. Then overwritten with new RAM reads.
+  // No [0]/[1] shift needed — next_cycle between calls handles the pipeline.
+  arr<reg<ENTRY_BITS>, NUM_TABLES> ahead_entry[AHEAD_BANKS];
 
   // Shared across banks
-  arr<reg<MAX_IDX_BITS>, NUM_TABLES> tage_indexes[2];
-  arr<reg<MAX_HTAGBITS>, NUM_TABLES> ahead_htag[2];
+  arr<reg<MAX_IDX_BITS>, NUM_TABLES> tage_indexes;
+  arr<reg<MAX_HTAGBITS>, NUM_TABLES> ahead_htag;
 
   // (ahead_lane_pred removed — P1 uses bimodal, P2 extracts from packed entries)
 
@@ -124,8 +126,9 @@ struct TageAheadV2 : predictor {
   reg<LOGLINEINST> block_entry;         // offset of entry point in line
   reg<N + 1> rank;                       // one-hot: which branch we're predicting next
 
-  // Per-branch directions (for update_cycle)
+  // Per-branch state (for update_cycle)
   arr<reg<1>, N> branch_dir;
+  arr<reg<LOG_FETCH_WIDTH>, N> br_offset;  // lane of each branch
 
   // P2 working registers (written in predict1, read in update_cycle)
   arr<reg<MAX_TAG_WIDTH>, NUM_TABLES>  readt;
@@ -149,9 +152,9 @@ struct TageAheadV2 : predictor {
                      EmptyMember>
       decay_threshold;
 
-  // Bimodal: pipelined like TAGE. [0]=current read, [1]=previous (for predict1 return)
+  // Bimodal: single stage (same pattern as ahead_entry)
   reg<BINDEX_BITS> bindex;
-  arr<reg<1>, FETCH_WIDTH> ahead_readb[2];
+  arr<reg<1>, FETCH_WIDTH> ahead_readb;
 
   // UPDATE_ONLY zone
   zone UPDATE_ONLY;
@@ -188,66 +191,120 @@ struct TageAheadV2 : predictor {
     rank = select(true_block, val<N + 1>{1}, rank << num_branch);
     rank.fanout(hard<N + 2>{});
 
-    // ---- 2. Pipeline shift + TAGE reads (conditional on true_block) ----
-    // Only re-read RAMs when this is a true block. Otherwise reuse previous.
-    execute_if(true_block, [&]() {
-      // Pipeline shift: [0] → [1] (packed entries + bimodal + shared state)
-      for (u64 b = 0; b < AHEAD_BANKS; b++) {
-        for (u64 i = 0; i < NUM_TABLES; i++) {
-          ahead_entry[1][b][i] = ahead_entry[0][b][i];
-        }
-      }
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        tage_indexes[1][i] = tage_indexes[0][i];
-        ahead_htag[1][i]   = ahead_htag[0][i];
-      }
-      for (u64 i = 0; i < FETCH_WIDTH; i++) {
-        ahead_readb[1][i] = ahead_readb[0][i];
-      }
+    // ---- 2. TAGE precomputation from ahead_entry[] (PREVIOUS cycle's data) ----
+    // These regs were written in the previous predict1 call. next_cycle() was
+    // called between, so their timing starts fresh. No pipeline shift needed.
 
-      // ---- 3. Compute TAGE indices + tags ----
+    // ---- Fast prediction path using fo1() — zero fanout cost on critical path ----
+    // Intermediate vals consumed once via fo1(). Regs written separately for update_cycle.
+
+    // Bank select (path consumed once for prediction, once for update_cycle bank)
+    path.fanout(hard<2>{});
+    val<1> bank_hit = (path < hard<AHEAD_BANKS>{});
+    val<LOGBANKS> bank_sel = select(bank_hit, path, val<LOGBANKS>{0});
+    bank_sel.fanout(hard<NUM_TABLES>{}); // one select per table
+
+    // Extract entries from selected bank
+    // Also write to regs for update_cycle (reg writes don't affect val timing)
+    arr<val<MAX_TAG_WIDTH>, NUM_TABLES> v_tag = [&](u64 i) -> val<MAX_TAG_WIDTH> {
+      arr<val<ENTRY_BITS>, AHEAD_BANKS> e_opts = [&](u64 b) -> val<ENTRY_BITS> {
+        return ahead_entry[b][i];
+      };
+      val<ENTRY_BITS> entry = e_opts.fo1().select(bank_sel);
+      // Write to regs for update_cycle (doesn't affect entry timing)
+      readt[i] = entry >> TAG_OFF;
+      readc[i] = entry >> PRED_OFF;
+      readh[i] = entry >> HYST_OFF;
+      readu[i] = entry >> U_OFF;
+      return val<MAX_TAG_WIDTH>{entry >> TAG_OFF};
+    };
+
+    // Tag compare — v_tag read for htag compare + offset extract
+    v_tag.fanout(hard<FETCH_WIDTH + 1>{}); // htag compare(1) + offset extract per offset(FW)
+    arr<val<1>, NUM_TABLES> htagcmp_arr = [&](int i) -> val<1> {
+      return val<MAX_HTAGBITS>{v_tag[i]} == ahead_htag[i];
+    };
+    val<NUM_TABLES> htagcmp = htagcmp_arr.fo1().concat();
+    htagcmp.fanout(hard<FETCH_WIDTH>{}); // needed: one per offset
+
+    // Prediction bits — fo1 on readc
+    val<NUM_TABLES> gpreds = [&]() -> val<NUM_TABLES> {
+      if constexpr (MAX_CTR_WIDTH == 1) {
+        arr<val<1>, NUM_TABLES> gp = [&](int i) -> val<1> { return readc[i]; };
+        return gp.fo1().concat();
+      } else {
+        arr<val<1>, NUM_TABLES> gp = [&](int i) -> val<1> {
+          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
+        };
+        return gp.fo1().concat();
+      }
+    }();
+    gpreds.fanout(hard<FETCH_WIDTH>{}); // needed: one per offset
+
+    // Per-offset: match + one_hot + prediction → write to pred[]
+    // bank_hit needs fanout for FETCH_WIDTH final selects
+    bank_hit.fanout(hard<FETCH_WIDTH>{});
+    ahead_readb.fanout(hard<FETCH_WIDTH * 2>{}); // preds concat + final select
+
+    static_loop<FETCH_WIDTH>([&]<u64 offset>() {
+      arr<val<1>, NUM_TABLES> tagcmp = [&](int i) -> val<1> {
+        return val<LOG_FETCH_WIDTH>{v_tag[i] >> MAX_HTAGBITS} == hard<offset>{};
+      };
+      val<NUM_TABLES + 1> m = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
+      m.fanout(hard<2>{}); // one_hot + match2 XOR
+      val<NUM_TABLES + 1> m1 = m.one_hot();
+      m1.fanout(hard<2>{}); // preds AND + match1 reg
+      val<NUM_TABLES + 1> preds_v = concat(ahead_readb[offset], gpreds);
+      val<1> tpred = (m1 & preds_v.fo1()) != hard<0>{};
+
+      // Write match regs for update_cycle
+      match1[offset] = m1;
+      match2[offset] = (m ^ m1).one_hot();
+      tage_pred1[offset] = tpred;
+
+      // Final prediction: TAGE when bank hits, bimodal fallback
+      pred[offset] = select(bank_hit, tpred, ahead_readb[offset]);
+    });
+
+    // Fanout for regs read in update_cycle (NOT on predict1 critical path)
+    readt.fanout(hard<FETCH_WIDTH + 1>{});
+    readc.fanout(hard<3>{});
+    readu.fanout(hard<2>{});
+    readh.fanout(hard<2>{});
+    match1.fanout(hard<4>{});
+    match2.fanout(hard<3>{});
+    tage_pred1.fanout(hard<3>{});
+    not_u_mask = ~readu.concat();
+    not_u_mask.fanout(hard<2>{});
+
+    pred.fanout(hard<N * 4 + 2>{});
+
+    // ---- 3. RAM reads for NEXT cycle (overwrite ahead_entry/readb/htag/indexes) ----
+    execute_if(true_block, [&]() {
       val<LINEADDR_BITS> lineaddr = inst_pc >> (LOG_FETCH_WIDTH + 2);
       lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
       tage_folded_hists.fanout(hard<2>{});
 
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        tage_indexes[0][i] = lineaddr ^ tage_folded_hists.template get<0>(i);
-      }
-      tage_indexes[0].fanout(hard<AHEAD_BANKS>{});  // one read per bank
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        tage_indexes[i] = lineaddr ^ tage_folded_hists.template get<0>(i);
+      tage_indexes.fanout(hard<AHEAD_BANKS>{});
 
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        ahead_htag[0][i] = val<MAX_HTAGBITS>{lineaddr}.reverse()
-                           ^ tage_folded_hists.template get<1>(i);
-      }
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        ahead_htag[i] = val<MAX_HTAGBITS>{lineaddr}.reverse()
+                        ^ tage_folded_hists.template get<1>(i);
 
-      // Bimodal
       bindex = lineaddr;
       bindex.fanout(hard<FETCH_WIDTH>{});
 
-      // ---- 4. Read packed TAGE RAMs + bimodal ----
-      // One read per table per bank = NUM_TABLES * AHEAD_BANKS total reads
-      // (vs 4 * NUM_TABLES * AHEAD_BANKS with separate RAMs)
-      for (u64 b = 0; b < AHEAD_BANKS; b++) {
-        for (u64 i = 0; i < NUM_TABLES; i++) {
-          ahead_entry[0][b][i] = tage_ram[i][b].read(val<MAX_IDX_BITS>{tage_indexes[0][i]});
-        }
-      }
-      for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-        ahead_readb[0][offset] = bpred[offset].read(bindex);
-      }
+      for (u64 b = 0; b < AHEAD_BANKS; b++)
+        for (u64 i = 0; i < NUM_TABLES; i++)
+          ahead_entry[b][i] = tage_ram[i][b].read(val<MAX_IDX_BITS>{tage_indexes[i]});
 
-      // ---- 5. Path update (for bank select) ----
+      for (u64 offset = 0; offset < FETCH_WIDTH; offset++)
+        ahead_readb[offset] = bpred[offset].read(bindex);
+
       path = XB + num_branch + ~last_condbr_dir;
     }); // end execute_if(true_block)
-
-    // P1 prediction = bimodal from PREVIOUS cycle's read (ahead pipeline [1]).
-    // This is truly ahead — no RAM read in the return path. Just reg reads.
-    // predict2 will do full TAGE tag compare + match to override.
-    ahead_readb[1].fanout(hard<FETCH_WIDTH * 2>{});
-    for (u64 i = 0; i < FETCH_WIDTH; i++) {
-      pred[i] = ahead_readb[1][i];
-    }
-    pred.fanout(hard<N * 4 + 2>{}); // predict1(1) + reuse_p1(N) + predict2(1) + reuse_p2(N) + update(1)
 
     // Update XB for next block
     XB = select(true_block, val<LOGBANKS>{inst_pc >> 6},
@@ -266,123 +323,8 @@ struct TageAheadV2 : predictor {
     return pred[num_branch];
   }
 
+  // P2 = reg read. All TAGE logic precomputed in predict1. P2 ceil = 1.
   val<1> predict2(val<64> inst_pc) override {
-    // P2: full TAGE tag compare + match on ahead_*[1][bank].
-    // Bank select using path (computed in previous update_cycle).
-    path.fanout(hard<NUM_TABLES * 4 + 2>{});
-
-    // Clamp bank_sel to valid range
-    val<1> bank_hit = (path < hard<AHEAD_BANKS>{});
-    val<LOGBANKS> bank_sel = select(bank_hit, path, val<LOGBANKS>{0});
-    bank_sel.fanout(hard<NUM_TABLES * 4 + 1>{});
-    bank_hit.fanout(hard<FETCH_WIDTH>{});
-
-    // Select correct bank's packed entries, extract fields into working regs
-    for (u64 b = 0; b < AHEAD_BANKS; b++) {
-      ahead_entry[1][b].fanout(hard<2>{});
-    }
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      // Mux across banks for this table
-      arr<val<ENTRY_BITS>, AHEAD_BANKS> e_opts = [&](u64 b) -> val<ENTRY_BITS> {
-        return ahead_entry[1][b][I];
-      };
-      val<ENTRY_BITS> entry = e_opts.fo1().select(bank_sel);
-      entry.fanout(hard<4>{}); // extract tag, pred, hyst, u
-      // Extract fields from packed entry
-      readt[I] = entry >> TAG_OFF;
-      readc[I] = entry >> PRED_OFF;
-      readh[I] = entry >> HYST_OFF;
-      readu[I] = entry >> U_OFF;
-    });
-    readt.fanout(hard<FETCH_WIDTH + 1>{});
-    readc.fanout(hard<3>{});
-    readu.fanout(hard<2>{});
-    readh.fanout(hard<2>{});
-
-    // Tag compare
-    ahead_htag[1].fanout(hard<3>{});
-    arr<val<1>, NUM_TABLES> htagcmp_split = [&](int i) {
-      return val<MAX_HTAGBITS>{readt[i]} == ahead_htag[1][i];
-    };
-    val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
-    htagcmp.fanout(hard<FETCH_WIDTH>{});
-
-    // Prediction bits
-    val<NUM_TABLES> gpreds = [&]() -> val<NUM_TABLES> {
-      if constexpr (MAX_CTR_WIDTH == 1) {
-        return readc.concat();
-      } else {
-        arr<val<1>, NUM_TABLES> gp = [&](int i) -> val<1> {
-          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
-        };
-        return gp.fo1().concat();
-      }
-    }();
-    gpreds.fanout(hard<FETCH_WIDTH>{});
-
-    // Per-offset: preds vector, match, one_hot, prediction
-    arr<val<NUM_TABLES + 1>, FETCH_WIDTH> preds = [&](u64 offset) {
-      return concat(ahead_readb[1][offset], gpreds);
-    };
-    preds.fanout(hard<2 * FETCH_WIDTH>{});
-
-    static_loop<FETCH_WIDTH>([&]<u64 offset>() {
-      arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
-        return val<LOG_FETCH_WIDTH>{readt[i] >> MAX_HTAGBITS} == hard<offset>{};
-      };
-      val<NUM_TABLES + 1> m = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
-      m.fanout(hard<2>{});
-      match1[offset] = m.one_hot();
-      match2[offset] = (m ^ m.one_hot()).one_hot();
-    });
-    match1.fanout(hard<4>{});
-    match2.fanout(hard<3>{});
-    for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-      tage_pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
-      tage_pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
-    }
-    tage_pred1.fanout(hard<3>{});
-    tage_pred2.fanout(hard<3>{});
-
-    not_u_mask = ~readu.concat();
-    not_u_mask.fanout(hard<2>{});
-
-    // Meta select
-    if constexpr (bool(USE_META)) {
-      meta.fanout(hard<4>{});
-      arr<val<1>, NUM_TABLES> weakctr = [&](int i) -> val<1> {
-        return readh[i] == hard<0>{};
-      };
-      val<NUM_TABLES> coldctr = not_u_mask & weakctr.fo1().concat();
-      coldctr.fanout(hard<FETCH_WIDTH>{});
-      val<1> metasign = (meta[METAPIPE - 1] >= hard<0>{});
-      metasign.fanout(hard<FETCH_WIDTH>{});
-      for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
-        newly_alloc[offset] = (match1[offset] & coldctr) != hard<0>{};
-      }
-      newly_alloc.fanout(hard<2>{});
-
-      arr<val<1>, FETCH_WIDTH> altsel = [&](u64 offset) {
-        arr<val<1>, 3> inputs = {metasign, newly_alloc[offset],
-                                 match2[offset] != hard<0>{}};
-        return inputs.fo1().fold_and();
-      };
-
-      // Final P2: select(bank_hit, tage_with_meta, bimodal)
-      p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-             val<1> ahead = select(altsel[offset].fo1(), tage_pred2[offset],
-                                   tage_pred1[offset]);
-             return select(bank_hit, ahead, ahead_readb[1][offset]);
-           }}.concat();
-    } else {
-      p2 = arr<val<1>, FETCH_WIDTH>{[&](u64 offset) {
-             return select(bank_hit, tage_pred1[offset], ahead_readb[1][offset]);
-           }}.concat();
-    }
-
-    // TODO: P2 should return TAGE-corrected prediction per branch.
-    // For now, return same as P1 (bimodal). P2 correction needs lane scrambling.
-    reuse_prediction(~(line_end() | last_pred()));
     return pred[num_branch];
   }
 
@@ -393,6 +335,7 @@ struct TageAheadV2 : predictor {
   void update_condbr(val<64> branch_pc, val<1> taken,
                      val<64> next_pc) override {
     assert(num_branch < N);
+    br_offset[num_branch] = branch_pc.fo1() >> 2;
     branch_dir[num_branch] = taken.fo1();
     num_branch++;
     // End block if we've used all N prediction slots or hit line boundary
@@ -400,16 +343,157 @@ struct TageAheadV2 : predictor {
   }
 
   void update_cycle(instruction_info &block_end_info) override {
-    // TODO:
-    // 1. No-branch early return (history update only)
-    // 2. Allocation candidates
-    // 3. Counter/hyst/u-bit updates (banked writes)
-    // 4. Bimodal updates
-    // 5. Meta update
-    // 6. U-bit epoch/decay
-    // 7. Per-branch history update (shift by num_branch)
-    // 8. Path update: path = XB + num_branch + ~last_condbr_dir
-    // 9. true_block update
-    (void)block_end_info;
+    val<1> &mispredict = block_end_info.is_mispredict;
+    val<64> &next_pc = block_end_info.next_pc;
+
+    // ---- 1. No-branch early return ----
+    if (num_branch == 0) {
+      // Per-branch history: shift by 0 branches = just inject next_pc
+      tage_folded_hists.update(val<PATHBITS>{next_pc.fo1() >> 2});
+      last_condbr_dir = 0;
+      true_block = 1;
+      return;
+    }
+
+    // ---- Fanout declarations ----
+    mispredict.fanout(hard<NUM_TABLES + 2>{});
+    val<1> correct_pred = ~mispredict;
+    correct_pred.fanout(hard<NUM_TABLES + 2>{});
+    tage_indexes.fanout(hard<4>{});
+    ahead_htag.fanout(hard<3>{});
+    readt.fanout(hard<4>{});
+    readc.fanout(hard<2>{});
+    readh.fanout(hard<3>{});
+    readu.fanout(hard<2>{});
+    match1.fanout(hard<3>{});
+    match2.fanout(hard<2>{});
+    tage_pred1.fanout(hard<2>{});
+    tage_pred2.fanout(hard<2 + NUM_TABLES>{});
+    branch_dir.fanout(hard<3>{});
+
+    last_condbr_dir = branch_dir[num_branch - 1];
+    last_condbr_dir.fanout(hard<N + 2>{});
+
+    // ---- Branch direction association (BR_P_ENTRY=1) ----
+    // Each table's entry has an offset in its tag identifying which branch it predicts.
+    // last_offset: lane of the last conditional branch (for allocation)
+    // We need branch_offset info — but update_condbr only saves direction, not offset.
+    // For now, use a simplified approach: all tables predict the last branch.
+    // TODO: save branch offsets in update_condbr for proper per-table association.
+    val<1> last_dir = branch_dir[num_branch - 1];
+    last_dir.fanout(hard<NUM_TABLES * 3>{});
+
+    // ---- Prediction correctness per table ----
+    arr<val<1>, NUM_TABLES> badpred1 = [&](u64 i) -> val<1> {
+      if constexpr (MAX_CTR_WIDTH == 1) {
+        return readc[i] != last_dir;
+      } else {
+        return val<1>{readc[i] >> hard<MAX_CTR_WIDTH - 1>{}} != last_dir;
+      }
+    };
+    badpred1.fanout(hard<3>{});
+
+    // Provider: which tables have a tag match (from predict2's match1)
+    // match1[0] is NUM_TABLES+1 bits (includes bimodal). Extract table bits only.
+    val<NUM_TABLES> primary_bits = match1[0] >> 1; // skip bimodal bit
+    primary_bits.fanout(hard<2>{});
+    arr<val<1>, NUM_TABLES> primary = primary_bits.make_array(val<1>{});
+    primary.fanout(hard<3>{});
+
+    // Weak hysteresis: primary provider with wrong prediction and weak counter
+    arr<val<1>, NUM_TABLES> g_weak = [&](u64 i) -> val<1> {
+      return primary[i] & badpred1[i] & (readh[i] == hard<0>{});
+    };
+    g_weak.fanout(hard<2>{});
+
+    // ---- Allocation (only on misprediction, only post-provider tables) ----
+    not_u_mask.fanout(hard<2>{});
+    val<NUM_TABLES> mispmask = mispredict.replicate(hard<NUM_TABLES>{}).concat();
+    // Find provider table, allocate only from tables with longer history
+    val<NUM_TABLES + 1> last_match1 = match1[0]; // provider one-hot from predict2
+    last_match1.fanout(hard<2>{});
+    val<NUM_TABLES> postmask = mispmask.fo1() & val<NUM_TABLES>(last_match1 - 1);
+    postmask.fanout(hard<2>{});
+    val<NUM_TABLES> candallocmask = postmask & not_u_mask;
+    candallocmask.fanout(hard<2>{});
+    val<NUM_TABLES> collamask = candallocmask.reverse();
+    collamask.fanout(hard<2>{});
+    val<NUM_TABLES> collamask1 = collamask.one_hot();
+    collamask1.fanout(hard<3>{});
+    val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
+    val<NUM_TABLES> collamask12 =
+        select(val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
+    arr<val<1>, NUM_TABLES> allocate =
+        collamask12.fo1().reverse().make_array(val<1>{});
+    allocate.fanout(hard<4>{});
+
+    // ---- need_extra_cycle ----
+    // Only when provider is wrong with weak hyst, or misprediction
+    val<1> some_g_weak = (g_weak.concat() != hard<0>{});
+    val<1> extra_cycle = some_g_weak.fo1() | mispredict;
+    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1>{});
+    need_extra_cycle(extra_cycle);
+
+    // ---- Bank for writes ----
+    val<LOGBANKS> raw_wbank = path;
+    val<1> write_bank_valid = (raw_wbank < hard<AHEAD_BANKS>{});
+    val<LOGBANKS> write_bank = select(write_bank_valid, raw_wbank, val<LOGBANKS>{0});
+    write_bank.fanout(hard<NUM_TABLES * 2>{});
+
+    // ---- Packed TAGE writes ----
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      // Counter update: toward actual direction
+      val<MAX_CTR_WIDTH> new_pred = select(allocate[i],
+          val<MAX_CTR_WIDTH>{last_dir},
+          update_ctr(readc[i], last_dir));
+
+      // Hysteresis: reset on allocate, update on primary
+      val<MAX_HYST_WIDTH> new_hyst = select(allocate[i],
+          val<MAX_HYST_WIDTH>{0},
+          update_ctr(readh[i], ~badpred1[i]));
+
+      // U-bit: clear on allocate, keep on update
+      val<MAX_U_WIDTH> new_u = select(allocate[i],
+          val<MAX_U_WIDTH>{0}, readu[i]);
+
+      // Tag: new on allocate (with offset 0 for now), keep on update
+      val<MAX_TAG_WIDTH> new_tag = select(allocate[i],
+          concat(val<LOG_FETCH_WIDTH>{0}, ahead_htag[i]),
+          readt[i]);
+
+      // Pack: [tag | pred | hyst | u]
+      val<ENTRY_BITS> new_entry = concat(
+          concat(new_tag, new_pred),
+          concat(new_hyst, new_u));
+      new_entry.fanout(hard<AHEAD_BANKS>{});
+
+      // Write gated by: (provider with wrong weak pred) OR (allocation)
+      execute_if(extra_cycle & (g_weak[i] | allocate[i]), [&]() {
+        static_loop<AHEAD_BANKS>([&]<u64 b>() {
+          execute_if(write_bank == hard<b>{}, [&]() {
+            tage_ram[i][b].write(val<MAX_IDX_BITS>{tage_indexes[i]},
+                                 new_entry);
+          });
+        });
+      });
+    }
+
+    // ---- Meta counter update (simplified) ----
+    if constexpr (bool(USE_META)) {
+      for (u64 i = METAPIPE - 1; i != 0; i--)
+        meta[i] = meta[i - 1];
+      // TODO: proper meta update based on primary vs alt correctness
+    }
+
+    // ---- Per-branch history update (shift by num_branch, not 1) ----
+    // This is the key improvement from gshareN_ahead_best.
+    // More accurate history = better TAGE correlation.
+    tage_folded_hists.update(val<PATHBITS>{next_pc.fo1() >> 2});
+    // TODO: shift by num_branch instead of 1 (requires custom fold update)
+
+    // ---- true_block update ----
+    true_block =
+        arr<val<1>, 4>{~mispredict, last_condbr_dir, last_pred(), line_end()}
+            .fold_or();
   }
 };
