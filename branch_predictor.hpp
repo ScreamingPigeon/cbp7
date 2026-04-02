@@ -1,5 +1,11 @@
 #include "predictors/always_taken.hpp"
 #include "predictors/bimodal.hpp"
+#include "predictors/bimodalN.hpp"
+#include "predictors/custom.hpp"
+#include "predictors/custom/Tage.hpp"
+#include "predictors/custom/LoopPredictorA.hpp"
+#include "predictors/custom/LoopPredictorC.hpp"
+#include "predictors/experiment_perceptron.hpp"
 #include "predictors/gshare.hpp"
 #include "predictors/never_taken.hpp"
 #include "predictors/perceptron.hpp"
@@ -10,6 +16,10 @@
 #include "predictors/tutorial/tutorial.hpp"
 #include "predictors/experiment_perceptron.hpp"
 #include "predictors/gshareN_loop.hpp"
+// NOTE: TageAhead pulls in TageConfig utilities that collide with
+// predictors/custom/Tage.hpp in this TU. Keep it out of the default
+// branch predictor include set unless specifically wiring an ahead predictor.
+// #include "predictors/custom/TageAhead.hpp"
 
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args>
