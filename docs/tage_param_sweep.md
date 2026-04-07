@@ -4,17 +4,23 @@
 
 ### SweepTableConfig (`Tage.hpp`)
 
-Parameterized table config for sweep use. 9 template params:
+Parameterized table config for sweep use. 12 template params:
 
 ```cpp
 template <u64 N = 8, u64 SIZE = 2048, u64 TAG = 11,
           u64 CTR = 1, u64 HYST = 2, u64 U = 1,
-          u64 MINH = 2, u64 MAXH = 100, u64 SIZE_RATIO = 1>
+          u64 MINH = 2, u64 MAXH = 100, u64 SIZE_RATIO = 1,
+          HistSeries HIST = HistSeries::GEOMETRIC,
+          typename TagFn = UniformTag<TAG>,
+          typename SizeFn = GeoSize<SIZE, SIZE_RATIO>>
 struct SweepTableConfig;
 ```
 
-- Defaults match `DefaultTableConfig` exactly (verified by `static_assert`)
 - `SIZE_RATIO > 1` enables geometric table size scaling (long-history tables smaller, short-history larger)
+- `HIST`: history series — GEOMETRIC (default), QUADRATIC, SUPEREXP, ROS
+- `TagFn`: per-table tag width functor — UniformTag (default), GradedTag, StepTag, LogTag
+- `SizeFn`: per-table size functor — GeoSize (default), UniformSize, StepSize, SqrtHistSize, ConstBitsSize
+- Also available: 7 allocation configs (DefaultAllocConfig, Alloc2Config, etc.) with PROB_START, CONF_GATE, NON_CONSECUTIVE, PARTIAL_UPDATE
 - Generates predictor strings like: `Tage<SweepTableConfig<8,1024,10,1,2,1,3,130,1>, DefaultAllocConfig, 16, 8192, ...>`
 
 ### Sweep Script (`scripts/tage_sweep.py`)

@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean
 
 all: cbp reference
 
@@ -50,6 +50,8 @@ help:
 	@echo "  make run-trace-analyze          Run trace analyzer on TRACE"
 	@echo "  make block-analyze              Build block analyzer for ahead banking"
 	@echo "  make run-block-analyze          Run block analyzer (BLOCK_FW, BLOCK_BANKS, BLOCK_INSTR)"
+	@echo "  make ahead-block-analyze        Build ahead block analyzer (N-capped blocks, secondary tag)"
+	@echo "  make run-ahead-block-analyze    Run ahead analyzer (AHEAD_LINEINST, AHEAD_N, AHEAD_BANKS, AHEAD_INSTR)"
 	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
 	@echo "  make save                   Bookmark current cbp binary (SAVE_NAME=label)"
 	@echo "  make list-saved             List bookmarked binaries"
@@ -100,6 +102,18 @@ BLOCK_BANKS ?= 8
 BLOCK_INSTR ?= 0
 run-block-analyze: $(BUILD_DIR)/block-analyze | out
 	./$(BUILD_DIR)/block-analyze $(TRACE) $(BLOCK_FW) $(BLOCK_BANKS) $(BLOCK_INSTR) | tee out/block_analysis.txt
+
+$(BUILD_DIR)/ahead-block-analyze: trace_files/ahead_block_analyzer.cpp trace_files/trace_reader.hpp | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) -Wall -Wextra -Itrace_files -o $@ trace_files/ahead_block_analyzer.cpp -lz
+
+ahead-block-analyze: $(BUILD_DIR)/ahead-block-analyze
+
+AHEAD_LINEINST ?= 64
+AHEAD_N ?= 7
+AHEAD_BANKS ?= 8
+AHEAD_INSTR ?= 0
+run-ahead-block-analyze: $(BUILD_DIR)/ahead-block-analyze | out
+	./$(BUILD_DIR)/ahead-block-analyze $(TRACE) $(AHEAD_LINEINST) $(AHEAD_N) $(AHEAD_BANKS) $(AHEAD_INSTR) | tee out/ahead_block_analysis.txt
 
 run-cbp: $(BUILD_DIR)/cbp
 	./$(BUILD_DIR)/cbp $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)
@@ -231,6 +245,7 @@ list-saved:
 
 clean:
 	rm -f $(BUILD_DIR)/cbp $(BUILD_DIR)/reference $(BUILD_DIR)/trace-analyze
+	rm -f $(BUILD_DIR)/block-analyze $(BUILD_DIR)/ahead-block-analyze
 	rm -f $(BUILD_DIR)/cbp-profile $(BUILD_DIR)/cbp-monitor
 	rm -f $(BUILD_DIR)/test-tage-compile $(BUILD_DIR)/quick_a $(BUILD_DIR)/quick_b
 	rm -f $(PREDICTOR_MK)

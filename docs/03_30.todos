@@ -1,13 +1,12 @@
 ● Plan by Problem Area                                                                                                                                                          
                                                                                                                                                                                 
-  A. Statistical Corrector (SC) — Highest Priority, Currently Broken                                                                                                            
-   
-  The SC is the single biggest lever but is VFS-negative due to training issues.                                                                                                
-                  
-  1. Fix SC training — Current tage_correct approach causes weight saturation and cross-workload regression. Needs: proper centering (TAGE vote in sum), dynamic PC-indexed     
+  A. Statistical Corrector (SC) — Highest Priority
+
+  SC now has 3 bias + 4 GEHL tables. Training issues partially addressed.
+
+  1. Fix SC training — Current tage_correct approach causes weight saturation and cross-workload regression. Needs: proper centering (TAGE vote in sum), dynamic PC-indexed
   thresholds (32 entries), selective training gate (train when mispred OR |sum| <= threshold + margin)
-  2. Add GEHL tables — Currently bias-only (PC-indexed). Need 2-4 history-correlated GEHL tables with geometric history lengths. This is the expected biggest SC improvement    
-  (6-8% mispred reduction)                                                                                                                                                      
+  2. GEHL tables — DONE (4 GEHL tables with geometric history lengths 4-64, 512 entries each)                                                                                                                                                      
   3. Reduce extra cycle overhead — SC forces extra_cycle every block with branches (770K extra cycles on gcc). Only force when SC actually overrode, not every block
   4. TAGE-SC chooser — Use TAGE confidence (newly_alloc, provider depth) to gate SC overrides. When TAGE is high-confidence and SC is low-confidence, trust TAGE                
   5. IMLI (Priority 2) — Inner-most loop iteration counter as an SC component                                                                                                   
@@ -18,9 +17,10 @@
     
   Incremental accuracy improvements to the base predictor.                                                                                                                      
     
-  1. History length series — Replace geometric with quadratic + super-exponential (Ros/RUNLTS). Expected to simplify design and improve accuracy                                
-  2. Multi-entry allocation (NNN=2) — Allocate 2 entries per misprediction instead of 1
-  3. u-bit confidence gating — Only evict entries with u=0 AND low counter confidence (|2*ctr+1| < 5). Nearly closes gap between 1-bit and 2-bit u                              
+  1. History length series — DONE (QUADRATIC, SUPEREXP, ROS in SweepTableConfig). Result: no VFS improvement over GEOMETRIC on 8 tables.
+  2. Multi-entry allocation (NNN=2) — DONE (Alloc2Config, Alloc2NCConfig). Result: hurt gcc, no multi-trace win.
+  3. u-bit confidence gating — DONE (AllocConfGateConfig). Result: no effect with CTR_WIDTH=1.
+  Also implemented: probabilistic start (AllocProbStartConfig), partial update (PartialUpdateConfig), silent update elimination, per-table tag widths (GradedTag, StepTag, LogTag).                              
   4. Alt prediction improvements — Extended alt selection (ctr=0 OR ctr=1), 256-entry chooser indexed by hit_bank_chunk/alt_confidence/etc                                      
   5. Larger bimodal for web/JS traces (currently 4096, RUNLTS uses 128K)                                                                                                        
   6. Thrashing detection (RUNLTS) — Dynamically throttle allocation rate, zero extra storage                                                                                    
@@ -48,14 +48,15 @@
     
   Not worth pursuing unless fundamentals change.                                                                                                                                
     
-  - Ahead mode — Complete but VFS-negative. Only revisit if P2 drops below 1.0                                                                                                  
+  - Ahead mode — Old implementations deleted (2026-04-02). New design planned as separate predictor (see 04_02_ahead_arch.md).                                                                                                  
   - Register-value-aware SC (RUNLTS) — Requires register state visibility, unclear if allowed
   - Mini-BranchNet (CNN-based) — 4-cycle latency, exotic                                                                                                                        
   - Branch precomputation — Requires separate thread, out of scope                                                                                                              
                                                                                                                                                                                 
   Recommended Execution Order                                                                                                                                                   
                                                                                                                                                                                 
-  Phase 1: Fix SC (A1-A4) — unblocks the biggest feature                                                                                                                        
-  Phase 2: TAGE accuracy (B1-B3) + overrider coordination (C1-C2) — incremental gains, low risk
-  Phase 3: Sweep combined config on 20 traces — find VFS-optimal point                                                                                                          
-  Phase 4: Energy/latency (D1-D2) if there's headroom, BR_P_ENTRY>1 (D4) if time permits  
+  Phase 1: Fix SC (A1, A3-A4) — unblocks the biggest feature (A2 GEHL done)
+  Phase 2: TAGE accuracy (B4-B6) + overrider coordination (C1-C2) — incremental gains, low risk (B1-B3 done)
+  Phase 3: Sweep combined config on 20 traces — find VFS-optimal point
+  Phase 4: Ahead TAGE (new separate predictor) — biggest VFS lever (P2 ceil 2->1)
+  Phase 5: Energy/latency (D1-D2) if there's headroom, BR_P_ENTRY>1 (D4) if time permits  

@@ -67,7 +67,6 @@ template <
     u64 U_WIDTH = 1,         // useful counter width
     u64 N = 4,               // max branches per cycle = predictions per block
     u64 NUM_BANKS = 1,       // branch-slot banks; BPB = N / NUM_BANKS
-    bool USE_AHEAD = false,  // 1-ahead pipelining; doubles physical banks
     bool SHARED_TAG = true,  // share one tag across branch-slot banks
     bool SHARED_U = true,    // share one u-bit across branch-slot banks
     bool SHARED_HYS = true,  // share one hysteresis across BPB slots in a bank
@@ -91,7 +90,6 @@ public:
   static constexpr u64 u_width = U_WIDTH;
   static constexpr u64 n_branches = N;
   static constexpr u64 num_banks = NUM_BANKS;
-  static constexpr bool use_ahead = USE_AHEAD;
   static constexpr bool shared_tag = SHARED_TAG;
   static constexpr bool shared_u = SHARED_U;
   static constexpr bool shared_hys = SHARED_HYS;
@@ -101,8 +99,7 @@ public:
   // ======== Computed Constants ========
 
   static constexpr u64 BPB = bpb;
-  static constexpr u64 AHEAD_FACTOR = USE_AHEAD ? 2 : 1;
-  static constexpr u64 PHYS_BANKS = NUM_BANKS * AHEAD_FACTOR;
+  static constexpr u64 PHYS_BANKS = NUM_BANKS;
   static constexpr u64 IDX_BITS = clog2(TABLE_SIZE);
 
   // Internal banking factor for rwram instances (matches reference)
@@ -115,9 +112,9 @@ public:
   static constexpr u64 HYST_ENTRY_BITS = SHARED_HYS ? HYST_WIDTH : BPB * HYST_WIDTH;
 
   // RAM instance counts (controlled by sharing params)
-  static constexpr u64 TAG_RAM_COUNT = SHARED_TAG ? AHEAD_FACTOR : PHYS_BANKS;
+  static constexpr u64 TAG_RAM_COUNT = SHARED_TAG ? 1 : PHYS_BANKS;
   static constexpr u64 HYST_RAM_COUNT = PHYS_BANKS; // always per-bank
-  static constexpr u64 U_STORAGE_COUNT = SHARED_U ? AHEAD_FACTOR : PHYS_BANKS;
+  static constexpr u64 U_STORAGE_COUNT = SHARED_U ? 1 : PHYS_BANKS;
 
   // Result register counts (depends on sharing mode)
   static constexpr u64 TAG_REG_COUNT = SHARED_TAG ? 1 : NUM_BANKS;

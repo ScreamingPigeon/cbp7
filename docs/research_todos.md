@@ -15,21 +15,21 @@ Ahead Prediction, Alt-Fetch, Omnipredictor, BranchNet, Branch Precomputation, Vi
 - **Expected: 6-8% misprediction reduction.** [CBP2016, Deep Dive]
 
 ### History Length Series — Quadratic + Super-Exponential
-- Replace geometric series with: h_n = h_{n-1} + d*(n-1) + k for n < t; h_n = round(h_{n-1} * (f*(n-t+1) + m)) for n >= t.
+- **IMPLEMENTED** in SweepTableConfig: `HistSeries::QUADRATIC`, `SUPEREXP`, `ROS`
 - Ros: h1=2, d=2, k=1, f=0.1, m=1.1, t=15. Eliminates need for set-associative tables.
-- RUNLTS: 0, 6, 14, 24, 36, 50, 66, 84, 104, 126, 150, 178, 212, 252, 300, 358, 426, 506, 602, 776, 1078, 1606, 2554, 4316.
-- **Expected: slight MPKI reduction, simplifies design (direct-mapped only).** [Deep Dive, RUNLTS]
+- **Result: QUAD/ROS never beat GEOMETRIC (within 0.002 VFS) on our 8-table design.**
+- May help with more tables (16+). [Deep Dive, RUNLTS]
 
 ### Multi-Entry Allocation (NNN=2)
-- Allocate 2 entries per misprediction instead of 1. More aggressive table filling.
-- Current: MAX_ALLOC=1 in DefaultAllocConfig.
-- **Expected: noticeable improvement at larger predictor sizes.** [CBP2016, RUNLTS]
+- **IMPLEMENTED** in allocation configs: `Alloc2Config`, `Alloc2NCConfig`
+- Also: probabilistic start (`AllocProbStartConfig`), partial update (`PartialUpdateConfig`)
+- **Result: All variants worse than baseline on multi-trace eval.** Hurt gcc (pollution).
+- May help traces with smaller working sets. [CBP2016, RUNLTS]
 
 ### u-bit Confidence Gating
-- Only replace entries with u=0 AND |2*ctr+1| < 5.
-- If u=0 but counter is high-confidence, decrease |2*ctr+1| instead of evicting.
-- Nearly closes gap between 1-bit and 2-bit u.
-- **Expected: better entry retention, fewer useful evictions.** [CBP2016]
+- **IMPLEMENTED** in `AllocConfGateConfig` (CONF_GATE=true)
+- Only replace entries with u=0 AND weak counter.
+- **Result: No improvement with CTR_WIDTH=1 (1-bit counters always "weak").** [CBP2016]
 
 ### Skip TAGE Allocation on Loop Hits
 - When loop predictor is selected as provider and prediction is correct, bypass TAGE allocation.

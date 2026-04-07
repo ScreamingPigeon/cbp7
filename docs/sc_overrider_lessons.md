@@ -15,11 +15,11 @@ A Statistical Corrector (SC) overrider was implemented following Seznec's TAGE-S
 - **Training direction**: `update_ctr(weight, tage_correct)` — weights learn whether TAGE was right/wrong
 - **Override decision**: `candidate = (sum < 0) & (|sum| > threshold)`, prediction = `~tage_pred`
 
-### Template Parameters
+### Template Parameters (current defaults)
 ```
-NUM_BIAS=3, BIAS_LOG=8, SC_CTR_BITS=6, FETCH_WIDTH=16,
-NUM_GEHL=4, GEHL_LOG=9, GEHL_MINH=4, GEHL_MAXH=64,
-THRESH_INIT=200, THRESH_MARGIN=4
+SCOverrider<NUM_BIAS=3, BIAS_LOG=8, SC_CTR_BITS=6, FETCH_WIDTH=16,
+            NUM_GEHL=4, GEHL_LOG=9, GEHL_MINH=4, GEHL_MAXH=64,
+            THRESH_INIT=200, THRESH_MARGIN=4>
 ```
 
 ## HARCOM Constraints Discovered

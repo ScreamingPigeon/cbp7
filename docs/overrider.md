@@ -161,9 +161,9 @@ Print stats by having TageImpl copy `overrider.stats` fields to TageMonitor.
 ## Existing Overriders
 
 ### SCOverrider (predictors/custom/SCOverrider.hpp)
-- 3 bias tables, 256 entries × 6-bit signed counters, PC-indexed
-- Prediction = sign(sum of weights). Confidence = |sum| > SC_CONF_THRESH.
-- Template: `SCOverrider<BIAS_LOG=8, SC_CTR_BITS=6, FETCH_WIDTH=16, SC_CONF_THRESH=4>`
+- 3 bias tables (ram<>, 256 entries × 6-bit signed) + 4 GEHL tables (ram<>, 512 entries × 6-bit)
+- Prediction = sign(sum of weights). Confidence = |sum| > threshold.
+- Template: `SCOverrider<NUM_BIAS=3, BIAS_LOG=8, SC_CTR_BITS=6, FETCH_WIDTH=16, NUM_GEHL=4, GEHL_LOG=9, GEHL_MINH=4, GEHL_MAXH=64, THRESH_INIT=200, THRESH_MARGIN=4>`
 - On gcc: 4.31% mispred (vs 5.08% without SC). 11:1 correct/wrong ratio.
 
 ### LoopPredictorA (predictors/custom/LoopPredictorA.hpp)

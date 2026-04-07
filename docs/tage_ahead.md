@@ -1,3 +1,6 @@
+  NOTE: This describes the FIRST ahead attempt (TageAhead.hpp). That implementation
+  has been DELETED (2026-04-02). See 04_02_ahead_arch.md for the new design.
+
   P1: Direct gshare. Not banked, not ahead. Same as Tage.hpp. P1 latency = 0.957.
                                                                                                                                                   
   P2 TAGE: Predecessor-indexed, 1-block ahead.     
