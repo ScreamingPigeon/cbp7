@@ -236,6 +236,20 @@ template <u64 SIZE, u64 RATIO> struct GeoSize {
   }
 };
 
+template <u64 SIZE, u64 RATIO> struct InvGeoSize {
+  constexpr u64 operator()(u64 i, u64 n) const {
+    if (RATIO <= 1 || n <= 1)
+      return SIZE;
+    double t = double(n - 1 - i) / double(n - 1);
+    double scale = constexpr_pow(double(RATIO), t - 0.5);
+    u64 sz = u64(SIZE * scale);
+    u64 result = 64;
+    while (result < sz)
+      result *= 2;
+    return result;
+  }
+};
+
 template <u64 S_HI, u64 S_LO, u64 SPLIT> struct StepSize {
   constexpr u64 operator()(u64 i, u64) const {
     return (i < SPLIT) ? S_HI : S_LO;
@@ -705,7 +719,7 @@ struct TageDirectImpl : predictor {
   static constexpr u64 P1_ENTRIES = P1_TABLE_SIZE_V;
   static constexpr u64 P1_INDEX_BITS = td::clog2(P1_TABLE_SIZE_V);
   static constexpr u64 LINEADDR_BITS = MAX_IDX_BITS;
-  static constexpr u64 UCTRBITS = 8;
+  static constexpr u64 UCTRBITS = 7;
   static constexpr u64 PATHBITS = PATH_BITS_V;
 
   static constexpr bool USE_PROB_DECAY = (DECAY_CTR_V > 0);
@@ -1562,6 +1576,9 @@ struct TageDirectImpl : predictor {
       val<DECAY_CTR_V> lfsr = val<DECAY_CTR_V>{static_cast<u64>(std::rand())};
       val<1> decay_fire = (lfsr > val<DECAY_CTR_V>{decay_threshold});
       decay_fire.fanout(hard<NUM_TABLES>{});
+#ifdef TAGE_MONITOR
+      if (static_cast<u64>(decay_fire)) mon.record_decay_fire();
+#endif
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I] & ~decay_fire;
         val<1> u_changed = (val<1>{readu[I]} != newu);
@@ -1686,18 +1703,22 @@ struct TageDirectImpl : predictor {
 // User-facing Alias
 // ============================================================================
 
-template <typename TableCfg = td::TDTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
-          typename AllocCfg = td::TDDefaultAllocConfig, u64 TD_LINEINST = 1024,
-          u64 TD_N = 7, bool TD_SHARED_TAG = true, bool TD_SHARED_U = true,
-          bool TD_SHARED_HYS = true, bool TD_U_STOR_FF = false,
-          u64 TD_DECAY_CTR = 8, u64 TD_DECAY_GRAN = 2,
-          typename TD_DECAY_POLICY = td::TDDecayMild,
-          bool TD_P1_USE_GSHARE = true, u64 TD_P1_TABLE_SIZE = 4096,
-          u64 TD_P1_HIST = 6, bool TD_USE_META = true, u64 TD_METABITS = 4,
-          u64 TD_METAPIPE = 2, bool TD_USE_PATH_HIST = false,
-          u64 TD_PATH_HIST_WIDTH = 27, u64 TD_PATH_BITS = 6,
-          template <u64> class TD_FOLD_FN = td::XORFold,
-          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0>
+template <typename TableCfg = td::TDTableConfig<8, 2048, 11, 1, 2, 1, 16, 400, 4>, // NOTE: @modify <NTABLES, BASE_SIZE, TAG, CTR, HYST, U, MINH, MAXH, SIZE_RATIO>
+          typename AllocCfg = td::TDDefaultAllocConfig, // NOTE: @modify allocation policy
+          u64 TD_LINEINST = 1024,  // NOTE: @modify max instructions per line
+          u64 TD_N = 7,            // NOTE: @modify max branches per block
+          bool TD_SHARED_TAG = true, bool TD_SHARED_U = true,   // NOTE: @modify sharing
+          bool TD_SHARED_HYS = true, bool TD_U_STOR_FF = false, // NOTE: @modify sharing/storage
+          u64 TD_DECAY_CTR = 0, u64 TD_DECAY_GRAN = 2,          // NOTE: @modify decay timing (0=epoch reset, >0=prob decay)
+          typename TD_DECAY_POLICY = td::TDDecayMild,            // NOTE: @modify decay policy
+          bool TD_P1_USE_GSHARE = true, u64 TD_P1_TABLE_SIZE = 4096, // NOTE: @modify P1 gshare
+          u64 TD_P1_HIST = 6,          // NOTE: @modify P1 history length
+          bool TD_USE_META = true, u64 TD_METABITS = 4,  // NOTE: @modify meta predictor
+          u64 TD_METAPIPE = 2,         // NOTE: @modify meta pipeline depth
+          bool TD_USE_PATH_HIST = false,                  // NOTE: @modify path history
+          u64 TD_PATH_HIST_WIDTH = 27, u64 TD_PATH_BITS = 6, // NOTE: @modify path params
+          template <u64> class TD_FOLD_FN = td::XORFold,  // NOTE: @modify fold function
+          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0> // NOTE: @modify rwram banking
 
 using TageDirect =
     TageDirectImpl<TableCfg, AllocCfg, TD_LINEINST, TD_N, TD_SHARED_TAG,
