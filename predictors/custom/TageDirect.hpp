@@ -3,7 +3,7 @@
 #include "../../cbp.hpp"
 #include "../../harcom.hpp"
 #ifdef TAGE_MONITOR
-#include "TageMonitor.hpp"
+#include "TDMonitor.hpp"
 #endif
 
 using namespace hcm;
@@ -471,11 +471,169 @@ struct TDHistoryFolder {
 };
 
 // ============================================================================
-// TAGE Table Storage — simple struct with plain ram<> members
+// Banked RAM wrapper — rwram with configurable bank index bits
 // ============================================================================
+//
+// Like common.hpp's rwram but lets you choose which address bits select the
+// bank. BANK_SHIFT=0 uses the low bits (same as rwram). BANK_SHIFT=K uses
+// bits [K, K+log2(B)) as the bank ID.
+//
+// Template params:
+//   N = data width in bits
+//   M = total entries (power of 2)
+//   B = number of banks (power of 2, >= 2)
+//   BANK_SHIFT = which bit position starts the bank selection (default 0)
+
+template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0>
+struct td_rwram {
+  static_assert(std::has_single_bit(M));
+  static_assert(B >= 2 && B <= 64);
+  static_assert(std::has_single_bit(B));
+  static constexpr u64 A = std::bit_width(M - 1);     // address bits
+  static constexpr u64 E = M / B;                      // entries per bank
+  static_assert(E > 1);
+  static constexpr u64 L = std::bit_width(E - 1);      // local address bits
+  static constexpr u64 BANK_BITS = std::bit_width(B - 1); // bank ID bits
+  static_assert(A == L + BANK_BITS);
+  static_assert(BANK_SHIFT + BANK_BITS <= A);
+
+  hcm::ram<val<N>, E> bank[B];
+  reg<B> read_bank;
+
+  // buffered write
+  reg<B> write_bank;
+  reg<L> write_localaddr;
+  reg<N> write_data;
+
+  td_rwram(const char *label = "") : bank{label} {}
+
+  // Extract bank ID and local address from a full address.
+  // With BANK_SHIFT=0: addr = [local_hi | bankid | local_lo] where local_lo
+  // is empty. With BANK_SHIFT=K: bankid = addr[K +: BANK_BITS], local =
+  // remaining bits concatenated.
+  auto split_addr(val<A> addr) {
+    if constexpr (BANK_SHIFT == 0) {
+      // Low bits = bank ID (same as reference rwram)
+      return hcm::split<L, BANK_BITS>(addr);
+    } else if constexpr (BANK_SHIFT + BANK_BITS == A) {
+      // High bits = bank ID
+      return std::pair{val<L>{addr}, val<BANK_BITS>{addr >> BANK_SHIFT}};
+    } else {
+      // Middle bits = bank ID: extract and reconstruct local addr
+      val<BANK_SHIFT> lo = addr;
+      val<BANK_BITS> bankid = addr >> BANK_SHIFT;
+      val<A - BANK_SHIFT - BANK_BITS> hi = addr >> (BANK_SHIFT + BANK_BITS);
+      val<L> localaddr = concat(lo, hi);
+      return std::pair{localaddr, bankid};
+    }
+  }
+
+  val<N> read(val<A> addr) {
+    auto [localaddr, bankid] = split_addr(addr.fo1());
+    localaddr.fanout(hard<B>{});
+    arr<val<1>, B> banksel = bankid.fo1().decode();
+    banksel.fanout(hard<2>{});
+    arr<val<N>, B> data = [&](u64 i) -> val<N> {
+      return execute_if(banksel[i], [&]() { return bank[i].read(localaddr); });
+    };
+    read_bank = banksel.concat();
+    return data.fo1().fold_or();
+  }
+
+  void write(val<A> addr, val<N> data, val<1> noconflict) {
+    // noconflict=1: no read this cycle, write immediately.
+    // noconflict=0: buffer write, flush when bank is free.
+    auto [localaddr, bankid] = split_addr(addr.fo1());
+    data.fanout(hard<B + 1>{});
+    noconflict.fanout(hard<B + 2>{});
+    val<B> banksel = bankid.fo1().decode().concat();
+    banksel.fanout(hard<2>{});
+    val<B> noconflict_mask = noconflict.replicate(hard<B>{}).concat();
+    noconflict_mask.fanout(hard<2>{});
+    val<B> current_write = banksel & noconflict_mask;
+    current_write.fanout(hard<3>{});
+    arr<val<1>, B> current_write_split = current_write.make_array(val<1>{});
+    current_write_split.fanout(hard<3>{});
+    arr<val<1>, B> write_bank_split = write_bank.make_array(val<1>{});
+    arr<val<1>, B> read_bank_split = read_bank.make_array(val<1>{});
+    for (u64 i = 0; i < B; i++) {
+      execute_if(
+          current_write_split[i] |
+              (write_bank_split[i].fo1() & ~read_bank_split[i].fo1()),
+          [&]() {
+            val<L> a =
+                select(current_write_split[i], localaddr, write_localaddr);
+            val<N> d = select(current_write_split[i], data, write_data);
+            bank[i].write(a.fo1(), d.fo1());
+          });
+    }
+    // buffer the current write if not done
+    val<1> buffered_done =
+        (write_bank & (current_write | read_bank)) == hard<0>{};
+    execute_if(buffered_done.fo1() | ~noconflict, [&]() {
+      write_bank = banksel & ~noconflict_mask;
+      execute_if(~noconflict, [&]() {
+        write_localaddr = localaddr;
+        write_data = data;
+      });
+    });
+  }
+
+  void reset() {
+    for (u64 i = 0; i < B; i++)
+      bank[i].reset();
+  }
+
+#ifdef TD_VERBOSE
+  void debug_read_info(const char *name, u64 table_idx, val<A> addr) {
+    u64 a = static_cast<u64>(addr);
+    u64 bid = (a >> BANK_SHIFT) & (B - 1);
+    u64 wb = static_cast<u64>(write_bank);
+    std::cerr << "  " << name << "[" << table_idx << "] addr=" << a
+              << " bank=" << bid;
+    if ((wb >> bid) & 1)
+      std::cerr << " (pending-write in bank)";
+    std::cerr << "\n";
+  }
+
+  // Debug: extract bank ID from address and report conflict with read_bank.
+  void debug_write_info(const char *name, u64 table_idx, val<A> addr,
+                        val<1> noconflict) {
+    u64 a = static_cast<u64>(addr);
+    u64 bid = (a >> BANK_SHIFT) & (B - 1);
+    u64 rb = static_cast<u64>(read_bank);
+    u64 wb = static_cast<u64>(write_bank);
+    bool read_conflict = (rb >> bid) & 1;
+    bool write_buffered = !static_cast<u64>(noconflict);
+    std::cerr << "  " << name << "[" << table_idx << "] addr=" << a
+              << " bank=" << bid;
+    if (write_buffered)
+      std::cerr << " BUFFERED";
+    else
+      std::cerr << " DIRECT";
+    if (read_conflict && write_buffered)
+      std::cerr << " (read-conflict)";
+    if (wb)
+      std::cerr << " (pending_wb=0x" << std::hex << wb << std::dec << ")";
+    std::cerr << "\n";
+  }
+#endif
+};
+
+// ============================================================================
+// TAGE Table Storage — tag/pred use plain ram<>, hyst/u use td_rwram
+// ============================================================================
+//
+// tag_ram, pred_ram: plain ram<>. Writes are gated by conditions that imply
+// extra_cycle (allocate ⊆ mispredict, g_weak ⊆ some_badpred1), so they
+// never conflict with P2 reads.
+//
+// hyst_ram, u_ram: td_rwram with B banks. Can read+write same cycle via
+// banking. Write takes a noconflict bit (= extra_cycle) following the
+// reference tage.hpp pattern.
 
 template <u64 TABLE_SIZE, u64 TAG_WIDTH, u64 CTR_WIDTH, u64 HYST_WIDTH,
-          u64 U_WIDTH>
+          u64 U_WIDTH, u64 RWRAM_BANKS = 4, u64 RWRAM_BANK_SHIFT = 0>
 struct TDTable {
   static constexpr u64 IDX_BITS = td::clog2(TABLE_SIZE);
   static constexpr u64 table_size = TABLE_SIZE;
@@ -484,24 +642,31 @@ struct TDTable {
   static constexpr u64 hyst_width = HYST_WIDTH;
   static constexpr u64 u_width = U_WIDTH;
 
+  static_assert(TABLE_SIZE >= 2 * RWRAM_BANKS,
+                "TABLE_SIZE must be >= 2*RWRAM_BANKS for td_rwram");
+
   hcm::ram<val<TAG_WIDTH>, TABLE_SIZE> tag_ram{"td_tag"};
   hcm::ram<val<CTR_WIDTH>, TABLE_SIZE> pred_ram{"td_pred"};
-  hcm::ram<val<std::max(u64(1), HYST_WIDTH)>, TABLE_SIZE> hyst_ram{"td_hyst"};
-  hcm::ram<val<U_WIDTH>, TABLE_SIZE> u_ram{"td_u"};
+  td_rwram<std::max(u64(1), HYST_WIDTH), TABLE_SIZE, RWRAM_BANKS,
+           RWRAM_BANK_SHIFT>
+      hyst_ram{"td_hyst"};
+  td_rwram<U_WIDTH, TABLE_SIZE, RWRAM_BANKS, RWRAM_BANK_SHIFT>
+      u_ram{"td_u"};
 };
 
 // Generate a TDTable type from config arrays at index I
-template <typename Cfg, u64 I>
+template <typename Cfg, u64 I, u64 BANKS, u64 BSHIFT>
 using TDTableAt =
     TDTable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::CTR_WIDTH[I],
-            Cfg::HYST_WIDTH[I], Cfg::U_WIDTH[I]>;
+            Cfg::HYST_WIDTH[I], Cfg::U_WIDTH[I], BANKS, BSHIFT>;
 
 // Build a tuple of TDTable types
-template <typename Cfg, typename Seq> struct TDMakeTableTuple;
+template <typename Cfg, u64 BANKS, u64 BSHIFT, typename Seq>
+struct TDMakeTableTuple;
 
-template <typename Cfg, u64... Is>
-struct TDMakeTableTuple<Cfg, std::index_sequence<Is...>> {
-  using type = std::tuple<TDTableAt<Cfg, Is>...>;
+template <typename Cfg, u64 BANKS, u64 BSHIFT, u64... Is>
+struct TDMakeTableTuple<Cfg, BANKS, BSHIFT, std::index_sequence<Is...>> {
+  using type = std::tuple<TDTableAt<Cfg, Is, BANKS, BSHIFT>...>;
 };
 
 } // namespace td
@@ -516,7 +681,8 @@ template <typename TableCfg, typename AllocCfg, u64 LINEINST_V, u64 N_V,
           typename DecayPolicy_V, bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V,
           u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
           bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V,
-          template <u64> class FoldFn_V>
+          template <u64> class FoldFn_V,
+          u64 RWRAM_BANKS_V = 4, u64 RWRAM_BANK_SHIFT_V = 0>
 struct TageDirectImpl : predictor {
 
   // ======== Constants ========
@@ -546,7 +712,7 @@ struct TageDirectImpl : predictor {
 
   // ---- Table tuple type ----
   using Tables =
-      typename td::TDMakeTableTuple<TableCfg,
+      typename td::TDMakeTableTuple<TableCfg, RWRAM_BANKS_V, RWRAM_BANK_SHIFT_V,
                                     std::make_index_sequence<NUM_TABLES>>::type;
 
   // Truncate gindex to per-table IDX_BITS
@@ -620,15 +786,24 @@ struct TageDirectImpl : predictor {
   u64 num_branch = 0;
   u64 block_size = 0;
   arr<reg<1>, LANES> branch_dir;
-  reg<N + 1> rank;  // one-hot: rank of current branch in block (gshareN_ahead pattern)
+  reg<N + 1>
+      rank; // one-hot: rank of current branch in block (gshareN_ahead pattern)
 
   // P1 storage
   hcm::ram<val<LANES>, P1_ENTRIES> p1_pred{"P1 pred"};
   zone UPDATE_ONLY;
-  hcm::ram<val<1>, P1_ENTRIES> p1_hyst[LANES]{"P1 hyst"};
+  hcm::ram<val<1>, P1_ENTRIES> p1_hyst[N]{"P1 hyst"};
 
   // TAGE tables
   Tables tables;
+
+#ifdef TAGE_MONITOR
+  TDMonitor<NUM_TABLES, LANES, P1_ENTRIES, RWRAM_BANKS_V> mon;
+  // Shadow state for meta tracking (set in predict2, read in update_cycle)
+  std::array<bool, LANES> mon_altsel{};     // meta chose alt for this rank
+  std::array<bool, LANES> mon_meta_active{}; // meta override was active
+  ~TageDirectImpl() { mon.print_summary(); }
+#endif
 
   bool params_printed = false;
 
@@ -713,7 +888,9 @@ struct TageDirectImpl : predictor {
       } else {
         index1 = lineaddr;
       }
+#ifdef TD_VERBOSE
       std::cerr << "P1: gshare p1_pred READ\n";
+#endif
       unordered_pred1 = p1_pred.read(index1);
     });
 
@@ -736,14 +913,7 @@ struct TageDirectImpl : predictor {
     return pred[num_branch];
   }
 
-  val<1> predict2([[maybe_unused]] val<64> inst_pc) override {
-    // TAGE disabled — return not-taken
-    std::cerr << "P2: STUB (not-taken)\n";
-    p2 = hard<0>{};
-    p2.fanout(hard<LANES>{});
-    reuse_prediction(~val<1>{block_entry >> (LINEINST - 1)});
-    return hard<0>{};
-#if 0  // --- TAGE P2 disabled ---
+  val<1> predict2(val<64> inst_pc) override {
     val<LINEADDR_BITS> lineaddr = inst_pc >> 2;
     lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
     gfolds.fanout(hard<2>{});
@@ -762,16 +932,30 @@ struct TageDirectImpl : predictor {
     // Read TAGE tables
     static_loop<NUM_TABLES>([&]<u64 I>() {
       auto &t = std::get<I>(tables);
+#ifdef TD_VERBOSE
       std::cerr << "P2: tage tag_ram[" << I << "] READ\n";
+#endif
       readt[I] = t.tag_ram.read(tidx<I>(gindex[I]));
+#ifdef TD_VERBOSE
       std::cerr << "P2: tage pred_ram[" << I << "] READ\n";
+#endif
       readc[I] = t.pred_ram.read(tidx<I>(gindex[I]));
       if constexpr (MAX_HYST_WIDTH > 0) {
-        std::cerr << "P2: tage hyst_ram[" << I << "] READ\n";
+#ifdef TD_VERBOSE
+        t.hyst_ram.debug_read_info("hyst_ram", I, tidx<I>(gindex[I]));
+#endif
         readh[I] = t.hyst_ram.read(tidx<I>(gindex[I]));
+#ifdef TAGE_MONITOR
+        mon.record_rwram_read(I);
+#endif
       }
-      std::cerr << "P2: tage u_ram[" << I << "] READ\n";
+#ifdef TD_VERBOSE
+      t.u_ram.debug_read_info("u_ram", I, tidx<I>(gindex[I]));
+#endif
       readu[I] = t.u_ram.read(tidx<I>(gindex[I]));
+#ifdef TAGE_MONITOR
+      mon.record_rwram_read(I);
+#endif
     });
     readt.fanout(hard<LANES + 1>{});
     readc.fanout(hard<3>{});
@@ -867,8 +1051,19 @@ struct TageDirectImpl : predictor {
       p2 = arr<val<1>, LANES>{[&](u64 r) {
              return select(altsel[r].fo1(), pred2_tage[r], pred1_tage[r]);
            }}.concat();
+#ifdef TAGE_MONITOR
+      for (u64 r = 0; r < LANES; r++) {
+        bool has_alt = static_cast<u64>(match2[r] != hard<0>{});
+        bool pri_ne_alt = static_cast<u64>(pred1_tage[r]) != static_cast<u64>(pred2_tage[r]);
+        mon_altsel[r] = static_cast<u64>(altsel[r]);
+        mon_meta_active[r] = has_alt && pri_ne_alt && static_cast<u64>(altsel[r]);
+      }
+#endif
     } else {
       p2 = pred1_tage.concat();
+#ifdef TAGE_MONITOR
+      for (u64 r = 0; r < LANES; r++) { mon_altsel[r] = false; mon_meta_active[r] = false; }
+#endif
     }
 
     p2.fanout(hard<LANES>{});
@@ -876,13 +1071,14 @@ struct TageDirectImpl : predictor {
     taken.fanout(hard<2>{});
     reuse_prediction(~val<1>{block_entry >> (LINEINST - 1)});
     return taken;
-#endif // --- TAGE P2 disabled ---
   }
 
   val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) override {
+    val<1> taken = p2 >> num_branch;
+    taken.fanout(hard<2>{});
     block_size++;
     reuse_prediction(~line_end());
-    return hard<0>{};
+    return taken;
   }
 
   void update_condbr([[maybe_unused]] val<64> branch_pc, val<1> taken,
@@ -897,12 +1093,16 @@ struct TageDirectImpl : predictor {
     val<1> &mispredict = block_end_info.is_mispredict;
     val<64> &next_pc = block_end_info.next_pc;
 
+#ifdef TD_VERBOSE
     std::cerr << "UC: ENTER (num_branch=" << num_branch
               << " misp=" << static_cast<u64>(block_end_info.is_mispredict)
               << ")\n";
+#endif
     if (num_branch == 0) {
       // No conditional branches — just update history
+#ifdef TD_VERBOSE
       std::cerr << "UC: EXIT (no branches)\n";
+#endif
       execute_if(true_block, [&]() {
         next_pc.fanout(hard<2>{});
         if constexpr (P1_USE_GSHARE_V) {
@@ -919,146 +1119,87 @@ struct TageDirectImpl : predictor {
       return;
     }
 
-    // ---- Gshare-only update (TAGE disabled) ----
-    mispredict.fanout(hard<2>{});
+    // ================================================================
+    // UPDATE CYCLE — Cycle 1: combinational logic + RAM reads
+    // All code above need_extra_cycle() executes in the same cycle as
+    // predict1/predict2. No RAM writes allowed here — only reads and
+    // pure combinational logic on values already in regs.
+    // ================================================================
+
+    // ---- Fanouts for values read in predict2 (stored in regs) ----
+    mispredict.fanout(hard<NUM_TABLES + 2>{});
     val<1> correct_pred = ~mispredict;
-    correct_pred.fanout(hard<2>{});
-    index1.fanout(hard<LANES * 3>{});
-    branch_dir.fanout(hard<2>{});
-    gfolds.fanout(hard<2>{});
-    X.fanout(hard<LANES + 1>{});
-
-    // ---- P1 gshare update (read / need_extra / write pattern) ----
-    // Same structure as gshareN reference: reads in cycle 1, writes in cycle 2.
-
-    // Combinational: compute which lanes were accessed by branches in this block.
-    // access[i] = OR of all X.rotate_left(branch_rank) masks — 1 if lane i was used.
-    arr<val<1>, LANES> access =
-        arr<val<LANES>, LANES>{[&](u64 i) -> val<LANES> {
-          return X.rotate_left(i) & val<LANES>{-(i < num_branch)};
-        }}.fold_or()
-            .make_array(val<1>{});
-
-    // Combinational: identify the lane that holds the mispredicted branch.
-    // misp_bank is a one-hot mask ANDed with mispredict — all zero on correct prediction.
-    val<LANES> misp_bank = X.rotate_left(num_branch - 1)
-        & mispredict.replicate(hard<LANES>{}).concat();
-    arr<val<1>, LANES> mispredicted = misp_bank.fo1().make_array(val<1>{});
-    mispredicted.fanout(hard<2>{});
-
-    // Cycle 1 RAM read: read hysteresis for the mispredicted lane.
-    // Gated by mispredicted[i] so only one lane's RAM is actually read.
-    // On correct prediction, mispredicted is all-zero so no RAM is accessed.
-    arr<val<1>, LANES> weak = [&](u64 i) {
-      return execute_if(mispredicted[i], [&]() {
-#ifdef CHEATING_MODE
-        if (static_cast<u64>(mispredict) && static_cast<u64>(mispredicted[i]))
-          std::cerr << "UC: gshare p1_hyst[" << i << "] READ\n";
-#endif
-        return p1_hyst[i].read(index1);
-      });
-    };
-
-    // Cycle boundary: grant an extra cycle when mispredict=1.
-    // Everything above this line is cycle 1 (reads).
-    // Everything below this line is cycle 2 (writes).
-    need_extra_cycle(mispredict);
-
-    // Cycle 2 RAM write: flip the prediction bit if hysteresis was weak.
-    // p1_pred was read in predict1 (cycle 1), so this write is safe in cycle 2.
-    execute_if(mispredict, [&]() {
-      arr<val<1>, LANES> stored = unordered_pred1.make_array(val<1>{});
-      arr<val<1>, LANES> bundle = [&](u64 i) {
-        return select(weak[i].fo1(), branch_dir[num_branch - 1],
-                      stored[i].fo1());
-      };
-#ifdef CHEATING_MODE
-      if (static_cast<u64>(mispredict))
-        std::cerr << "UC: gshare p1_pred WRITE\n";
-#endif
-      p1_pred.write(index1, bundle.fo1().concat());
-    });
-
-    // Cycle 2 RAM write: update hysteresis for all accessed lanes.
-    // p1_hyst[i] was read above in cycle 1, so this write is safe in cycle 2.
-    for (u64 i = 0; i < LANES; i++) {
-      execute_if(access[i].fo1(), [&]() {
-#ifdef CHEATING_MODE
-        if (static_cast<u64>(mispredict) && static_cast<u64>(access[i]))
-          std::cerr << "UC: gshare p1_hyst[" << i << "] WRITE\n";
-#endif
-        p1_hyst[i].write(index1, mispredicted[i].fo1());
-      });
-    }
-
-#if 0 // --- TAGE update disabled ---
     correct_pred.fanout(hard<NUM_TABLES + 2>{});
     index1.fanout(hard<LANES * 3>{});
     gindex.fanout(hard<4>{});
     htag.fanout(hard<3>{});
-    readt.fanout(hard<4>{});
-    readc.fanout(hard<2>{});
+    readt.fanout(hard<4>{});   // tag values read from TAGE tables in P2
+    readc.fanout(hard<2>{});   // counter values read in P2
     if constexpr (MAX_HYST_WIDTH > 0)
-      readh.fanout(hard<3>{});
-    match1.fanout(hard<3>{});
-    match2.fanout(hard<2>{});
+      readh.fanout(hard<3>{}); // hysteresis values read in P2
+    match1.fanout(hard<3>{});  // provider match vectors computed in P2
+    match2.fanout(hard<2>{});  // alt match vectors computed in P2
     pred1_tage.fanout(hard<2>{});
     pred2_tage.fanout(hard<2 + NUM_TABLES>{});
     branch_dir.fanout(hard<2>{});
     gfolds.fanout(hard<2>{});
-    readu.fanout(hard<2>{});
+    readu.fanout(hard<2>{});   // u-bit values read in P2
     X.fanout(hard<LANES + 1>{});
     if constexpr (USE_META_V)
       meta.fanout(hard<2>{});
 
+    // ---- TAGE combinational logic ----
+    // All pure logic — computes allocation decisions, counter update
+    // conditions, etc. from the reg values read in predict2.
+    // No RAM access here.
+
+    // last_rank: which lane held the last conditional branch in this block
     val<LOG_LANES> last_rank = val<LOG_LANES>{num_branch - 1};
     last_rank.fanout(hard<4 * NUM_TABLES + 2>{});
 
-    // Determine which lanes have branches
+    // Per-lane: was this lane used by a branch in this block?
     arr<val<1>, LANES> is_branch = [&](u64 r) -> val<1> {
       return val<1>{r < num_branch ? 1u : 0u};
     };
     is_branch.fanout(hard<4>{});
 
+    // Per-lane: actual branch direction (0 for unused lanes)
     arr<val<1>, LANES> branch_taken = [&](u64 r) -> val<1> {
-      if (r < num_branch)
-        return branch_dir[r];
+      if (r < num_branch) return branch_dir[r];
       return val<1>{0};
     };
     branch_taken.fanout(hard<3>{});
 
-    // Per-rank match restricted to actual branches
+    // Restrict match vectors to lanes that actually had branches
     arr<val<NUM_TABLES + 1>, LANES> actual_match1 = [&](u64 r) {
       return select(is_branch[r], match1[r], val<NUM_TABLES + 1>{0});
     };
     actual_match1.fanout(hard<2>{});
 
+    // primary_mask: OR of all per-lane provider matches — tells which
+    // TAGE tables are the provider for at least one branch
     val<NUM_TABLES> primary_mask = actual_match1.fold_or();
     primary_mask.fanout(hard<2>{});
     arr<val<1>, NUM_TABLES> primary = primary_mask.make_array(val<1>{});
     primary.fanout(hard<3>{});
 
-    arr<val<1>, LANES> primary_wrong = [&](u64 r) {
-      return pred1_tage[r] != branch_taken[r];
-    };
-    primary_wrong.fanout(hard<2>{});
+    // ---- Allocation decision (combinational) ----
+    // On misprediction, try to allocate entries in tables above the provider.
+    // mispmask gates allocation to mispredictions only.
+    val<NUM_TABLES> mispmask = mispredict.replicate(hard<NUM_TABLES>{}).concat();
 
-    // ---- Allocation ----
-    val<NUM_TABLES> mispmask =
-        mispredict.replicate(hard<NUM_TABLES>{}).concat();
-
-    // Per-table tag comparison for last branch (uses last_tagcmp_reg)
+    // Tag comparison for the last branch's rank specifically
     static_loop<NUM_TABLES>([&]<u64 I>() {
       using Table = std::tuple_element_t<I, Tables>;
       static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
-      last_tagcmp_reg[I] = (val<LOG_LANES>{readt[I] >> PER_HTAG} == last_rank) &
-                           (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
+      last_tagcmp_reg[I] = (val<LOG_LANES>{readt[I] >> PER_HTAG} == last_rank)
+                         & (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
     });
     val<NUM_TABLES + 1> last_match1 =
         last_tagcmp_reg.fo1().append(1).concat().one_hot();
     last_match1.fanout(hard<2>{});
 
-    // Postmask: tables above the provider
+    // postmask: tables above the provider (candidates for allocation)
     val<NUM_TABLES> postmask = [&]() -> val<NUM_TABLES> {
       if constexpr (AllocCfg::PROB_START > 0) {
         val<2> rstart = val<2>{static_cast<u64>(std::rand())};
@@ -1073,12 +1214,11 @@ struct TageDirectImpl : predictor {
     }();
     postmask.fanout(hard<2>{});
 
-    // Candidate allocation mask
+    // candallocmask: tables that are both above provider AND have u=0
     val<NUM_TABLES> candallocmask = [&]() -> val<NUM_TABLES> {
       if constexpr (AllocCfg::CONF_GATE) {
         arr<val<1>, NUM_TABLES> weak_entry = [&](u64 i) -> val<1> {
-          if constexpr (MAX_CTR_WIDTH == 1)
-            return val<1>{1};
+          if constexpr (MAX_CTR_WIDTH == 1) return val<1>{1};
           else {
             auto ctr = readc[i];
             return (ctr == hard<0>{}) |
@@ -1097,6 +1237,7 @@ struct TageDirectImpl : predictor {
     val<NUM_TABLES> collamask1 = collamask.one_hot();
     collamask1.fanout(hard<3>{});
 
+    // allocate[i]: final per-table allocation decision (one-hot or two-hot)
     arr<val<1>, NUM_TABLES> allocate = [&]() -> arr<val<1>, NUM_TABLES> {
       if constexpr (AllocCfg::MAX_ALLOC >= 2) {
         val<NUM_TABLES> pick2 = [&]() -> val<NUM_TABLES> {
@@ -1106,56 +1247,54 @@ struct TageDirectImpl : predictor {
             val<NUM_TABLES> nc_mask = (collamask ^ collamask1) & ~neighbors;
             val<NUM_TABLES> nc_pick = nc_mask.reverse().one_hot();
             return select(nc_mask != hard<0>{}, nc_pick, basic2);
-          } else {
-            return basic2;
-          }
+          } else { return basic2; }
         }();
         return (collamask1 | pick2).reverse().make_array(val<1>{});
       } else {
         val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
-        val<NUM_TABLES> collamask12 = select(val<2>{std::rand()} == hard<0>{},
-                                             collamask2.fo1(), collamask1);
+        val<NUM_TABLES> collamask12 =
+            select(val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
         return collamask12.fo1().reverse().make_array(val<1>{});
       }
     }();
     allocate.fanout(hard<7>{});
 
-    // ---- Branch direction per table ----
+    // ---- Per-table update conditions (combinational) ----
+
+    // bdir[i]: branch direction for the rank stored in table i's tag.
+    // On allocation, uses last_rank instead.
     arr<val<1>, NUM_TABLES> bdir = [&](u64 i) {
       val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
-      val<LOG_LANES> use_rank =
-          select(allocate[i], last_rank, stored_rank.fo1());
-      // Select branch_dir at the stored rank
+      val<LOG_LANES> use_rank = select(allocate[i], last_rank, stored_rank.fo1());
       return branch_dir.select(use_rank);
     };
     bdir.fanout(hard<2>{});
 
+    // badpred1[i]: did table i's counter predict wrong?
     arr<val<1>, NUM_TABLES> badpred1 = [&](u64 i) -> val<1> {
-      if constexpr (MAX_CTR_WIDTH == 1)
-        return readc[i] != bdir[i];
-      else
-        return val<1>{readc[i] >> hard<MAX_CTR_WIDTH - 1>{}} != bdir[i];
+      if constexpr (MAX_CTR_WIDTH == 1) return readc[i] != bdir[i];
+      else return val<1>{readc[i] >> hard<MAX_CTR_WIDTH - 1>{}} != bdir[i];
     };
     badpred1.fanout(hard<3>{});
 
+    // altdiffer[i]: does provider disagree with alt prediction?
     arr<val<1>, NUM_TABLES> altdiffer = [&](u64 i) -> val<1> {
       auto pred_dir = [&]() -> val<1> {
-        if constexpr (MAX_CTR_WIDTH == 1)
-          return readc[i];
-        else
-          return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
+        if constexpr (MAX_CTR_WIDTH == 1) return readc[i];
+        else return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
       }();
       val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
       return pred_dir != pred2_tage.select(stored_rank.fo1());
     };
 
+    // goodpred[i]: was this table's prediction correct for its stored rank?
     arr<val<1>, NUM_TABLES> goodpred = [&](u64 i) {
       val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
       return (stored_rank.fo1() != last_rank) | correct_pred;
     };
     goodpred.fanout(hard<2>{});
 
-    // ---- Hysteresis weakness ----
+    // g_weak[i]: provider with wrong prediction AND weak hysteresis — flip counter
     arr<val<1>, NUM_TABLES> g_weak = [&](u64 i) -> val<1> {
       if constexpr (MAX_HYST_WIDTH > 0)
         return primary[i] & badpred1[i] & (readh[i] == hard<0>{});
@@ -1164,33 +1303,12 @@ struct TageDirectImpl : predictor {
     };
     g_weak.fanout(hard<2>{});
 
-    // ---- P1 disagreement ----
+    // P1 vs P2 disagreement — need extra cycle to update P1
     val<LANES> p1_concat = pred.concat();
     val<LANES> disagree_mask = (p1_concat ^ p2) & is_branch.concat();
     disagree_mask.fanout(hard<2>{});
 
-    // ---- Extra cycle ----
-    if constexpr (AllocCfg::MISPREDICT_ONLY_WRITE) {
-      // Only need extra cycle on misprediction
-      need_extra_cycle(mispredict);
-    } else {
-      val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
-      val<1> extra_cycle =
-          some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-      extra_cycle.fanout(hard<NUM_TABLES * 2 + 1>{});
-      need_extra_cycle(extra_cycle);
-    }
-
-    // ---- TAGE tag write (allocation) ----
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      execute_if(allocate[I], [&]() {
-        std::cerr << "UC: tage tag_ram[" << I << "] WRITE (alloc)\n";
-        std::get<I>(tables).tag_ram.write(tidx<I>(gindex[I]),
-                                          concat(last_rank, htag[I]));
-      });
-    });
-
-    // ---- U-bit update ----
+    // U-bit clear helpers (combinational)
     arr<val<1>, NUM_TABLES> update_u = [&](u64 i) {
       return primary[i] & altdiffer[i].fo1();
     };
@@ -1200,128 +1318,183 @@ struct TageDirectImpl : predictor {
     arr<val<1>, NUM_TABLES> uclear = uclearmask.fo1().make_array(val<1>{});
     uclear.fanout(hard<2>{});
 
-    if constexpr (AllocCfg::MISPREDICT_ONLY_WRITE) {
-      // Only write u-bits on misprediction
-      static_loop<NUM_TABLES>([&]<u64 I>() {
-        execute_if(mispredict & (allocate[I] | uclear[I]), [&]() {
-          std::cerr << "UC: tage u_ram[" << I << "] WRITE (misp_only)\n";
-          val<1> newu =
-              select(allocate[I], val<1>{1}, val<1>{0}); // init u=1 on alloc
-          std::get<I>(tables).u_ram.write(tidx<I>(gindex[I]), newu.fo1());
-        });
-      });
-    } else if constexpr (USE_PROB_DECAY) {
-      val<DECAY_CTR_V> lfsr = val<DECAY_CTR_V>{static_cast<u64>(std::rand())};
-      val<1> decay_fire = (lfsr > val<DECAY_CTR_V>{decay_threshold});
-      decay_fire.fanout(hard<NUM_TABLES>{});
-      static_loop<NUM_TABLES>([&]<u64 I>() {
-        val<1> newu =
-            goodpred[I].fo1() & ~allocate[I] & ~uclear[I] & ~decay_fire;
-        val<1> u_changed = (val<1>{readu[I]} != newu);
-        execute_if((update_u[I].fo1() | allocate[I] | uclear[I] | decay_fire) &
-                       u_changed,
-                   [&]() {
-                     std::cerr << "UC: tage u_ram[" << I << "] WRITE (decay)\n";
-                     std::get<I>(tables).u_ram.write(tidx<I>(gindex[I]),
-                                                     newu.fo1());
-                   });
-      });
-    } else {
-      static_loop<NUM_TABLES>([&]<u64 I>() {
-        val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I];
-        val<1> u_changed = (val<1>{readu[I]} != newu);
-        execute_if(
-            (update_u[I].fo1() | allocate[I] | uclear[I]) & u_changed, [&]() {
-              std::cerr << "UC: tage u_ram[" << I << "] WRITE (default)\n";
-              std::get<I>(tables).u_ram.write(tidx<I>(gindex[I]), newu.fo1());
-            });
-      });
-    }
+    // ---- P1 gshare + TAGE reads / need_extra / writes ----
+    // Same structure as gshareN reference: reads in cycle 1, writes in cycle 2.
 
-    // ---- P1 gshare update (gshareN pattern) ----
-    // All P1 RAM accesses gated by mispredict to ensure they happen in extra
-    // cycle (p1_pred was read in predict1, so writes must be in a different
-    // cycle)
-    execute_if(mispredict, [&]() {
-      arr<val<1>, LANES> access =
-          arr<val<LANES>, LANES>{[&](u64 i) -> val<LANES> {
-            return X.rotate_left(i) & val<LANES>{-(i < num_branch)};
-          }}.fold_or()
-              .make_array(val<1>{});
+    // Combinational: compute which lanes were accessed by branches in this
+    // block. access[i] = OR of all X.rotate_left(branch_rank) masks — 1 if lane
+    // i was used.
+    arr<val<1>, LANES> access =
+        arr<val<LANES>, LANES>{[&](u64 i) -> val<LANES> {
+          return X.rotate_left(i) & val<LANES>{-(i < num_branch)};
+        }}.fold_or()
+            .make_array(val<1>{});
 
-      val<LANES> misp_bank = X.rotate_left(num_branch - 1);
-      arr<val<1>, LANES> mispredicted = misp_bank.fo1().make_array(val<1>{});
-      mispredicted.fanout(hard<2>{});
+    // Combinational: identify the lane that holds the mispredicted branch.
+    // misp_bank is a one-hot mask ANDed with mispredict — all zero on correct
+    // prediction.
+    val<LANES> misp_bank = X.rotate_left(num_branch - 1) &
+                           mispredict.replicate(hard<LANES>{}).concat();
+    arr<val<1>, LANES> mispredicted = misp_bank.fo1().make_array(val<1>{});
+    mispredicted.fanout(hard<2>{});
 
-      // Read hysteresis for mispredicted lane
-      arr<val<1>, LANES> weak = [&](u64 i) {
-        return execute_if(mispredicted[i], [&]() {
+    // Cycle 1 RAM read: read hysteresis for the mispredicted lane.
+    // Gated by mispredicted[i] so only one lane's RAM is actually read.
+    // On correct prediction, mispredicted is all-zero so no RAM is accessed.
+    arr<val<1>, LANES> weak = [&](u64 i) -> val<1> {
+      if (i >= N) return val<1>{0};
+      return execute_if(mispredicted[i], [&]() {
+#ifdef TD_VERBOSE
+        if (static_cast<u64>(mispredict) && static_cast<u64>(mispredicted[i]))
           std::cerr << "UC: gshare p1_hyst[" << i << "] READ\n";
-          return p1_hyst[i].read(index1);
-        });
-      };
+#endif
+        return p1_hyst[i].read(index1);
+      });
+    };
 
-      // Flip prediction if weak
+    // ================================================================
+    // Cycle boundary: grant an extra cycle for RAM writes.
+    // tag_ram/pred_ram use plain ram<> — need extra_cycle for writes.
+    // hyst_ram/u_ram use td_rwram — pass extra_cycle as noconflict,
+    // so they can buffer writes when extra_cycle=0.
+    // Everything above = cycle 1. Everything below = cycle 2.
+    // ================================================================
+    val<1> extra_cycle = [&]() -> val<1> {
+      if constexpr (AllocCfg::MISPREDICT_ONLY_WRITE) {
+        return mispredict;
+      } else {
+        val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
+        return some_badpred1.fo1() | mispredict;
+      }
+    }();
+#ifdef TD_VERBOSE
+    std::cerr << "UC: extra_cycle=" << static_cast<u64>(extra_cycle) << "\n";
+#endif
+    extra_cycle.fanout(hard<NUM_TABLES * 2 + 1>{});
+    need_extra_cycle(extra_cycle);
+
+#ifdef TAGE_MONITOR
+    // Block stats
+    mon.record_block(static_cast<u64>(block_entry), block_size, num_branch,
+                     static_cast<u64>(extra_cycle));
+    // Per-branch outcome + prediction tracking
+    for (u64 r = 0; r < num_branch; r++) {
+      bool actual = static_cast<u64>(branch_dir[r]);
+      bool p1_pr = static_cast<u64>(pred[r]);
+      bool p2_pr = static_cast<u64>((p2 >> r) & hard<1>{});
+      bool misp = (r == num_branch - 1) ? static_cast<u64>(mispredict) : false;
+      mon.record_prediction(r, static_cast<u64>(match1[r]),
+                            static_cast<u64>(match2[r]),
+                            mon_meta_active[r], mon_altsel[r],
+                            p1_pr, p2_pr);
+      mon.record_outcome(r, actual, misp);
+    }
+    // Tag match tracking
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      bool matched = static_cast<u64>(htagcmp_reg[i]);
+      mon.record_tag_lookup(i, matched);
+    }
+    // Allocation
+    if (static_cast<u64>(mispredict)) {
+      u64 amask = 0;
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        if (static_cast<u64>(allocate[i])) amask |= (u64(1) << i);
+      mon.record_allocation(amask != 0, amask);
+    }
+#endif
+
+    // ================================================================
+    // Cycle 2: RAM writes — P1 gshare + TAGE tables
+    // All writes are gated by execute_if so they only fire when needed.
+    // ================================================================
+
+    // ---- P1 gshare writes ----
+    // Flip prediction bit if hysteresis was weak on misprediction.
+    // p1_pred was read in predict1 (cycle 1), safe to write in cycle 2.
+    execute_if(mispredict, [&]() {
       arr<val<1>, LANES> stored = unordered_pred1.make_array(val<1>{});
       arr<val<1>, LANES> bundle = [&](u64 i) {
         return select(weak[i].fo1(), branch_dir[num_branch - 1],
                       stored[i].fo1());
       };
-      std::cerr << "UC: gshare p1_pred WRITE\n";
+#ifdef TD_VERBOSE
+      if (static_cast<u64>(mispredict))
+        std::cerr << "UC: gshare p1_pred WRITE\n";
+#endif
       p1_pred.write(index1, bundle.fo1().concat());
+    });
 
-      // Update hysteresis for all accessed lanes
-      // TODO: Only do this on mispredict
-      for (u64 i = 0; i < LANES; i++) {
-        execute_if(access[i].fo1(), [&]() {
+    // Update P1 hysteresis for all accessed lanes.
+    // p1_hyst[i] was read in cycle 1, safe to write in cycle 2.
+    for (u64 i = 0; i < N; i++) {
+      execute_if(access[i].fo1(), [&]() {
+#ifdef TD_VERBOSE
+        if (static_cast<u64>(mispredict) && static_cast<u64>(access[i]))
           std::cerr << "UC: gshare p1_hyst[" << i << "] WRITE\n";
-          p1_hyst[i].write(index1, mispredicted[i].fo1());
-        });
-      }
+#endif
+        p1_hyst[i].write(index1, mispredicted[i].fo1());
+#ifdef TAGE_MONITOR
+        mon.record_p1_write(i, static_cast<u64>(index1));
+#endif
+      });
+    }
+
+    // ---- TAGE tag write (allocation) ----
+    // Write new tag = concat(last_rank, htag) into allocated table entries.
+    // tag_ram was read in predict2 (cycle 1), safe to write in cycle 2.
+    // Gate: allocate[I] ⊆ mispredict ⊆ extra_cycle, so no third arg needed.
+    static_loop<NUM_TABLES>([&]<u64 I>() {
+      execute_if(allocate[I], [&]() {
+#ifdef TD_VERBOSE
+        if (static_cast<u64>(allocate[I]))
+          std::cerr << "UC: tage tag_ram[" << I << "] WRITE (alloc)\n";
+#endif
+        std::get<I>(tables).tag_ram.write(tidx<I>(gindex[I]),
+                                          concat(last_rank, htag[I]));
+      });
     });
 
     // ---- TAGE counter update ----
+    // pred_ram was read in predict2 (cycle 1), safe to write in cycle 2.
     if constexpr (AllocCfg::MISPREDICT_ONLY_WRITE) {
-      // Only write counters on misprediction; initialize saturated on alloc
       static_loop<NUM_TABLES>([&]<u64 I>() {
         execute_if(mispredict & (g_weak[I].fo1() | allocate[I]), [&]() {
+#ifdef TD_VERBOSE
           std::cerr << "UC: tage pred_ram[" << I << "] WRITE (misp_only)\n";
+#endif
           if constexpr (MAX_CTR_WIDTH == 1) {
             std::get<I>(tables).pred_ram.write(tidx<I>(gindex[I]), bdir[I]);
           } else {
-            // Saturate toward branch direction on allocation
-            auto init_ctr =
-                select(bdir[I], val<MAX_CTR_WIDTH>{(1u << MAX_CTR_WIDTH) - 1},
-                       val<MAX_CTR_WIDTH>{0});
-            std::get<I>(tables).pred_ram.write(
-                tidx<I>(gindex[I]),
+            auto init_ctr = select(bdir[I],
+                val<MAX_CTR_WIDTH>{(1u << MAX_CTR_WIDTH) - 1},
+                val<MAX_CTR_WIDTH>{0});
+            std::get<I>(tables).pred_ram.write(tidx<I>(gindex[I]),
                 select(allocate[I], init_ctr, val<MAX_CTR_WIDTH>{bdir[I]}));
           }
         });
       });
     } else {
-      // Standard: update on weak+wrong or allocate, with silent elimination
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> old_dir = [&]() -> val<1> {
-          if constexpr (MAX_CTR_WIDTH == 1)
-            return readc[I];
-          else
-            return readc[I] >> hard<MAX_CTR_WIDTH - 1>{};
+          if constexpr (MAX_CTR_WIDTH == 1) return readc[I];
+          else return readc[I] >> hard<MAX_CTR_WIDTH - 1>{};
         }();
         val<1> pred_changed = (old_dir != bdir[I]) | allocate[I];
         execute_if((g_weak[I].fo1() | allocate[I]) & pred_changed, [&]() {
+#ifdef TD_VERBOSE
           std::cerr << "UC: tage pred_ram[" << I << "] WRITE (standard)\n";
+#endif
           std::get<I>(tables).pred_ram.write(tidx<I>(gindex[I]), bdir[I]);
         });
       });
     }
 
-    // ---- Hysteresis update ----
+    // ---- TAGE hysteresis update ----
+    // hyst_ram was read in predict2 (cycle 1), safe to write in cycle 2.
     if constexpr (MAX_HYST_WIDTH > 0 && !AllocCfg::MISPREDICT_ONLY_WRITE) {
       static constexpr u64 HW = std::max(u64(1), MAX_HYST_WIDTH);
       static constexpr u64 HMAX = (u64(1) << HW) - 1;
-      if constexpr (AllocCfg::PARTIAL_UPDATE)
-        altdiffer.fanout(hard<2>{});
+      if constexpr (AllocCfg::PARTIAL_UPDATE) altdiffer.fanout(hard<2>{});
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> would_change = allocate[I] |
                               (badpred1[I] & (readh[I] != hard<0>{})) |
@@ -1333,26 +1506,100 @@ struct TageDirectImpl : predictor {
             return primary[I] | allocate[I];
         }();
         execute_if(should_update & would_change, [&]() {
-          std::cerr << "UC: tage hyst_ram[" << I << "] WRITE (standard)\n";
           auto newhyst = select(allocate[I], val<HW>{0},
                                 td::update_ctr(readh[I], ~badpred1[I]));
-          std::get<I>(tables).hyst_ram.write(tidx<I>(gindex[I]), newhyst.fo1());
+#ifdef TD_VERBOSE
+          std::get<I>(tables).hyst_ram.debug_write_info("hyst_ram", I, tidx<I>(gindex[I]), extra_cycle);
+#endif
+          std::get<I>(tables).hyst_ram.write(tidx<I>(gindex[I]), newhyst.fo1(), extra_cycle);
+#ifdef TAGE_MONITOR
+          { auto &r = std::get<I>(tables).hyst_ram;
+            u64 bid = (static_cast<u64>(gindex[I]) >> RWRAM_BANK_SHIFT_V) & (RWRAM_BANKS_V - 1);
+            mon.record_rwram_write(I, bid, static_cast<u64>(extra_cycle),
+                                   static_cast<u64>(r.read_bank), static_cast<u64>(r.write_bank)); }
+#endif
         });
       });
-    } else if constexpr (MAX_HYST_WIDTH > 0 &&
-                         AllocCfg::MISPREDICT_ONLY_WRITE) {
-      // Initialize hysteresis saturated on allocation
+    } else if constexpr (MAX_HYST_WIDTH > 0 && AllocCfg::MISPREDICT_ONLY_WRITE) {
       static constexpr u64 HW = std::max(u64(1), MAX_HYST_WIDTH);
       static constexpr u64 HMAX = (u64(1) << HW) - 1;
       static_loop<NUM_TABLES>([&]<u64 I>() {
         execute_if(mispredict & allocate[I], [&]() {
-          std::cerr << "UC: tage hyst_ram[" << I << "] WRITE (misp_only)\n";
-          std::get<I>(tables).hyst_ram.write(tidx<I>(gindex[I]), val<HW>{HMAX});
+#ifdef TD_VERBOSE
+          std::get<I>(tables).hyst_ram.debug_write_info("hyst_ram", I, tidx<I>(gindex[I]), extra_cycle);
+#endif
+          std::get<I>(tables).hyst_ram.write(tidx<I>(gindex[I]), val<HW>{HMAX}, extra_cycle);
+#ifdef TAGE_MONITOR
+          { auto &r = std::get<I>(tables).hyst_ram;
+            u64 bid = (static_cast<u64>(gindex[I]) >> RWRAM_BANK_SHIFT_V) & (RWRAM_BANKS_V - 1);
+            mon.record_rwram_write(I, bid, static_cast<u64>(extra_cycle),
+                                   static_cast<u64>(r.read_bank), static_cast<u64>(r.write_bank)); }
+#endif
         });
       });
     }
 
-    // ---- Meta counter update ----
+    // ---- TAGE u-bit update ----
+    // u_ram uses td_rwram: pass extra_cycle as noconflict for buffered writes.
+    if constexpr (AllocCfg::MISPREDICT_ONLY_WRITE) {
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        execute_if(mispredict & (allocate[I] | uclear[I]), [&]() {
+          val<1> newu = select(allocate[I], val<1>{1}, val<1>{0});
+#ifdef TD_VERBOSE
+          std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
+#endif
+          std::get<I>(tables).u_ram.write(tidx<I>(gindex[I]), newu.fo1(), extra_cycle);
+#ifdef TAGE_MONITOR
+          mon.record_u_write(I, static_cast<u64>(newu));
+          { auto &r = std::get<I>(tables).u_ram;
+            u64 bid = (static_cast<u64>(gindex[I]) >> RWRAM_BANK_SHIFT_V) & (RWRAM_BANKS_V - 1);
+            mon.record_rwram_write(I, bid, static_cast<u64>(extra_cycle),
+                                   static_cast<u64>(r.read_bank), static_cast<u64>(r.write_bank)); }
+#endif
+        });
+      });
+    } else if constexpr (USE_PROB_DECAY) {
+      val<DECAY_CTR_V> lfsr = val<DECAY_CTR_V>{static_cast<u64>(std::rand())};
+      val<1> decay_fire = (lfsr > val<DECAY_CTR_V>{decay_threshold});
+      decay_fire.fanout(hard<NUM_TABLES>{});
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I] & ~decay_fire;
+        val<1> u_changed = (val<1>{readu[I]} != newu);
+        execute_if((update_u[I].fo1() | allocate[I] | uclear[I] | decay_fire) & u_changed, [&]() {
+#ifdef TD_VERBOSE
+          std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
+#endif
+          std::get<I>(tables).u_ram.write(tidx<I>(gindex[I]), newu.fo1(), extra_cycle);
+#ifdef TAGE_MONITOR
+          mon.record_u_write(I, static_cast<u64>(newu));
+          { auto &r = std::get<I>(tables).u_ram;
+            u64 bid = (static_cast<u64>(gindex[I]) >> RWRAM_BANK_SHIFT_V) & (RWRAM_BANKS_V - 1);
+            mon.record_rwram_write(I, bid, static_cast<u64>(extra_cycle),
+                                   static_cast<u64>(r.read_bank), static_cast<u64>(r.write_bank)); }
+#endif
+        });
+      });
+    } else {
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I];
+        val<1> u_changed = (val<1>{readu[I]} != newu);
+        execute_if((update_u[I].fo1() | allocate[I] | uclear[I]) & u_changed, [&]() {
+#ifdef TD_VERBOSE
+          std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
+#endif
+          std::get<I>(tables).u_ram.write(tidx<I>(gindex[I]), newu.fo1(), extra_cycle);
+#ifdef TAGE_MONITOR
+          mon.record_u_write(I, static_cast<u64>(newu));
+          { auto &r = std::get<I>(tables).u_ram;
+            u64 bid = (static_cast<u64>(gindex[I]) >> RWRAM_BANK_SHIFT_V) & (RWRAM_BANKS_V - 1);
+            mon.record_rwram_write(I, bid, static_cast<u64>(extra_cycle),
+                                   static_cast<u64>(r.read_bank), static_cast<u64>(r.write_bank)); }
+#endif
+        });
+      });
+    }
+
+    // ---- Meta counter update (regs only, no RAM) ----
     if constexpr (USE_META_V) {
       arr<val<1>, LANES> altdiff = [&](u64 r) {
         return (match2[r] != hard<0>{}) & (pred2_tage[r] != pred1_tage[r]);
@@ -1363,8 +1610,7 @@ struct TageDirectImpl : predictor {
         return select(update_meta.fo1(), concat(bad_pred2.fo1(), val<1>{1}),
                       val<2>{0});
       };
-      for (u64 i = METAPIPE_V - 1; i != 0; i--)
-        meta[i] = meta[i - 1];
+      for (u64 i = METAPIPE_V - 1; i != 0; i--) meta[i] = meta[i - 1];
       auto newmeta = meta[0] + meta_incr.fo1().fold_add();
       newmeta.fanout(hard<3>{});
       using meta_t = valt<decltype(meta[0])>;
@@ -1373,7 +1619,7 @@ struct TageDirectImpl : predictor {
                               meta_t{newmeta}));
     }
 
-    // ---- Epoch / decay threshold ----
+    // ---- Epoch / decay threshold (regs only, no RAM except u_ram.reset) ----
     uctr.fanout(hard<3>{});
     val<NUM_TABLES> allocmask1 = collamask1.reverse();
     allocmask1.fanout(hard<2>{});
@@ -1387,27 +1633,30 @@ struct TageDirectImpl : predictor {
 
     if constexpr (USE_PROB_DECAY) {
       val<1> threshold_tick = [&]() -> val<1> {
-        if constexpr (DECAY_GRAN_V == 0)
-          return ~correct_pred;
-        else
-          return (uctr & hard<(u64(1) << DECAY_GRAN_V) - 1>{}) == hard<0>{};
+        if constexpr (DECAY_GRAN_V == 0) return ~correct_pred;
+        else return (uctr & hard<(u64(1) << DECAY_GRAN_V) - 1>{}) == hard<0>{};
       }();
       val<1> misp = ~correct_pred;
-      decay_threshold =
-          select(threshold_tick,
-                 DecayPolicy_V::template apply<DECAY_CTR_V>(
-                     decay_threshold, correct_pred, uctrsat, misp),
-                 val<DECAY_CTR_V>{decay_threshold});
+      decay_threshold = select(threshold_tick,
+          DecayPolicy_V::template apply<DECAY_CTR_V>(
+              decay_threshold, correct_pred, uctrsat, misp),
+          val<DECAY_CTR_V>{decay_threshold});
     } else {
+      // Periodic u-bit reset — u_ram.reset() is a bulk clear, safe in cycle 2.
+      // uctrsat only fires on mispredictions, so extra_cycle is guaranteed.
       execute_if(uctrsat, [&]() {
+#ifdef TAGE_MONITOR
+        mon.record_epoch_reset();
+#endif
         static_loop<NUM_TABLES>([&]<u64 I>() {
-          std::cerr << "UC: tage u_ram[" << I << "] RESET\n";
+#ifdef TD_VERBOSE
+          if (static_cast<u64>(uctrsat))
+            std::cerr << "UC: tage u_ram[" << I << "] RESET\n";
+#endif
           std::get<I>(tables).u_ram.reset();
         });
       });
     }
-
-#endif // --- TAGE update disabled ---
 
     // ---- History update ----
     true_block = arr<val<1>, 4>{~mispredict, branch_dir[num_branch - 1],
@@ -1426,7 +1675,9 @@ struct TageDirectImpl : predictor {
       }
     });
 
+#ifdef TD_VERBOSE
     std::cerr << "UC: EXIT (full update)\n";
+#endif
     num_branch = 0;
   }
 };
@@ -1445,7 +1696,8 @@ template <typename TableCfg = td::TDTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
           u64 TD_P1_HIST = 6, bool TD_USE_META = true, u64 TD_METABITS = 4,
           u64 TD_METAPIPE = 2, bool TD_USE_PATH_HIST = false,
           u64 TD_PATH_HIST_WIDTH = 27, u64 TD_PATH_BITS = 6,
-          template <u64> class TD_FOLD_FN = td::XORFold>
+          template <u64> class TD_FOLD_FN = td::XORFold,
+          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0>
 
 using TageDirect =
     TageDirectImpl<TableCfg, AllocCfg, TD_LINEINST, TD_N, TD_SHARED_TAG,
@@ -1453,4 +1705,5 @@ using TageDirect =
                    TD_DECAY_GRAN, TD_DECAY_POLICY, TD_P1_USE_GSHARE,
                    TD_P1_TABLE_SIZE, TD_P1_HIST, TD_USE_META, TD_METABITS,
                    TD_METAPIPE, TD_USE_PATH_HIST, TD_PATH_HIST_WIDTH,
-                   TD_PATH_BITS, TD_FOLD_FN>;
+                   TD_PATH_BITS, TD_FOLD_FN, TD_RWRAM_BANKS,
+                   TD_RWRAM_BANK_SHIFT>;

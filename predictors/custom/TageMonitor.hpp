@@ -13,8 +13,10 @@
 
 using u64 = uint64_t;
 
-template <u64 NUM_TABLES, u64 MAX_TABLE_SIZE, u64 FETCH_WIDTH_V = 16>
+// Cap shadow memory to avoid multi-GB allocations with large SIZE_RATIO configs.
+template <u64 NUM_TABLES, u64 MAX_TABLE_SIZE_RAW, u64 FETCH_WIDTH_V = 16>
 struct TageMonitor {
+  static constexpr u64 MAX_TABLE_SIZE = std::min(MAX_TABLE_SIZE_RAW, u64(16384));
 
   static constexpr u64 WINDOW_SIZE = 100000; // branches per window
 
@@ -68,6 +70,13 @@ struct TageMonitor {
     u64 p1_alias_evictions = 0;   // P1 entry overwritten by different PC
     std::array<u64, NUM_TABLES> tage_alias_evictions{};  // per TAGE table
     u64 loop_alias_evictions = 0; // loop table evictions due to aliasing
+    // rwram bank stats (hyst + u combined per table)
+    std::array<u64, NUM_TABLES> rwram_reads{};
+    std::array<u64, NUM_TABLES> rwram_writes{};
+    std::array<u64, NUM_TABLES> rwram_writes_direct{};   // noconflict=1
+    std::array<u64, NUM_TABLES> rwram_writes_buffered{};  // noconflict=0
+    std::array<u64, NUM_TABLES> rwram_read_write_same_bank{};  // read+write same bank in a cycle
+    std::array<u64, NUM_TABLES> rwram_buffer_pending_on_write{};  // write when buffer already full
 
     void reset() { *this = Counters{}; }
   };
@@ -181,6 +190,27 @@ struct TageMonitor {
       for (u64 i = 0; i < sz; i++) {
         shadow_table[t][i].u_value = 0;
       }
+    }
+  }
+
+  // rwram bank tracking: called from td_rwram read/write
+  void record_rwram_read(u64 table, u64 bank_id) {
+    (void)bank_id;
+    cum.rwram_reads[table]++; win.rwram_reads[table]++;
+  }
+  void record_rwram_write(u64 table, u64 bank_id, bool direct,
+                          u64 read_bank_mask, u64 write_bank_mask) {
+    cum.rwram_writes[table]++; win.rwram_writes[table]++;
+    if (direct) {
+      cum.rwram_writes_direct[table]++; win.rwram_writes_direct[table]++;
+    } else {
+      cum.rwram_writes_buffered[table]++; win.rwram_writes_buffered[table]++;
+    }
+    if ((read_bank_mask >> bank_id) & 1) {
+      cum.rwram_read_write_same_bank[table]++; win.rwram_read_write_same_bank[table]++;
+    }
+    if (write_bank_mask != 0) {
+      cum.rwram_buffer_pending_on_write[table]++; win.rwram_buffer_pending_on_write[table]++;
     }
   }
 
@@ -519,6 +549,20 @@ struct TageMonitor {
     os << "P1 Writes: " << c.p1_writes
        << "  Aliasing: " << c.p1_alias_evictions
        << " evictions (" << pct(c.p1_alias_evictions, c.p1_writes) << "%)\n";
+
+    // rwram bank stats
+    os << "\nRWRAM Bank Stats (hyst+u combined per table):\n";
+    os << "  Table  |   Reads  |  Writes  |  Direct  | Buffered | SameBank | BufPend\n";
+    os << "  -------+----------+----------+----------+----------+----------+--------\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << ""
+         << "|" << std::setw(9) << c.rwram_reads[i]
+         << " |" << std::setw(9) << c.rwram_writes[i]
+         << " |" << std::setw(9) << c.rwram_writes_direct[i]
+         << " |" << std::setw(9) << c.rwram_writes_buffered[i]
+         << " |" << std::setw(9) << c.rwram_read_write_same_bank[i]
+         << " |" << std::setw(7) << c.rwram_buffer_pending_on_write[i] << "\n";
+    }
 
     // TAGE aliasing
     os << "\nTAGE Aliasing (evictions per table):\n";

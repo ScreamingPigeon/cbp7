@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -166,6 +166,9 @@ cbp-monitor: $(BUILD_DIR)/cbp-monitor $(BUILD_DIR)/cbp-profile | out
 	@echo ""
 	@echo "Files: $(MONITOR_OUT), out/monitor_csv.txt"
 
+monitor-vis:
+	python3 scripts/monitor_vis.py out/monitor_csv.txt
+
 # Compare two predictors side-by-side.
 # Single trace:  make compare TRACE=path/to/trace.gz
 # All traces:    make compare-all TRACE_DIR=path/to/traces/
@@ -249,4 +252,16 @@ clean:
 	rm -f $(BUILD_DIR)/cbp-profile $(BUILD_DIR)/cbp-monitor
 	rm -f $(BUILD_DIR)/test-tage-compile $(BUILD_DIR)/quick_a $(BUILD_DIR)/quick_b
 	rm -f $(PREDICTOR_MK)
+	rm -rf out/*
+
+# Clean individual targets: make clean-cbp, clean-monitor, clean-profile, clean-out
+clean-cbp:
+	rm -f $(BUILD_DIR)/cbp $(PREDICTOR_MK)
+clean-monitor:
+	rm -f $(BUILD_DIR)/cbp-monitor
+clean-profile:
+	rm -f $(BUILD_DIR)/cbp-profile
+clean-reference:
+	rm -f $(BUILD_DIR)/reference
+clean-out:
 	rm -rf out/*
