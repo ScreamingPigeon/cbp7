@@ -15,6 +15,7 @@
 *.out
 
 /out/*
+!/out/gshare_monitor_all.txt
 /traces/*
 # Local training traces (large datasets)
 /cbp-ng_training_traces/
