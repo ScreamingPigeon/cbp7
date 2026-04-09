@@ -27,6 +27,12 @@ struct TDMonitor {
     u64 blocks = 0;
     u64 extra_cycles = 0;
 
+    // Pipeline call counts
+    u64 predict1_calls = 0;
+    u64 reuse_predict1_calls = 0;
+    u64 predict2_calls = 0;
+    u64 reuse_predict2_calls = 0;
+
     // Block structure
     u64 total_block_instr = 0;     // sum of instructions across all blocks
     u64 total_block_branches = 0;  // sum of branches across all blocks
@@ -109,6 +115,11 @@ struct TDMonitor {
 
   // ======== Recording methods ========
 
+  void record_predict1() { cum.predict1_calls++; win.predict1_calls++; }
+  void record_reuse_predict1() { cum.reuse_predict1_calls++; win.reuse_predict1_calls++; }
+  void record_predict2() { cum.predict2_calls++; win.predict2_calls++; }
+  void record_reuse_predict2() { cum.reuse_predict2_calls++; win.reuse_predict2_calls++; }
+
   // Block structure — called at end of block (update_cycle)
   void record_block(u64 block_entry, u64 block_size, u64 num_branch, bool extra_cycle_fired) {
     auto record = [&](Counters &c) {
@@ -152,28 +163,31 @@ struct TDMonitor {
     if (matched) { cum.tag_matches[table]++; win.tag_matches[table]++; }
   }
 
-  // Branch outcome — called in update_condbr
+  // Branch outcome — called per branch in update_cycle monitor block
+  // mispredict: simulator-level (only true for block-ending misprediction)
   void record_outcome(u64 rank, bool actual_taken, bool mispredict) {
+    // Per-branch correctness derived from actual vs predicted
+    bool p2_ok = (shadow_p2_pred[rank] == actual_taken);
     auto record = [&](Counters &c) {
       c.branches++;
       if (mispredict) c.mispredictions++;
 
       u64 prov = shadow_provider[rank];
       c.provider_count[prov]++;
-      if (!mispredict) c.provider_correct[prov]++;
+      if (p2_ok) c.provider_correct[prov]++;
 
       u64 alt = shadow_alt[rank];
       c.alt_count[alt]++;
 
       if (shadow_meta_overrode[rank]) {
         c.meta_override_count++;
-        if (!mispredict) c.meta_override_correct++;
+        if (p2_ok) c.meta_override_correct++;
         if (shadow_meta_chose_alt[rank]) {
           c.meta_chose_alt++;
-          if (!mispredict) c.meta_chose_alt_correct++;
+          if (p2_ok) c.meta_chose_alt_correct++;
         } else {
           c.meta_chose_pri++;
-          if (!mispredict) c.meta_chose_pri_correct++;
+          if (p2_ok) c.meta_chose_pri_correct++;
         }
       }
 
@@ -189,7 +203,6 @@ struct TDMonitor {
       // P1 vs P2
       if (shadow_p1_pred[rank] != shadow_p2_pred[rank]) {
         c.p1p2_disagree++;
-        bool p2_ok = !mispredict;
         if (p1_ok && !p2_ok) c.p1_right_p2_wrong++;
         if (p2_ok && !p1_ok) c.p2_right_p1_wrong++;
       }
@@ -313,7 +326,21 @@ struct TDMonitor {
        << pct(c.mispredictions, c.branches) << "%)\n";
     os << "Blocks: " << c.blocks
        << "  Extra cycles: " << c.extra_cycles
-       << " (" << pct(c.extra_cycles, c.blocks) << "%)\n\n";
+       << " (" << pct(c.extra_cycles, c.blocks) << "%)\n";
+
+    // Pipeline calls
+    os << "\nPipeline Calls:\n";
+    os << "  predict1: " << c.predict1_calls
+       << "  reuse_predict1: " << c.reuse_predict1_calls
+       << "  (reuse rate: " << pct(c.reuse_predict1_calls,
+                                    c.predict1_calls + c.reuse_predict1_calls) << "%)\n";
+    os << "  predict2: " << c.predict2_calls
+       << "  reuse_predict2: " << c.reuse_predict2_calls
+       << "  (reuse rate: " << pct(c.reuse_predict2_calls,
+                                    c.predict2_calls + c.reuse_predict2_calls) << "%)\n";
+    u64 total_p1 = c.predict1_calls + c.reuse_predict1_calls;
+    os << "  Avg instr/block (from P1): "
+       << (c.predict1_calls > 0 ? double(total_p1) / c.predict1_calls : 0) << "\n\n";
 
     // Block structure
     os << "Block Structure:\n";

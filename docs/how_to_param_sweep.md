@@ -96,6 +96,95 @@ All parameters are in the `TageDirect` alias in `TageDirect.hpp`. Lines marked `
 | `PartialUpdateConfig` | Partial counter updates |
 | `AllocFullConfig` | All options enabled |
 
+## Reference Parameters from Papers (Seznec TAGE-SC-L)
+
+### Prediction Counters
+
+Papers use **3-bit signed** prediction counters (range -4 to +3) with **shared hysteresis**:
+- Multiple entries (typically 4) share a single hysteresis bit in a separate smaller table
+- Pred table: stores top 2 bits per entry. Hyst table: 1 bit per group of 4 entries.
+- 32KB: 4K pred bits + 1K hyst bits. 256KB: 16K pred bits + 4K hyst bits.
+- Prediction = MSB of counter. Weak = counter near zero. Strong = saturated.
+- Storage savings: ~58% reduction vs per-entry 3-bit counters.
+
+Our implementation: CTR=1 (pred bits per entry), HYST=2 (hyst bits per entry, NOT shared).
+To match papers: need grouped hysteresis sharing (e.g. HYST_SHARE_RATIO=4).
+
+### U-bit / Useful Counter
+
+| Config | U width | Notes |
+|--------|---------|-------|
+| 32KB TAGE-SC-L | 2-bit | Probabilistic decrement via TICK counter |
+| 64KB CBP-5 | 1-bit | Simpler but more aggressive |
+| 256KB TAGE-SC-L | 2-bit | Smooth alternating-bit reset |
+
+**Update logic:**
+- Increment u when provider correct AND alt incorrect
+- Clear u on allocation (new entry gets u=0)
+- When u=0: also update alt predictor on correct predictions
+
+### Decay / U-bit Aging
+
+**Alternating bit reset (L-TAGE, 256KB):**
+- 2-bit u counter, reset one bit at a time on alternating epochs
+- Period: every 512K branches
+- Epoch 2n-1: reset u1 (MSB). Epoch 2n: reset u0 (LSB).
+- Effect: graceful aging. u=3 → u=1 → u=0 over two epochs.
+
+**TICK counter (32KB TAGE-SC-L):**
+- Dynamic counter monitoring allocation success/failure rate
+- On allocation failure: probabilistic u decrement, probability increases with TICK
+- More adaptive than periodic reset — decay pressure responds to allocation demand
+
+**Graceful reset counter (CBP-5):**
+- 19-bit counter for graceful resets (~512K-1.5M branches)
+- 10-bit counter for allocation monitoring
+
+Our implementation: 1-bit u with bulk epoch reset (all u→0) or probabilistic decay.
+To match papers: need 2-bit u with alternating-bit reset, or TICK-based adaptive decay.
+
+### Allocation Logic
+
+**Probabilistic start table (all configs):**
+- On misprediction, allocate in tables with longer history than provider
+- Start search at: i+1 (50%), i+2 (25%), i+3 (25%) — uses 2-bit counter
+- Non-consecutive: never allocate in adjacent tables
+- At most 1 entry per misprediction (L-TAGE, CBP-5). Sometimes 1-2 for small configs.
+
+**Replacement policy:**
+- Only replace entries with u=0
+- 64KB special: also require `|2*ctr+1| < 5` (don't replace confident entries)
+- Init: CTR = weak correct, u = 0
+
+Our implementation: `AllocProbStartConfig` matches probabilistic start. `Alloc2NCConfig` matches non-consecutive.
+
+### Meta / USE_ALT_ON_NA
+
+**Small configs (32KB):**
+- Single 4-bit counter, globally shared
+- When provider CTR is weak AND counter >= 0: use alternate prediction
+- Updated when provider is newly allocated and prediction resolves
+
+**Large configs (256KB):**
+- 256 choosers (6-bit counters) indexed by:
+  - hit_bank_chunk (3 bits) — which table group is provider
+  - alt_confidence (2 bits)
+  - alt_bank_hit (1 bit) — does alt come from a tagged table
+  - hit_confidence (2 bits)
+- Much more context-sensitive meta decision
+
+Our implementation: single METABITS-wide counter per meta pipeline entry.
+To match papers: need PC-indexed or multi-feature-indexed meta table.
+
+### Preset Configs
+
+| Config | Tables | Tags | Entries (original) | Budget |
+|--------|--------|------|--------------------|--------|
+| `TDConfig32Kx2` | 10 | 7→13 | 2× original | ~64Kbit |
+| `TDConfig32Kx4` | 10 | 7→13 | 4× original | ~128Kbit |
+| `TDConfig256Kd4` | 15 | 7→15 | ÷4 original | ~96Kbit |
+| `TDConfigLTAGE` | 12 | 7→15 | ÷4 original | ~96Kbit |
+
 ## Iterative Process
 
 ### Step 1: Baseline

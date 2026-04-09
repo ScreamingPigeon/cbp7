@@ -282,9 +282,9 @@ constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
 // ============================================================================
 
 template <u64 N = 8, u64 SIZE = 2048, u64 TAG = 11, u64 CTR = 1, u64 HYST = 2,
-          u64 U = 1, u64 MINH = 2, u64 MAXH = 100, u64 SIZE_RATIO = 1,
+          u64 U = 1, u64 MINH = 15, u64 MAXH = 100, u64 SIZE_RATIO = 1,
           HistSeries HIST = HistSeries::GEOMETRIC,
-          typename TagFn = UniformTag<TAG>,
+          typename TagFn = GradedTag<TAG, TAG - 3>,
           typename SizeFn = GeoSize<SIZE, SIZE_RATIO>>
 struct TDTableConfig {
   static constexpr u64 NUM_TABLES = N;
@@ -307,6 +307,65 @@ struct TDTableConfig {
   }();
 };
 
+// 32Kbit TAGE-SC-L (Seznec) scaled 2x → ~64Kbit TAGE storage
+// Original: 10 tables, graded tags 7→13, inverse geo sizes
+// Hist:    4,  9, 13, 24,  37,  53,  91, 145, 226, 359
+// Bits/entry: tag+ctr+hyst+u = 11-17 per entry
+struct TDConfig32Kx2 {
+  static constexpr u64 NUM_TABLES = 10;
+  static constexpr u64 MINHIST = 4;
+  static constexpr u64 MAXHIST = 359;
+  static constexpr std::array<u64, 10> TABLE_SIZE = {128, 128, 128, 256, 512, 256, 512, 512, 512, 512};
+  static constexpr std::array<u64, 10> TAG_WIDTH  = {13, 13, 11, 10, 10,   9,   8,   7,   7,   7};
+  static constexpr std::array<u64, 10> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3};
+  static constexpr std::array<u64, 10> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0};
+  static constexpr std::array<u64, 10> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1};
+  static constexpr std::array<u64, 10> HIST_LEN   = {359, 226, 145, 91, 53, 37, 24, 13, 9, 4};
+};
+
+// 32Kbit TAGE-SC-L (Seznec) scaled 4x → ~128Kbit TAGE storage
+struct TDConfig32Kx4 {
+  static constexpr u64 NUM_TABLES = 10;
+  static constexpr u64 MINHIST = 4;
+  static constexpr u64 MAXHIST = 359;
+  static constexpr std::array<u64, 10> TABLE_SIZE = {256, 256, 256, 512, 1024, 512, 1024, 1024, 1024, 1024};
+  static constexpr std::array<u64, 10> TAG_WIDTH  = {13, 13, 11, 10, 10,   9,   8,   7,   7,   7};
+  static constexpr std::array<u64, 10> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3};
+  static constexpr std::array<u64, 10> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0};
+  static constexpr std::array<u64, 10> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1};
+  static constexpr std::array<u64, 10> HIST_LEN   = {359, 226, 145, 91, 53, 37, 24, 13, 9, 4};
+};
+
+// 256Kbit TAGE-SC-L (Seznec) scaled to ~96Kbit — 15 tables, graded tags 7→15
+// Original entries /4, rounded to powers of 2
+// Hist: 6,10,18,25,35,55,69,105,155,230,354,479,642,1012,1347
+struct TDConfig256Kd4 {
+  static constexpr u64 NUM_TABLES = 15;
+  static constexpr u64 MINHIST = 6;
+  static constexpr u64 MAXHIST = 1347;
+  static constexpr std::array<u64, 15> TABLE_SIZE = {32, 32, 64, 128, 128, 128, 256, 256, 256, 256, 256, 512, 256, 256, 256};
+  static constexpr std::array<u64, 15> TAG_WIDTH  = {15, 15, 15, 14, 13, 12, 12, 12, 11, 11, 10,  9,  9,  9,  7};
+  static constexpr std::array<u64, 15> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3,3,3,3,3,3};
+  static constexpr std::array<u64, 15> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+  static constexpr std::array<u64, 15> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+  static constexpr std::array<u64, 15> HIST_LEN   = {1347, 1012, 642, 479, 354, 230, 155, 105, 69, 55, 35, 25, 18, 10, 6};
+};
+
+// 256Kbit L-TAGE (Seznec) scaled to ~96Kbit — 12 tables, graded tags 7→15
+// Original entries /4, rounded to powers of 2
+// Uses geometric history from MINH=5 to MAXH=800
+struct TDConfigLTAGE {
+  static constexpr u64 NUM_TABLES = 12;
+  static constexpr u64 MINHIST = 5;
+  static constexpr u64 MAXHIST = 800;
+  static constexpr std::array<u64, 12> TABLE_SIZE = {128, 128, 256, 256, 256, 512, 512, 512, 512, 256, 128, 128};
+  static constexpr std::array<u64, 12> TAG_WIDTH  = {15, 14, 13, 12, 12, 11, 10,  9,  8,  8,  7,  7};
+  static constexpr std::array<u64, 12> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3,3,3};
+  static constexpr std::array<u64, 12> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0,0,0};
+  static constexpr std::array<u64, 12> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1,1,1};
+  static constexpr std::array<u64, 12> HIST_LEN   = {800, 500, 320, 200, 130, 80, 50, 32, 20, 13, 8, 5};
+};
+
 // ============================================================================
 // Allocation Policy Configs
 // ============================================================================
@@ -318,6 +377,7 @@ struct TDDefaultAllocConfig {
   static constexpr u64 PROB_START = 0;
   static constexpr bool PARTIAL_UPDATE = false;
   static constexpr bool MISPREDICT_ONLY_WRITE = false;
+  static constexpr bool DISAGREE_EXTRA_CYCLE = true; // grant extra cycle on P1/P2 disagree (like reference tage)
 };
 
 struct TDMispredOnlyAllocConfig {
@@ -327,6 +387,7 @@ struct TDMispredOnlyAllocConfig {
   static constexpr u64 PROB_START = 0;
   static constexpr bool PARTIAL_UPDATE = false;
   static constexpr bool MISPREDICT_ONLY_WRITE = true;
+  static constexpr bool DISAGREE_EXTRA_CYCLE = false;
 };
 
 // ============================================================================
@@ -690,13 +751,13 @@ struct TDMakeTableTuple<Cfg, BANKS, BSHIFT, std::index_sequence<Is...>> {
 // ============================================================================
 
 template <typename TableCfg, typename AllocCfg, u64 LINEINST_V, u64 N_V,
-          bool SHARED_TAG_V, bool SHARED_U_V, bool SHARED_HYS_V,
-          bool U_STOR_FF_V, u64 DECAY_CTR_V, u64 DECAY_GRAN_V,
+          u64 DECAY_CTR_V, u64 DECAY_GRAN_V,
           typename DecayPolicy_V, bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V,
           u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
           bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V,
           template <u64> class FoldFn_V,
-          u64 RWRAM_BANKS_V = 4, u64 RWRAM_BANK_SHIFT_V = 0>
+          u64 RWRAM_BANKS_V = 4, u64 RWRAM_BANK_SHIFT_V = 0,
+          u64 EPOCH_CTR_BITS_V = 18>
 struct TageDirectImpl : predictor {
 
   // ======== Constants ========
@@ -719,7 +780,7 @@ struct TageDirectImpl : predictor {
   static constexpr u64 P1_ENTRIES = P1_TABLE_SIZE_V;
   static constexpr u64 P1_INDEX_BITS = td::clog2(P1_TABLE_SIZE_V);
   static constexpr u64 LINEADDR_BITS = MAX_IDX_BITS;
-  static constexpr u64 UCTRBITS = 7;
+  static constexpr u64 EPOCH_CTR_BITS = EPOCH_CTR_BITS_V;
   static constexpr u64 PATHBITS = PATH_BITS_V;
 
   static constexpr bool USE_PROB_DECAY = (DECAY_CTR_V > 0);
@@ -786,7 +847,7 @@ struct TageDirectImpl : predictor {
   std::conditional_t<USE_META_V, arr<reg<1>, LANES>, EmptyMember> newly_alloc;
 
   // U-bit reset
-  reg<UCTRBITS> uctr;
+  reg<EPOCH_CTR_BITS> uctr;
   std::conditional_t<USE_PROB_DECAY, reg<DECAY_CTR_V == 0 ? 1 : DECAY_CTR_V>,
                      EmptyMember>
       decay_threshold;
@@ -868,6 +929,9 @@ struct TageDirectImpl : predictor {
       print_params(std::cerr);
       params_printed = true;
     }
+#ifdef TAGE_MONITOR
+    mon.record_predict1();
+#endif
 
     inst_pc.fanout(hard<3>{});
     true_block.fanout(hard<4>{});
@@ -922,12 +986,18 @@ struct TageDirectImpl : predictor {
   }
 
   val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) override {
+#ifdef TAGE_MONITOR
+    mon.record_reuse_predict1();
+#endif
     block_size++;
     reuse_prediction(~line_end());
     return pred[num_branch];
   }
 
   val<1> predict2(val<64> inst_pc) override {
+#ifdef TAGE_MONITOR
+    mon.record_predict2();
+#endif
     val<LINEADDR_BITS> lineaddr = inst_pc >> 2;
     lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
     gfolds.fanout(hard<2>{});
@@ -1070,7 +1140,8 @@ struct TageDirectImpl : predictor {
         bool has_alt = static_cast<u64>(match2[r] != hard<0>{});
         bool pri_ne_alt = static_cast<u64>(pred1_tage[r]) != static_cast<u64>(pred2_tage[r]);
         mon_altsel[r] = static_cast<u64>(altsel[r]);
-        mon_meta_active[r] = has_alt && pri_ne_alt && static_cast<u64>(altsel[r]);
+        bool is_newly_alloc = static_cast<u64>(newly_alloc[r]);
+        mon_meta_active[r] = has_alt && pri_ne_alt && is_newly_alloc;
       }
 #endif
     } else {
@@ -1088,6 +1159,9 @@ struct TageDirectImpl : predictor {
   }
 
   val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) override {
+#ifdef TAGE_MONITOR
+    mon.record_reuse_predict2();
+#endif
     val<1> taken = p2 >> num_branch;
     taken.fanout(hard<2>{});
     block_size++;
@@ -1378,7 +1452,12 @@ struct TageDirectImpl : predictor {
         return mispredict;
       } else {
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
-        return some_badpred1.fo1() | mispredict;
+        val<1> base = some_badpred1.fo1() | mispredict;
+        if constexpr (AllocCfg::DISAGREE_EXTRA_CYCLE) {
+          return base | (disagree_mask != hard<0>{});
+        } else {
+          return base;
+        }
       }
     }();
 #ifdef TD_VERBOSE
@@ -1663,7 +1742,7 @@ struct TageDirectImpl : predictor {
       // uctrsat only fires on mispredictions, so extra_cycle is guaranteed.
       execute_if(uctrsat, [&]() {
 #ifdef TAGE_MONITOR
-        mon.record_epoch_reset();
+        if (static_cast<u64>(uctrsat)) mon.record_epoch_reset();
 #endif
         static_loop<NUM_TABLES>([&]<u64 I>() {
 #ifdef TD_VERBOSE
@@ -1703,12 +1782,10 @@ struct TageDirectImpl : predictor {
 // User-facing Alias
 // ============================================================================
 
-template <typename TableCfg = td::TDTableConfig<8, 2048, 11, 1, 2, 1, 16, 400, 4>, // NOTE: @modify <NTABLES, BASE_SIZE, TAG, CTR, HYST, U, MINH, MAXH, SIZE_RATIO>
+template <typename TableCfg = td::TDTableConfig<>, // NOTE: @modify table config (TDTableConfig<...>, TDConfig32Kx2, TDConfig32Kx4, TDConfig256Kd4, TDConfigLTAGE)
           typename AllocCfg = td::TDDefaultAllocConfig, // NOTE: @modify allocation policy
           u64 TD_LINEINST = 1024,  // NOTE: @modify max instructions per line
           u64 TD_N = 7,            // NOTE: @modify max branches per block
-          bool TD_SHARED_TAG = true, bool TD_SHARED_U = true,   // NOTE: @modify sharing
-          bool TD_SHARED_HYS = true, bool TD_U_STOR_FF = false, // NOTE: @modify sharing/storage
           u64 TD_DECAY_CTR = 0, u64 TD_DECAY_GRAN = 2,          // NOTE: @modify decay timing (0=epoch reset, >0=prob decay)
           typename TD_DECAY_POLICY = td::TDDecayMild,            // NOTE: @modify decay policy
           bool TD_P1_USE_GSHARE = true, u64 TD_P1_TABLE_SIZE = 4096, // NOTE: @modify P1 gshare
@@ -1718,13 +1795,13 @@ template <typename TableCfg = td::TDTableConfig<8, 2048, 11, 1, 2, 1, 16, 400, 4
           bool TD_USE_PATH_HIST = false,                  // NOTE: @modify path history
           u64 TD_PATH_HIST_WIDTH = 27, u64 TD_PATH_BITS = 6, // NOTE: @modify path params
           template <u64> class TD_FOLD_FN = td::XORFold,  // NOTE: @modify fold function
-          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0> // NOTE: @modify rwram banking
+          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0, // NOTE: @modify rwram banking
+          u64 TD_EPOCH_CTR_BITS = 8> // NOTE: @modify epoch counter width (8=reset every ~256 like reference, 18=reset every ~256K)
 
 using TageDirect =
-    TageDirectImpl<TableCfg, AllocCfg, TD_LINEINST, TD_N, TD_SHARED_TAG,
-                   TD_SHARED_U, TD_SHARED_HYS, TD_U_STOR_FF, TD_DECAY_CTR,
+    TageDirectImpl<TableCfg, AllocCfg, TD_LINEINST, TD_N, TD_DECAY_CTR,
                    TD_DECAY_GRAN, TD_DECAY_POLICY, TD_P1_USE_GSHARE,
                    TD_P1_TABLE_SIZE, TD_P1_HIST, TD_USE_META, TD_METABITS,
                    TD_METAPIPE, TD_USE_PATH_HIST, TD_PATH_HIST_WIDTH,
                    TD_PATH_BITS, TD_FOLD_FN, TD_RWRAM_BANKS,
-                   TD_RWRAM_BANK_SHIFT>;
+                   TD_RWRAM_BANK_SHIFT, TD_EPOCH_CTR_BITS>;
