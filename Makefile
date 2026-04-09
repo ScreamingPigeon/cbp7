@@ -28,7 +28,7 @@ MEASURE ?= 40000
 REGION_SHIFT ?= 12
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor cbp-gshare-monitor compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report save list-saved clean
 
 all: cbp reference
 
@@ -134,8 +134,15 @@ cbp-profile-analyze-regions: $(BUILD_DIR)/cbp-profile | out
 MONITOR_FLAGS := -DTAGE_MONITOR -DCHEATING_MODE -DREAD_WRITE_RAM
 MONITOR_OUT ?= out/monitor.txt
 
+# GshareN-Ahead Monitor
+GSHARE_MONITOR_FLAGS := -DGSHARE_AHEAD_MONITOR -DCHEATING_MODE -DREAD_WRITE_RAM
+GSHARE_MONITOR_OUT ?= out/gshare_monitor.txt
+
 $(BUILD_DIR)/cbp-monitor: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) $(MONITOR_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
+
+$(BUILD_DIR)/cbp-gshare-monitor: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) $(GSHARE_MONITOR_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
 
 MONITOR_MEASURE ?= $(MEASURE)
 PROFILE_MEASURE ?= 100000
@@ -151,6 +158,14 @@ cbp-monitor: $(BUILD_DIR)/cbp-monitor $(BUILD_DIR)/cbp-profile | out
 	@echo "=== Monitor ===" && cat $(MONITOR_OUT)
 	@echo ""
 	@echo "Files: $(MONITOR_OUT), out/monitor_csv.txt"
+
+cbp-gshare-monitor: $(BUILD_DIR)/cbp-gshare-monitor | out
+	@echo "=== Running GshareN-Ahead Monitor ==="
+	./$(BUILD_DIR)/cbp-gshare-monitor $(TRACE) $(TRACE_NAME) $(WARMUP) $(MONITOR_MEASURE) 1> out/gshare_monitor_csv.txt 2> $(GSHARE_MONITOR_OUT)
+	@echo ""
+	@echo "=== GshareN-Ahead Monitor ===" && cat $(GSHARE_MONITOR_OUT)
+	@echo ""
+	@echo "Files: $(GSHARE_MONITOR_OUT), out/gshare_monitor_csv.txt"
 
 # Compare two predictors side-by-side.
 # Single trace:  make compare TRACE=path/to/trace.gz
