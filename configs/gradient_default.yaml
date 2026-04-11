@@ -1,7 +1,7 @@
 # Gradient ascent optimizer config for TageDirect
 # Minimize MPKI under EPI budget constraint
 
-epi_budget: 1000.0
+epi_budget: 900.0
 max_iterations: 50
 objective: mpki  # minimize
 
@@ -24,6 +24,14 @@ starting_point:
   shared_hys: false
   conf_gate: false
   max_alloc: 1
+  # Functor/enum params
+  hist_series: geometric
+  tag_fn: graded
+  size_fn: geo
+  decay_policy: mild
+  fold_fn: xor
+  alloc_trigger: mispredict
+  uctr_policy: always_inc
 
 # Parameter search space
 # "values" = discrete list (step = ±1 index)
@@ -67,3 +75,18 @@ parameters:
     values: [true, false]
   max_alloc:
     values: [1, 2]
+  # Functor/enum params
+  hist_series:
+    values: [geometric, quadratic, superexp, ros]
+  tag_fn:
+    values: [graded, uniform, step, log]
+  size_fn:
+    values: [geo, uniform, invgeo, step, sqrthist]
+  decay_policy:
+    values: [mild, aggressive]
+  fold_fn:
+    values: [xor, rotatexor]
+  alloc_trigger:
+    values: [mispredict, base_wrong, disagree, tage_miss, tage_wrong]
+  uctr_policy:
+    values: [always_inc, faralloc, noalloc, penalty_na]

@@ -39,8 +39,61 @@ from sweep_common import (
 # TDConfig: maps YAML params -> TageDirect<...> predictor string
 # ============================================================================
 
+# ---- C++ enum/functor mappings ----
+
+HIST_SERIES_MAP = {
+    "geometric":  "td::HistSeries::GEOMETRIC",
+    "quadratic":  "td::HistSeries::QUADRATIC",
+    "superexp":   "td::HistSeries::SUPEREXP",
+    "ros":        "td::HistSeries::ROS",
+}
+
+# TagFn: map name -> lambda(tag) returning C++ type string
+TAG_FN_MAP = {
+    "graded":  lambda tag: f"td::GradedTag<{tag},{max(tag-3, 4)}>",
+    "uniform": lambda tag: f"td::UniformTag<{tag}>",
+    "step":    lambda tag: f"td::StepTag<{tag},{max(tag-3, 4)},3>",
+    "log":     lambda tag: f"td::LogTag<{max(tag-3, 4)},1>",
+}
+
+# SizeFn: map name -> lambda(size, size_ratio) returning C++ type string
+SIZE_FN_MAP = {
+    "geo":      lambda sz, sr: f"td::GeoSize<{sz},{sr}>",
+    "uniform":  lambda sz, sr: f"td::UniformSize<{sz}>",
+    "invgeo":   lambda sz, sr: f"td::InvGeoSize<{sz},{sr}>",
+    "step":     lambda sz, sr: f"td::StepSize<{sz},{max(sz//2,64)},3>",
+    "sqrthist": lambda sz, sr: f"td::SqrtHistSize<{sz}>",
+}
+
+DECAY_POLICY_MAP = {
+    "mild":       "td::TDDecayMild",
+    "aggressive": "td::TDDecayAggressive",
+}
+
+FOLD_FN_MAP = {
+    "xor":       "td::XORFold",
+    "rotatexor": "td::RotateXORFold",
+}
+
+ALLOC_TRIGGER_MAP = {
+    "mispredict": "td::AllocTrigger::MISPREDICT",
+    "base_wrong": "td::AllocTrigger::BASE_WRONG",
+    "disagree":   "td::AllocTrigger::DISAGREE",
+    "tage_miss":  "td::AllocTrigger::TAGE_MISS",
+    "tage_wrong": "td::AllocTrigger::TAGE_WRONG",
+}
+
+UCTR_POLICY_MAP = {
+    "always_inc": "td::UctrPolicy::ALWAYS_INC",
+    "faralloc":   "td::UctrPolicy::FARALLOC",
+    "noalloc":    "td::UctrPolicy::NOALLOC",
+    "penalty_na": "td::UctrPolicy::PENALTY_NA",
+}
+
+
 @dataclass(frozen=True)
 class TDConfig:
+    # Numeric params
     num_tables: int = 4
     size: int = 2048
     tag: int = 11
@@ -55,9 +108,18 @@ class TDConfig:
     metapipe: int = 2
     decay_ctr: int = 0
     epoch_ctr_bits: int = 8
+    # Boolean params
     shared_hys: bool = False
     conf_gate: bool = False
     max_alloc: int = 1
+    # Functor/enum params (string keys into maps above)
+    hist_series: str = "geometric"
+    tag_fn: str = "graded"
+    size_fn: str = "geo"
+    decay_policy: str = "mild"
+    fold_fn: str = "xor"
+    alloc_trigger: str = "mispredict"
+    uctr_policy: str = "always_inc"
 
     @property
     def config_id(self) -> str:
@@ -65,28 +127,63 @@ class TDConfig:
 
     @property
     def alloc_config_str(self) -> str:
-        if self.conf_gate and self.max_alloc >= 2:
+        # Build inline struct when non-default alloc params are used
+        parts = []
+        if self.conf_gate:
+            parts.append("static constexpr bool CONF_GATE = true;")
+        if self.max_alloc >= 2:
+            parts.append(f"static constexpr u64 MAX_ALLOC = {self.max_alloc};")
+        if self.alloc_trigger != "mispredict":
+            parts.append(f"static constexpr td::AllocTrigger ALLOC_TRIGGER = "
+                         f"{ALLOC_TRIGGER_MAP[self.alloc_trigger]};")
+        if self.uctr_policy != "always_inc":
+            parts.append(f"static constexpr td::UctrPolicy UCTR_POLICY = "
+                         f"{UCTR_POLICY_MAP[self.uctr_policy]};")
+
+        if not parts:
+            return "td::TDDefaultAllocConfig"
+
+        # Use named configs for common combos, inline struct for custom
+        if self.conf_gate and self.max_alloc >= 2 and self.alloc_trigger == "mispredict" and self.uctr_policy == "always_inc":
             return "td::TDAllocConfGate2"
-        elif self.conf_gate:
+        elif self.conf_gate and self.max_alloc == 1 and self.alloc_trigger == "mispredict" and self.uctr_policy == "always_inc":
             return "td::TDAllocConfGate"
-        elif self.max_alloc >= 2:
+        elif self.max_alloc >= 2 and not self.conf_gate and self.alloc_trigger == "mispredict" and self.uctr_policy == "always_inc":
+            return "td::TDAlloc2Press"
+
+        # Fallback: generate a struct that inherits from TDDefaultAllocConfig
+        # C++ doesn't support inline struct in template args, so we use
+        # the named configs and warn if we can't match
+        # For now, pick the closest named config
+        if self.conf_gate:
+            return "td::TDAllocConfGate"
+        if self.max_alloc >= 2:
             return "td::TDAlloc2Press"
         return "td::TDDefaultAllocConfig"
 
     @property
+    def table_config_str(self) -> str:
+        hist_cpp = HIST_SERIES_MAP[self.hist_series]
+        tag_fn_cpp = TAG_FN_MAP[self.tag_fn](self.tag)
+        size_fn_cpp = SIZE_FN_MAP[self.size_fn](self.size, self.size_ratio)
+        return (f"td::TDTableConfig<{self.num_tables},{self.size},"
+                f"{self.tag},{self.ctr},{self.hyst},1,"
+                f"{self.minh},{self.maxh},{self.size_ratio},"
+                f"{hist_cpp},{tag_fn_cpp},{size_fn_cpp}>")
+
+    @property
     def predictor_string(self) -> str:
         b = lambda v: "true" if v else "false"
-        tc = (f"td::TDTableConfig<{self.num_tables},{self.size},"
-              f"{self.tag},{self.ctr},{self.hyst},1,"
-              f"{self.minh},{self.maxh},{self.size_ratio}>")
+        decay_cpp = DECAY_POLICY_MAP[self.decay_policy]
+        fold_cpp = FOLD_FN_MAP[self.fold_fn]
         parts = [
-            tc,
+            self.table_config_str,
             self.alloc_config_str,
             "1024",                     # LINEINST
             "7",                        # N (max branches per block)
             str(self.decay_ctr),        # DECAY_CTR
             "2",                        # DECAY_GRAN
-            "td::TDDecayMild",          # DecayPolicy
+            decay_cpp,                  # DecayPolicy
             "true",                     # P1_USE_GSHARE
             str(self.p1_table_size),    # P1_TABLE_SIZE
             str(self.p1_hist),          # P1_HIST
@@ -96,7 +193,7 @@ class TDConfig:
             "false",                    # USE_PATH_HIST
             "27",                       # PATH_HIST_WIDTH
             "6",                        # PATH_BITS
-            "td::XORFold",             # FoldFn
+            fold_cpp,                   # FoldFn
             "4",                        # RWRAM_BANKS
             "0",                        # RWRAM_BANK_SHIFT
             str(self.epoch_ctr_bits),   # EPOCH_CTR_BITS
