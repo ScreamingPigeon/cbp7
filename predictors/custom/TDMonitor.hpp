@@ -28,6 +28,7 @@ struct TDMonitor {
     u64 mispredictions = 0;
     u64 blocks = 0;
     u64 extra_cycles = 0;
+    u64 extra_cycles_all_silent = 0;  // extra cycles where every write was silenced
 
     // Pipeline call counts
     u64 predict1_calls = 0;
@@ -93,6 +94,14 @@ struct TDMonitor {
     u64 uctr_sum = 0;
     u64 uctr_samples = 0;
 
+    // Silent update elimination
+    std::array<u64, NUM_TABLES> pred_write_eligible{};  // would have written without silent elim
+    std::array<u64, NUM_TABLES> pred_write_silenced{};  // skipped because pred didn't change
+    std::array<u64, NUM_TABLES> hyst_write_eligible{};
+    std::array<u64, NUM_TABLES> hyst_write_silenced{};
+    std::array<u64, NUM_TABLES> u_write_eligible{};
+    std::array<u64, NUM_TABLES> u_write_silenced{};
+
     // rwram banking (hyst + u combined per table)
     std::array<u64, NUM_TABLES> rwram_reads{};
     std::array<u64, NUM_TABLES> rwram_writes{};
@@ -119,6 +128,24 @@ struct TDMonitor {
 
   // Unique branch PCs
   std::unordered_set<u64> unique_branch_pcs;
+
+  // Per-cycle write tracking: set before update, cleared when any write fires
+  bool cycle_had_write = false;
+  bool cycle_is_extra = false;
+
+  void begin_update_cycle(bool extra_cycle_fired) {
+    cycle_had_write = false;
+    cycle_is_extra = extra_cycle_fired;
+  }
+
+  void mark_write() { cycle_had_write = true; }
+
+  void end_update_cycle() {
+    if (cycle_is_extra && !cycle_had_write) {
+      cum.extra_cycles_all_silent++;
+      win.extra_cycles_all_silent++;
+    }
+  }
 
   // ======== Shadow state (set in predict2, consumed in update_cycle) ========
   static constexpr u64 MAX_FW = 64;
@@ -302,6 +329,20 @@ struct TDMonitor {
     }
   }
 
+  // Silent update elimination: call with silenced=true when write was skipped
+  void record_silent_pred(u64 table, bool silenced) {
+    cum.pred_write_eligible[table]++; win.pred_write_eligible[table]++;
+    if (silenced) { cum.pred_write_silenced[table]++; win.pred_write_silenced[table]++; }
+  }
+  void record_silent_hyst(u64 table, bool silenced) {
+    cum.hyst_write_eligible[table]++; win.hyst_write_eligible[table]++;
+    if (silenced) { cum.hyst_write_silenced[table]++; win.hyst_write_silenced[table]++; }
+  }
+  void record_silent_u(u64 table, bool silenced) {
+    cum.u_write_eligible[table]++; win.u_write_eligible[table]++;
+    if (silenced) { cum.u_write_silenced[table]++; win.u_write_silenced[table]++; }
+  }
+
   // rwram banking
   void record_rwram_read(u64 table) {
     cum.rwram_reads[table]++; win.rwram_reads[table]++;
@@ -309,6 +350,7 @@ struct TDMonitor {
 
   void record_rwram_write(u64 table, u64 bank_id, bool direct,
                           u64 read_bank_mask, u64 write_bank_mask) {
+    mark_write();
     cum.rwram_writes[table]++; win.rwram_writes[table]++;
     if (direct) {
       cum.rwram_writes_direct[table]++; win.rwram_writes_direct[table]++;
@@ -378,7 +420,9 @@ struct TDMonitor {
        << pct(c.mispredictions, c.branches) << "%)\n";
     os << "Blocks: " << c.blocks
        << "  Extra cycles: " << c.extra_cycles
-       << " (" << pct(c.extra_cycles, c.blocks) << "%)\n";
+       << " (" << pct(c.extra_cycles, c.blocks) << "%)"
+       << "  All-silent: " << c.extra_cycles_all_silent
+       << " (" << pct(c.extra_cycles_all_silent, c.extra_cycles) << "% of extra)\n";
 
     // Pipeline calls
     os << "\nPipeline Calls:\n";
@@ -558,6 +602,38 @@ struct TDMonitor {
     os << "  Decay fires: " << c.decay_fire_count
        << "  Epoch resets: " << c.epoch_resets
        << "  Avg uctr: " << (c.uctr_samples > 0 ? double(c.uctr_sum) / c.uctr_samples : 0) << "\n";
+
+    // Silent update elimination
+    os << "\nSilent Update Elimination:\n";
+    os << "  Table  | Pred Elig | Pred Skip | Skip% | Hyst Elig | Hyst Skip | Skip% | U Elig    | U Skip    | Skip%\n";
+    os << "  -------+-----------+-----------+-------+-----------+-----------+-------+-----------+-----------+------\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << ""
+         << "|" << std::setw(10) << c.pred_write_eligible[i]
+         << " |" << std::setw(10) << c.pred_write_silenced[i]
+         << " |" << std::setw(5) << pct(c.pred_write_silenced[i], c.pred_write_eligible[i]) << "%"
+         << " |" << std::setw(10) << c.hyst_write_eligible[i]
+         << " |" << std::setw(10) << c.hyst_write_silenced[i]
+         << " |" << std::setw(5) << pct(c.hyst_write_silenced[i], c.hyst_write_eligible[i]) << "%"
+         << " |" << std::setw(10) << c.u_write_eligible[i]
+         << " |" << std::setw(10) << c.u_write_silenced[i]
+         << " |" << std::setw(5) << pct(c.u_write_silenced[i], c.u_write_eligible[i]) << "%\n";
+    }
+    u64 tot_pred_e = 0, tot_pred_s = 0, tot_hyst_e = 0, tot_hyst_s = 0, tot_u_e = 0, tot_u_s = 0;
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      tot_pred_e += c.pred_write_eligible[i]; tot_pred_s += c.pred_write_silenced[i];
+      tot_hyst_e += c.hyst_write_eligible[i]; tot_hyst_s += c.hyst_write_silenced[i];
+      tot_u_e += c.u_write_eligible[i]; tot_u_s += c.u_write_silenced[i];
+    }
+    os << "  Total  |" << std::setw(10) << tot_pred_e
+       << " |" << std::setw(10) << tot_pred_s
+       << " |" << std::setw(5) << pct(tot_pred_s, tot_pred_e) << "%"
+       << " |" << std::setw(10) << tot_hyst_e
+       << " |" << std::setw(10) << tot_hyst_s
+       << " |" << std::setw(5) << pct(tot_hyst_s, tot_hyst_e) << "%"
+       << " |" << std::setw(10) << tot_u_e
+       << " |" << std::setw(10) << tot_u_s
+       << " |" << std::setw(5) << pct(tot_u_s, tot_u_e) << "%\n";
 
     // rwram
     os << "\nRWRAM Bank Stats (per table, hyst+u combined):\n";

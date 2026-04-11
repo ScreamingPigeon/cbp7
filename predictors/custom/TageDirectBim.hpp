@@ -867,6 +867,7 @@ struct TageDirectBimImpl : predictor {
 
 #ifdef TAGE_MONITOR
     // Block stats
+    mon.begin_update_cycle(static_cast<u64>(extra_cycle));
     mon.record_block(static_cast<u64>(block_entry), block_size, num_branch,
                      static_cast<u64>(extra_cycle));
     // Per-branch outcome + prediction tracking (p2 indexed by offset now)
@@ -958,6 +959,9 @@ struct TageDirectBimImpl : predictor {
 #endif
         std::get<I>(tables).tag_ram.write(tidx<I>(gindex[I]),
                                           concat(htag[I], last_offset));
+#ifdef TAGE_MONITOR
+        mon.mark_write();
+#endif
       });
     });
 
@@ -993,11 +997,19 @@ struct TageDirectBimImpl : predictor {
           else return readc[I] >> hard<MAX_CTR_WIDTH - 1>{};
         }();
         val<1> pred_changed = (old_dir != bdir[I]) | allocate[I];
-        execute_if((g_weak[I].fo1() | allocate[I]) & pred_changed, [&]() {
+        val<1> pred_eligible = g_weak[I].fo1() | allocate[I];
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(pred_eligible))
+          mon.record_silent_pred(I, !static_cast<u64>(pred_changed));
+#endif
+        execute_if(pred_eligible & pred_changed, [&]() {
 #ifdef TD_VERBOSE
           std::cerr << "UC: tage pred_ram[" << I << "] WRITE (standard)\n";
 #endif
           std::get<I>(tables).pred_ram.write(tidx<I>(gindex[I]), bdir[I]);
+#ifdef TAGE_MONITOR
+          mon.mark_write();
+#endif
         });
       });
     }
@@ -1018,6 +1030,10 @@ struct TageDirectBimImpl : predictor {
           else
             return primary[I] | allocate[I];
         }();
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(should_update))
+          mon.record_silent_hyst(I, !static_cast<u64>(would_change));
+#endif
         execute_if(should_update & would_change, [&]() {
           auto newhyst = select(allocate[I], val<HW>{0},
                                 td::update_ctr(readh[I], ~badpred1[I]));
@@ -1093,7 +1109,12 @@ struct TageDirectBimImpl : predictor {
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I] & ~decay_fire;
         val<1> u_changed = (val<1>{readu[I]} != newu);
-        execute_if((update_u[I].fo1() | allocate[I] | uclear[I] | decay_fire) & u_changed, [&]() {
+        val<1> u_eligible = update_u[I].fo1() | allocate[I] | uclear[I] | decay_fire;
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(u_eligible))
+          mon.record_silent_u(I, !static_cast<u64>(u_changed));
+#endif
+        execute_if(u_eligible & u_changed, [&]() {
 #ifdef TD_VERBOSE
           std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
 #endif
@@ -1111,7 +1132,12 @@ struct TageDirectBimImpl : predictor {
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I];
         val<1> u_changed = (val<1>{readu[I]} != newu);
-        execute_if((update_u[I].fo1() | allocate[I] | uclear[I]) & u_changed, [&]() {
+        val<1> u_eligible_nd = update_u[I].fo1() | allocate[I] | uclear[I];
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(u_eligible_nd))
+          mon.record_silent_u(I, !static_cast<u64>(u_changed));
+#endif
+        execute_if(u_eligible_nd & u_changed, [&]() {
 #ifdef TD_VERBOSE
           std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
 #endif
@@ -1241,6 +1267,9 @@ struct TageDirectBimImpl : predictor {
       }
     });
 
+#ifdef TAGE_MONITOR
+    mon.end_update_cycle();
+#endif
 #ifdef TD_VERBOSE
     std::cerr << "UC: EXIT (full update)\n";
 #endif

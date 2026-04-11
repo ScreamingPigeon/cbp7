@@ -421,6 +421,103 @@ struct TDConfigLTAGE {
 };
 
 // ============================================================================
+// Allocation Target Policies (functors)
+//
+// These control which candidate table(s) get allocated into.
+// Input:  collamask = reversed candidate mask (LSB = closest to provider)
+//         alloc_pressure, accuracy_pressure = pressure register values
+// Output: modified collamask (one_hot + MAX_ALLOC logic picks from result)
+//
+// The `x & (x-1)` idiom clears the lowest set bit, effectively skipping
+// the closest candidate. Applied N times = skip N closest candidates.
+// ============================================================================
+
+// Always pick the closest candidate (default — current behavior)
+struct ClosestTarget {
+  static constexpr const char* name() { return "Closest"; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, u64, u64) {
+    return collamask;
+  }
+};
+
+// Helper: clear the N lowest set bits from a bitmask (single-assignment friendly)
+// x & (x-1) clears the LSB. Each step produces a new val<>.
+namespace target_detail {
+  template <u64 NT>
+  val<NT> clear_lsb(val<NT> x) {
+    x.fanout(hard<2>{});
+    return x & val<NT>(x - 1);
+  }
+
+  template <u64 SKIP, u64 NT>
+  val<NT> skip_n(val<NT> x) {
+    static_assert(SKIP <= 4, "skip_n: SKIP > 4 not supported");
+    if constexpr (SKIP == 0) return x;
+    else if constexpr (SKIP == 1) return clear_lsb(x);
+    else { val<NT> s = skip_n<SKIP - 1, NT>(x); return clear_lsb(s); }
+  }
+} // namespace target_detail
+
+// Deterministically skip SKIP closest candidates, always allocate further out
+template <u64 SKIP = 1>
+struct DeterministicSkipTarget {
+  static_assert(SKIP <= 4, "DeterministicSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "DetSkip"; }
+  static constexpr u64 skip() { return SKIP; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, u64, u64) {
+    return target_detail::skip_n<SKIP, NT>(collamask);
+  }
+};
+
+// Skip SKIP closest with static probability PROB/256
+template <u64 SKIP = 1, u64 PROB_256 = 64>
+struct StaticSkipTarget {
+  static_assert(SKIP <= 4, "StaticSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "StaticSkip"; }
+  static constexpr u64 skip() { return SKIP; }
+  static constexpr u64 prob() { return PROB_256; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, u64, u64) {
+    collamask.fanout(hard<2>{});
+    val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
+    val<8> rv = val<8>{static_cast<u64>(std::rand())};
+    return select(rv < hard<PROB_256>{}, skipped, collamask);
+  }
+};
+
+// Skip probability scales with alloc_pressure register (high pressure = skip more)
+template <u64 SKIP = 1>
+struct AllocPressureSkipTarget {
+  static_assert(SKIP <= 4, "AllocPressureSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "AllocPressureSkip"; }
+  static constexpr u64 skip() { return SKIP; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, u64 ap, u64) {
+    collamask.fanout(hard<2>{});
+    val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
+    val<8> rv = val<8>{static_cast<u64>(std::rand())};
+    return select(val<8>{ap} > rv, skipped, collamask);
+  }
+};
+
+// Skip probability scales with accuracy_pressure register (low accuracy = skip more)
+template <u64 SKIP = 1>
+struct AccuracyPressureSkipTarget {
+  static_assert(SKIP <= 4, "AccuracyPressureSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "AccPressureSkip"; }
+  static constexpr u64 skip() { return SKIP; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, u64, u64 acp) {
+    collamask.fanout(hard<2>{});
+    val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
+    val<8> rv = val<8>{static_cast<u64>(std::rand())};
+    return select(val<8>{acp} > rv, skipped, collamask);
+  }
+};
+
+// ============================================================================
 // Allocation Policy Configs
 // ============================================================================
 
@@ -437,6 +534,7 @@ struct TDDefaultAllocConfig {
   static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::ALWAYS_INC;
   static constexpr u64 ALLOC_PRESSURE_BITS    = 0;  // 0 = disabled
   static constexpr u64 ACCURACY_PRESSURE_BITS = 0;  // 0 = disabled
+  using TARGET_POLICY = ClosestTarget;              // allocation target selection functor
 };
 
 struct TDMispredOnlyAllocConfig {
@@ -452,6 +550,7 @@ struct TDMispredOnlyAllocConfig {
   static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::FARALLOC;
   static constexpr u64 ALLOC_PRESSURE_BITS    = 0;
   static constexpr u64 ACCURACY_PRESSURE_BITS = 0;
+  using TARGET_POLICY = ClosestTarget;
 };
 
 // ---- Test configs for allocation experiments ----
@@ -477,6 +576,39 @@ struct TDAllocDisagree : TDDefaultAllocConfig {
 struct TDAllocTageMiss : TDDefaultAllocConfig {
   static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::TAGE_MISS;
   static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::NOALLOC;
+};
+
+// Static 25% skip-1 target policy
+struct TDAllocSkip1 : TDDefaultAllocConfig {
+  using TARGET_POLICY = StaticSkipTarget<1, 64>;
+};
+
+// Deterministic skip-1 (always allocate to second-closest)
+struct TDAllocDetSkip1 : TDDefaultAllocConfig {
+  using TARGET_POLICY = DeterministicSkipTarget<1>;
+};
+
+// CONF_GATE: only override base when u-bit set (proven-useful entries only)
+struct TDAllocConfGate : TDDefaultAllocConfig {
+  static constexpr bool CONF_GATE = true;
+};
+
+// CONF_GATE + multi-alloc (2 tables per misprediction)
+struct TDAllocConfGate2 : TDDefaultAllocConfig {
+  static constexpr bool CONF_GATE = true;
+  static constexpr u64 MAX_ALLOC = 2;
+};
+
+// CONF_GATE + alloc pressure (4-bit counter tracks alloc success rate)
+struct TDAllocConfGatePress : TDDefaultAllocConfig {
+  static constexpr bool CONF_GATE = true;
+  static constexpr u64 ALLOC_PRESSURE_BITS = 4;
+};
+
+// Multi-alloc 2 + accuracy pressure (4-bit) — no conf gate
+struct TDAlloc2Press : TDDefaultAllocConfig {
+  static constexpr u64 MAX_ALLOC = 2;
+  static constexpr u64 ACCURACY_PRESSURE_BITS = 4;
 };
 
 // ============================================================================
@@ -1053,6 +1185,11 @@ struct TageDirectImpl : predictor {
     os << "\n  ALLOC_PRESSURE_BITS=" << AllocCfg::ALLOC_PRESSURE_BITS
        << "  ACCURACY_PRESSURE_BITS=" << AllocCfg::ACCURACY_PRESSURE_BITS;
     os << "\n  DISAGREE_EXTRA_CYCLE=" << AllocCfg::DISAGREE_EXTRA_CYCLE;
+    os << "\n  TARGET_POLICY=" << AllocCfg::TARGET_POLICY::name();
+    if constexpr (requires { AllocCfg::TARGET_POLICY::skip(); })
+      os << "  SKIP=" << AllocCfg::TARGET_POLICY::skip();
+    if constexpr (requires { AllocCfg::TARGET_POLICY::prob(); })
+      os << "  PROB=" << AllocCfg::TARGET_POLICY::prob() << "/256";
     os << "\nSHARED_HYS=" << SHARED_HYS_V;
     os << "\n\n";
   }
@@ -1507,7 +1644,12 @@ struct TageDirectImpl : predictor {
       }
     }();
     candallocmask.fanout(hard<2>{});
-    val<NUM_TABLES> collamask = candallocmask.reverse();
+    val<NUM_TABLES> collamask_raw = candallocmask.reverse();
+    // Apply target policy functor (may skip closest candidates)
+    u64 ap_val = [&]() -> u64 { if constexpr (ALLOC_PRESS_W > 0) return alloc_pressure; else return 0; }();
+    u64 acp_val = [&]() -> u64 { if constexpr (ACC_PRESS_W > 0) return accuracy_pressure; else return 0; }();
+    val<NUM_TABLES> collamask = AllocCfg::TARGET_POLICY::template apply<NUM_TABLES>(
+        collamask_raw, ap_val, acp_val);
     collamask.fanout(hard<2>{});
     val<NUM_TABLES> collamask1 = collamask.one_hot();
     collamask1.fanout(hard<3>{});
@@ -1670,6 +1812,7 @@ struct TageDirectImpl : predictor {
 
 #ifdef TAGE_MONITOR
     // Block stats
+    mon.begin_update_cycle(static_cast<u64>(extra_cycle));
     mon.record_block(static_cast<u64>(block_entry), block_size, num_branch,
                      static_cast<u64>(extra_cycle));
     // Per-branch outcome + prediction tracking
@@ -1760,6 +1903,9 @@ struct TageDirectImpl : predictor {
 #endif
         std::get<I>(tables).tag_ram.write(tidx<I>(gindex[I]),
                                           concat(last_rank, htag[I]));
+#ifdef TAGE_MONITOR
+        mon.mark_write();
+#endif
       });
     });
 
@@ -1795,11 +1941,19 @@ struct TageDirectImpl : predictor {
           else return readc[I] >> hard<MAX_CTR_WIDTH - 1>{};
         }();
         val<1> pred_changed = (old_dir != bdir[I]) | allocate[I];
-        execute_if((g_weak[I].fo1() | allocate[I]) & pred_changed, [&]() {
+        val<1> pred_eligible = g_weak[I].fo1() | allocate[I];
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(pred_eligible))
+          mon.record_silent_pred(I, !static_cast<u64>(pred_changed));
+#endif
+        execute_if(pred_eligible & pred_changed, [&]() {
 #ifdef TD_VERBOSE
           std::cerr << "UC: tage pred_ram[" << I << "] WRITE (standard)\n";
 #endif
           std::get<I>(tables).pred_ram.write(tidx<I>(gindex[I]), bdir[I]);
+#ifdef TAGE_MONITOR
+          mon.mark_write();
+#endif
         });
       });
     }
@@ -1820,6 +1974,10 @@ struct TageDirectImpl : predictor {
           else
             return primary[I] | allocate[I];
         }();
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(should_update))
+          mon.record_silent_hyst(I, !static_cast<u64>(would_change));
+#endif
         execute_if(should_update & would_change, [&]() {
           auto newhyst = select(allocate[I], val<HW>{0},
                                 td::update_ctr(readh[I], ~badpred1[I]));
@@ -1895,7 +2053,12 @@ struct TageDirectImpl : predictor {
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I] & ~decay_fire;
         val<1> u_changed = (val<1>{readu[I]} != newu);
-        execute_if((update_u[I].fo1() | allocate[I] | uclear[I] | decay_fire) & u_changed, [&]() {
+        val<1> u_eligible = update_u[I].fo1() | allocate[I] | uclear[I] | decay_fire;
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(u_eligible))
+          mon.record_silent_u(I, !static_cast<u64>(u_changed));
+#endif
+        execute_if(u_eligible & u_changed, [&]() {
 #ifdef TD_VERBOSE
           std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
 #endif
@@ -1913,7 +2076,12 @@ struct TageDirectImpl : predictor {
       static_loop<NUM_TABLES>([&]<u64 I>() {
         val<1> newu = goodpred[I].fo1() & ~allocate[I] & ~uclear[I];
         val<1> u_changed = (val<1>{readu[I]} != newu);
-        execute_if((update_u[I].fo1() | allocate[I] | uclear[I]) & u_changed, [&]() {
+        val<1> u_eligible_nd = update_u[I].fo1() | allocate[I] | uclear[I];
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(u_eligible_nd))
+          mon.record_silent_u(I, !static_cast<u64>(u_changed));
+#endif
+        execute_if(u_eligible_nd & u_changed, [&]() {
 #ifdef TD_VERBOSE
           std::get<I>(tables).u_ram.debug_write_info("u_ram", I, tidx<I>(gindex[I]), extra_cycle);
 #endif
@@ -2046,6 +2214,9 @@ struct TageDirectImpl : predictor {
       }
     });
 
+#ifdef TAGE_MONITOR
+    mon.end_update_cycle();
+#endif
 #ifdef TD_VERBOSE
     std::cerr << "UC: EXIT (full update)\n";
 #endif
