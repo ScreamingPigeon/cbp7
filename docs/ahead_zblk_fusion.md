@@ -402,6 +402,33 @@ Across all blocks: 17.3% are zero-blocks.
 | ZBLK table | 512 | 36 bits | 2.3 KB |
 | ZBLK table | 1024 | 36 bits | 4.5 KB |
 
+## Pipeline Reg Timing Validation (2026-04-11)
+
+Tested the ahead pipeline register pattern in isolation (`TageAheadTest.hpp`),
+replicating the `gshareN_ahead_best` approach:
+
+```
+Pattern:
+  predict1:  write ahead[0] (RAM read + bank select + lane scatter)
+             shift ahead[0] → ahead[1] inside execute_if(true_block)
+  predict2:  return pred[num_branch] (computed from ahead[1], purely combinational)
+```
+
+Results on gcc trace (500K instructions):
+```
+TageAheadTest (gshareN_ahead_best replica):  P1=0.56, P2=0.56
+```
+
+Key findings:
+- **P2 < 1 confirmed**: The pattern achieves ceil(P2)=1 easily.
+- The pipeline shift and bank select MUST happen inside `execute_if(true_block)`.
+- Bank select via `.select(path)` and lane unscramble via `XL.rotate_left(i)` 
+  happen outside execute_if — they operate on regs written inside it.
+- Earlier simpler tests without the bank-select-inside-execute_if pattern
+  achieved P2~1.1. The full gshareN pattern gets P2=0.56.
+- This validates the ahead architecture: adding TAGE tag compare + provider
+  selection on top of these pipeline regs should stay well under P2=1.
+
 ## Open Questions
 
 1. **Optimal ZTABLE_SIZE**: Need to measure zblk working set (unique hot
