@@ -19,15 +19,16 @@
 //   6. Lane utilization (how many branches per block)
 //   7. Hot/cold branch analysis
 
-#include <iostream>
-#include <iomanip>
-#include <unordered_map>
-#include <map>
-#include <vector>
 #include <algorithm>
-#include <cstdint>
-#include <numeric>
 #include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <set>
+#include <unordered_map>
+#include <vector>
 #include "trace_reader.hpp"
 
 struct PredecessorEntry {
@@ -78,12 +79,23 @@ int main(int argc, char **argv) {
   std::map<uint64_t, uint64_t> block_size_hist;
   std::map<uint64_t, uint64_t> path_dist;
   std::map<uint64_t, uint64_t> lane_util_hist; // how many lanes used per block
+  // Joint distribution: (num_cond_branches, block_size) → count
+  std::map<std::pair<uint64_t, uint64_t>, uint64_t> joint_branches_size;
 
   // Predecessor tracking (keyed by predecessor line PC)
   std::unordered_map<uint64_t, PredecessorEntry> predecessor_map;
   uint64_t last_block_line_pc = 0;
   uint64_t last_block_path = 0;
   bool has_last_block = false;
+
+  // Zero-block analysis
+  uint64_t zblk_total = 0;
+  uint64_t zblk_sequential = 0;    // successor_pc == block_start_pc + block_instr_count * 4
+  uint64_t zblk_nonsequential = 0; // successor_pc is a jump target
+  std::map<uint64_t, uint64_t> zblk_size_hist; // size distribution of zero-blocks
+  // Track (zblk_size, successor_has_branches) for fusion viability
+  uint64_t zblk_succ_has_branches = 0; // successor block has ≥1 conditional branch
+  uint64_t zblk_succ_zero = 0;         // successor is also a zero-block (chain)
 
   // Per-branch stats
   std::unordered_map<uint64_t, BranchInfo> branch_stats;
@@ -92,12 +104,24 @@ int main(int argc, char **argv) {
   prev_inst.pc = 0;
   bool has_prev = false;
 
+  // Deferred zero-block tracking: record previous block's zero-block status
+  bool last_was_zblk = false;
+
   auto finish_block = [&](uint64_t successor_pc, bool taken_exit) {
     total_blocks++;
+
+    // If previous block was a zero-block, now we know this block's branch count
+    if (last_was_zblk) {
+      if (block_cond_branches > 0)
+        zblk_succ_has_branches++;
+      else
+        zblk_succ_zero++;
+    }
 
     branches_per_block_hist[block_cond_branches]++;
     block_size_hist[block_instr_count]++;
     lane_util_hist[std::min(block_cond_branches, N)]++;
+    joint_branches_size[{block_cond_branches, block_instr_count}]++;
 
     block_path = taken_exit ? block_cond_branches : 0;
     path_dist[block_path]++;
@@ -111,6 +135,20 @@ int main(int argc, char **argv) {
       entry.path_successors[last_block_path][succ_line_pc]++;
       entry.all_successors[succ_line_pc]++;
       entry.total++;
+    }
+
+    // Zero-block analysis
+    last_was_zblk = false;
+    if (block_cond_branches == 0) {
+      zblk_total++;
+      zblk_size_hist[block_instr_count]++;
+      uint64_t expected_sequential_pc = block_start_pc + block_instr_count * 4;
+      if (successor_pc == expected_sequential_pc) {
+        zblk_sequential++;
+      } else {
+        zblk_nonsequential++;
+      }
+      last_was_zblk = true;
     }
 
     last_block_line_pc = block_line_pc;
@@ -220,6 +258,94 @@ int main(int argc, char **argv) {
   }
   std::cout << "  Avg lanes/block: " << std::setprecision(2)
             << double(total_lanes_used) / total_blocks << std::endl;
+  std::cout << std::endl;
+
+  // 4a. Zero-block analysis
+  std::cout << "--- 4a. Zero-block (0 cond branches) analysis ---" << std::endl;
+  std::cout << "  Total zero-blocks: " << zblk_total << " ("
+            << std::setprecision(1) << 100.0 * zblk_total / total_blocks
+            << "% of all blocks)" << std::endl;
+  std::cout << "  Sequential successor (fall-through): " << zblk_sequential
+            << " (" << std::setprecision(1)
+            << 100.0 * zblk_sequential / std::max(zblk_total, uint64_t(1))
+            << "% of zero-blocks)" << std::endl;
+  std::cout << "  Non-sequential successor (jump/call/ret): " << zblk_nonsequential
+            << " (" << std::setprecision(1)
+            << 100.0 * zblk_nonsequential / std::max(zblk_total, uint64_t(1))
+            << "% of zero-blocks)" << std::endl;
+  std::cout << "  Successor has branches: " << zblk_succ_has_branches
+            << " (" << std::setprecision(1)
+            << 100.0 * zblk_succ_has_branches / std::max(zblk_total, uint64_t(1))
+            << "% — fusable)" << std::endl;
+  std::cout << "  Successor also zero-block (chain): " << zblk_succ_zero
+            << " (" << std::setprecision(1)
+            << 100.0 * zblk_succ_zero / std::max(zblk_total, uint64_t(1))
+            << "%)" << std::endl;
+  std::cout << "  Size distribution:" << std::endl;
+  for (auto &[sz, count] : zblk_size_hist) {
+    if (count > zblk_total / 100) // >1%
+      std::cout << "    " << sz << " instrs: " << count << " ("
+                << std::setprecision(1)
+                << 100.0 * count / zblk_total << "%)" << std::endl;
+  }
+  std::cout << std::endl;
+
+  // 4b. Joint distribution: P(N branches, block size K)
+  std::cout << "--- 4b. Joint distribution: P(N branches in block of size K) ---" << std::endl;
+  // Bucket block sizes: 1, 2, 3, 4, 5-8, 9-16, 17-32, 33-64, 65+
+  auto size_bucket = [](uint64_t sz) -> std::string {
+    if (sz <= 4) return std::to_string(sz);
+    if (sz <= 8) return "5-8";
+    if (sz <= 16) return "9-16";
+    if (sz <= 32) return "17-32";
+    if (sz <= 64) return "33-64";
+    return "65+";
+  };
+  auto size_bucket_id = [](uint64_t sz) -> uint64_t {
+    if (sz <= 4) return sz;
+    if (sz <= 8) return 5;
+    if (sz <= 16) return 6;
+    if (sz <= 32) return 7;
+    if (sz <= 64) return 8;
+    return 9;
+  };
+  // Aggregate into buckets
+  std::map<std::pair<uint64_t, uint64_t>, uint64_t> bucketed; // (branches, size_bucket_id) → count
+  std::set<uint64_t> seen_buckets;
+  uint64_t max_branches_seen = 0;
+  for (auto &[key, count] : joint_branches_size) {
+    auto [br, sz] = key;
+    uint64_t bid = size_bucket_id(sz);
+    bucketed[{br, bid}] += count;
+    seen_buckets.insert(bid);
+    max_branches_seen = std::max(max_branches_seen, br);
+  }
+  // Header
+  std::vector<std::pair<uint64_t, std::string>> bucket_labels = {
+    {1,"1"}, {2,"2"}, {3,"3"}, {4,"4"}, {5,"5-8"}, {6,"9-16"}, {7,"17-32"}, {8,"33-64"}, {9,"65+"}
+  };
+  std::cout << std::setw(8) << "br\\sz";
+  for (auto &[bid, label] : bucket_labels)
+    if (seen_buckets.count(bid))
+      std::cout << std::setw(8) << label;
+  std::cout << std::setw(8) << "TOTAL" << std::endl;
+  // Rows
+  for (uint64_t br = 0; br <= std::min(max_branches_seen, N); br++) {
+    std::cout << std::setw(8) << br;
+    uint64_t row_total = 0;
+    for (auto &[bid, label] : bucket_labels) {
+      if (!seen_buckets.count(bid)) continue;
+      uint64_t c = bucketed[{br, bid}];
+      row_total += c;
+      if (c > 0)
+        std::cout << std::setw(7) << std::setprecision(1)
+                  << 100.0 * c / total_blocks << "%";
+      else
+        std::cout << std::setw(8) << "-";
+    }
+    std::cout << std::setw(7) << std::setprecision(1)
+              << 100.0 * row_total / total_blocks << "%" << std::endl;
+  }
   std::cout << std::endl;
 
   // 5. Successor count per predecessor (total, ignoring path)

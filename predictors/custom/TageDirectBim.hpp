@@ -1,865 +1,32 @@
 #pragma once
 
-#include "../../cbp.hpp"
-#include "../../harcom.hpp"
-#ifdef TAGE_MONITOR
-#include "TDMonitor.hpp"
-#endif
-
-using namespace hcm;
+#include "TageDirect.hpp"
 
 // ============================================================================
-// TageDirect — Branch-rank-indexed TAGE with separate LINEINST/N,
-//              P1 gshare base predictor, and pluggable history folding.
+// TageDirectBim — Offset-tagged TAGE with bimodal P1 base predictor.
 //
-// Key differences from Tage.hpp:
-//   - Branch rank in tag (log2(LANES) bits) instead of instruction offset
-//   - LINEINST and N are independent (LINEINST=line boundary, N=max branches)
-//   - P1 gshare is the sole base predictor (no bimodal)
-//   - Pluggable fold functors for history hashing
-//   - MISPREDICT_ONLY_WRITE mode for reduced extra cycles
-//   - Self-contained: no dependency on common.hpp or TageTable.hpp
+// Fork of TageDirect: bimodal replaces gshare so TAGE tables become
+// the primary provider, enabling the allocation cascade.
+// TAGE tags use static PC-derived offset bits (inst_pc >> 2) instead of
+// dynamic branch rank, so the same instruction always matches the same
+// tag regardless of block boundaries.  Mirrors predictors/tage.hpp's
+// concat(offset, htag) scheme.
 // ============================================================================
 
 // ============================================================================
-// Constexpr Helpers
+// TageDirectBimImpl
 // ============================================================================
-
-namespace td {
-
-constexpr u64 clog2(u64 x) {
-  u64 r = 0;
-  u64 v = x - 1;
-  while (v > 0) {
-    v >>= 1;
-    r++;
-  }
-  return r;
-}
-
-constexpr u64 next_pow2(u64 x) {
-  u64 r = 1;
-  while (r < x)
-    r <<= 1;
-  return r;
-}
-
-constexpr double constexpr_pow(double base, double exp) {
-  if (exp == 0.0)
-    return 1.0;
-  if (base == 0.0)
-    return 0.0;
-  return std::exp(exp * std::log(base));
-}
-
-template <typename T, std::size_t N>
-constexpr std::array<T, N> uniform_array(T v) {
-  std::array<T, N> a{};
-  for (std::size_t i = 0; i < N; i++)
-    a[i] = v;
-  return a;
-}
-
-template <typename T, std::size_t N>
-constexpr T array_max(const std::array<T, N> &a) {
-  T m = a[0];
-  for (std::size_t i = 1; i < N; i++)
-    m = (a[i] > m) ? a[i] : m;
-  return m;
-}
-
-template <typename T, std::size_t N>
-constexpr T array_min(const std::array<T, N> &a) {
-  T m = a[0];
-  for (std::size_t i = 1; i < N; i++)
-    m = (a[i] < m) ? a[i] : m;
-  return m;
-}
-
-// Saturating counter update (inspired by common.hpp update_ctr)
-template <u64 N, typename T = u64>
-val<N, T> update_ctr(val<N, T> &ctr, val<1> incr) {
-  ctr.fanout(hard<3>{});
-  auto maxv = val<N, T>::maxval;
-  auto minv = val<N, T>::minval;
-  return select(incr, select(ctr == maxv, val<N, T>{maxv}, val<N, T>{ctr + 1}),
-                select(ctr == minv, val<N, T>{minv}, val<N, T>{ctr - 1}));
-}
-
-// ============================================================================
-// History Series
-// ============================================================================
-
-enum class HistSeries { GEOMETRIC, QUADRATIC, SUPEREXP, ROS };
-
-// Allocation trigger: what condition causes TAGE to attempt allocation
-enum class AllocTrigger {
-  MISPREDICT,   // final P2 misprediction (default, conservative)
-  BASE_WRONG,   // P1 gshare was wrong for last branch
-  DISAGREE,     // P1 and P2 disagree (even if correct)
-  TAGE_MISS,    // last branch had no TAGE table match
-  TAGE_WRONG,   // TAGE provider's prediction was wrong (even if meta/P1 corrected it)
-  ALWAYS,       // every update cycle (most aggressive)
-};
-
-// Allocation action: how to gate allocation when triggered
-enum class AllocAction {
-  STANDARD,     // allocate in tables above provider with u=0 (default)
-  FILTERED,     // probabilistically throttle by accuracy_pressure register
-  THROTTLED,    // probabilistically throttle by alloc_pressure register
-};
-
-// Epoch counter (uctr) policy: what drives the u-bit reset counter
-enum class UctrPolicy {
-  FARALLOC,     // increment when alloc is "far" from provider (default, original)
-  PENALTY_NA,   // Seznec-style: increment on alloc failure, decrement on success (every cycle)
-  NOALLOC,      // increment on alloc failure, decrement on success (mispredict only)
-  ALWAYS_INC,   // always increment on misprediction (pure timer)
-};
-
-constexpr const char* to_string(AllocTrigger t) {
-  switch (t) {
-    case AllocTrigger::MISPREDICT: return "MISPREDICT";
-    case AllocTrigger::BASE_WRONG: return "BASE_WRONG";
-    case AllocTrigger::DISAGREE:   return "DISAGREE";
-    case AllocTrigger::TAGE_MISS:  return "TAGE_MISS";
-    case AllocTrigger::TAGE_WRONG: return "TAGE_WRONG";
-    case AllocTrigger::ALWAYS:     return "ALWAYS";
-  }
-  return "?";
-}
-constexpr const char* to_string(AllocAction a) {
-  switch (a) {
-    case AllocAction::STANDARD:  return "STANDARD";
-    case AllocAction::FILTERED:  return "FILTERED";
-    case AllocAction::THROTTLED: return "THROTTLED";
-  }
-  return "?";
-}
-constexpr const char* to_string(UctrPolicy p) {
-  switch (p) {
-    case UctrPolicy::FARALLOC:   return "FARALLOC";
-    case UctrPolicy::PENALTY_NA: return "PENALTY_NA";
-    case UctrPolicy::NOALLOC:    return "NOALLOC";
-    case UctrPolicy::ALWAYS_INC: return "ALWAYS_INC";
-  }
-  return "?";
-}
-
-template <std::size_t N>
-constexpr std::array<u64, N> geometric_hist(u64 min_h, u64 max_h) {
-  static_assert(N >= 2);
-  std::array<u64, N> h{};
-  u64 prev = 0;
-  double ratio = static_cast<double>(max_h) / static_cast<double>(min_h);
-  for (std::size_t i = 0; i < N; i++) {
-    double e = static_cast<double>(i) / static_cast<double>(N - 1);
-    u64 hl =
-        static_cast<u64>(static_cast<double>(min_h) * constexpr_pow(ratio, e));
-    hl = (hl > prev + 1) ? hl : prev + 1;
-    h[N - 1 - i] = hl;
-    prev = hl;
-  }
-  return h;
-}
-
-template <std::size_t N>
-constexpr std::array<u64, N> quadratic_hist(u64 minh, u64 maxh, u64 d = 2,
-                                            u64 k = 1) {
-  std::array<u64, N> h{};
-  h[0] = minh;
-  for (std::size_t n = 1; n < N; n++)
-    h[n] = h[n - 1] + d * n + k;
-  double raw_max = h[N - 1], raw_min = h[0];
-  u64 prev = 0;
-  for (std::size_t n = 0; n < N; n++) {
-    double t = (raw_max > raw_min)
-                   ? (double(h[n]) - raw_min) / (raw_max - raw_min)
-                   : 0.0;
-    u64 scaled = minh + u64(t * (maxh - minh));
-    scaled = (scaled > prev + 1 || n == 0) ? scaled : prev + 1;
-    h[n] = scaled;
-    prev = scaled;
-  }
-  for (std::size_t i = 0; i < N / 2; i++)
-    std::swap(h[i], h[N - 1 - i]);
-  return h;
-}
-
-template <std::size_t N>
-constexpr std::array<u64, N> superexp_hist(u64 h0, double f, double m) {
-  std::array<u64, N> h{};
-  h[0] = h0;
-  for (std::size_t n = 1; n < N; n++) {
-    double mult = f * double(n) + m;
-    u64 next = u64(double(h[n - 1]) * mult + 0.5);
-    h[n] = (next > h[n - 1] + 1) ? next : h[n - 1] + 1;
-  }
-  for (std::size_t i = 0; i < N / 2; i++)
-    std::swap(h[i], h[N - 1 - i]);
-  return h;
-}
-
-template <std::size_t N>
-constexpr std::array<u64, N> ros_hist(u64 minh, u64 maxh, u64 d = 2, u64 k = 1,
-                                      double f = 0.1, double m = 1.1,
-                                      std::size_t t = 15) {
-  std::array<u64, N> h{};
-  h[0] = minh;
-  for (std::size_t n = 1; n < N; n++) {
-    if (n < t) {
-      h[n] = h[n - 1] + d * n + k;
-    } else {
-      double mult = f * double(n - t + 1) + m;
-      u64 next = u64(double(h[n - 1]) * mult + 0.5);
-      h[n] = (next > h[n - 1] + 1) ? next : h[n - 1] + 1;
-    }
-  }
-  double raw_max = h[N - 1], raw_min = h[0];
-  u64 prev = 0;
-  for (std::size_t n = 0; n < N; n++) {
-    double t_val = (raw_max > raw_min)
-                       ? (double(h[n]) - raw_min) / (raw_max - raw_min)
-                       : 0.0;
-    u64 scaled = minh + u64(t_val * (maxh - minh));
-    scaled = (scaled > prev + 1 || n == 0) ? scaled : prev + 1;
-    h[n] = scaled;
-    prev = scaled;
-  }
-  for (std::size_t i = 0; i < N / 2; i++)
-    std::swap(h[i], h[N - 1 - i]);
-  return h;
-}
-
-// ============================================================================
-// Tag Width Functors — (table_index, num_tables) -> tag_width
-// ============================================================================
-
-template <u64 TAG> struct UniformTag {
-  constexpr u64 operator()(u64, u64) const { return TAG; }
-};
-
-template <u64 TAG_LONG, u64 TAG_SHORT> struct GradedTag {
-  constexpr u64 operator()(u64 i, u64 n) const {
-    if (n <= 1)
-      return TAG_LONG;
-    return TAG_LONG - (TAG_LONG - TAG_SHORT) * i / (n - 1);
-  }
-};
-
-template <u64 TAG_HI, u64 TAG_LO, u64 SPLIT> struct StepTag {
-  constexpr u64 operator()(u64 i, u64) const {
-    return (i < SPLIT) ? TAG_HI : TAG_LO;
-  }
-};
-
-template <u64 BASE, u64 SCALE> struct LogTag {
-  constexpr u64 operator()(u64 i, u64 n) const {
-    u64 level = (n > 1) ? (n - 1 - i) : 0;
-    return BASE + SCALE * level / 4;
-  }
-};
-
-template <u64 N, typename TagFn>
-constexpr std::array<u64, N> generate_tag_widths(TagFn fn) {
-  std::array<u64, N> t{};
-  for (u64 i = 0; i < N; i++)
-    t[i] = fn(i, N);
-  return t;
-}
-
-// ============================================================================
-// Size Functors — (table_index, num_tables) -> table_size
-// ============================================================================
-
-template <u64 SIZE> struct UniformSize {
-  constexpr u64 operator()(u64, u64) const { return SIZE; }
-};
-
-template <u64 SIZE, u64 RATIO> struct GeoSize {
-  constexpr u64 operator()(u64 i, u64 n) const {
-    if (RATIO <= 1 || n <= 1)
-      return SIZE;
-    double t = double(i) / double(n - 1);
-    double scale = constexpr_pow(double(RATIO), t - 0.5);
-    u64 sz = u64(SIZE * scale);
-    u64 result = 64;
-    while (result < sz)
-      result *= 2;
-    return result;
-  }
-};
-
-template <u64 SIZE, u64 RATIO> struct InvGeoSize {
-  constexpr u64 operator()(u64 i, u64 n) const {
-    if (RATIO <= 1 || n <= 1)
-      return SIZE;
-    double t = double(n - 1 - i) / double(n - 1);
-    double scale = constexpr_pow(double(RATIO), t - 0.5);
-    u64 sz = u64(SIZE * scale);
-    u64 result = 64;
-    while (result < sz)
-      result *= 2;
-    return result;
-  }
-};
-
-template <u64 S_HI, u64 S_LO, u64 SPLIT> struct StepSize {
-  constexpr u64 operator()(u64 i, u64) const {
-    return (i < SPLIT) ? S_HI : S_LO;
-  }
-};
-
-template <u64 BASE_SIZE> struct SqrtHistSize {
-  constexpr u64 operator()(u64 i, u64 n) const {
-    if (n <= 1)
-      return BASE_SIZE;
-    double scale = constexpr_pow(double(n - 1 - i + 1), 0.5);
-    u64 sz = u64(BASE_SIZE * scale);
-    u64 result = 64;
-    while (result < sz)
-      result *= 2;
-    return result;
-  }
-};
-
-template <std::size_t N, typename SizeFn>
-constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
-  std::array<u64, N> s{};
-  for (std::size_t i = 0; i < N; i++)
-    s[i] = fn(i, N);
-  return s;
-}
-
-// ============================================================================
-// Table Config
-// ============================================================================
-
-template <u64 N = 8, u64 SIZE = 2048, u64 TAG = 11, u64 CTR = 1, u64 HYST = 2,
-          u64 U = 1, u64 MINH = 8, u64 MAXH = 100, u64 SIZE_RATIO = 1,
-          HistSeries HIST = HistSeries::GEOMETRIC,
-          typename TagFn = GradedTag<TAG, TAG - 3>,
-          typename SizeFn = GeoSize<SIZE, SIZE_RATIO>>
-struct TDTableConfig {
-  static constexpr u64 NUM_TABLES = N;
-  static constexpr u64 MINHIST = MINH;
-  static constexpr u64 MAXHIST = MAXH;
-  static constexpr auto TABLE_SIZE = generate_table_sizes<N>(SizeFn{});
-  static constexpr auto TAG_WIDTH = generate_tag_widths<N>(TagFn{});
-  static constexpr auto CTR_WIDTH = uniform_array<u64, N>(CTR);
-  static constexpr auto HYST_WIDTH = uniform_array<u64, N>(HYST);
-  static constexpr auto U_WIDTH = uniform_array<u64, N>(U);
-  static constexpr auto HIST_LEN = []() {
-    if constexpr (HIST == HistSeries::GEOMETRIC)
-      return geometric_hist<N>(MINH, MAXH);
-    else if constexpr (HIST == HistSeries::QUADRATIC)
-      return quadratic_hist<N>(MINH, MAXH);
-    else if constexpr (HIST == HistSeries::SUPEREXP)
-      return superexp_hist<N>(MINH, 0.1, 1.1);
-    else if constexpr (HIST == HistSeries::ROS)
-      return ros_hist<N>(MINH, MAXH);
-  }();
-};
-
-// 32Kbit TAGE-SC-L (Seznec) scaled 2x → ~64Kbit TAGE storage
-// Original: 10 tables, graded tags 7→13, inverse geo sizes
-// Hist:    4,  9, 13, 24,  37,  53,  91, 145, 226, 359
-// Bits/entry: tag+ctr+hyst+u = 11-17 per entry
-struct TDConfig32Kx2 {
-  static constexpr u64 NUM_TABLES = 10;
-  static constexpr u64 MINHIST = 4;
-  static constexpr u64 MAXHIST = 359;
-  static constexpr std::array<u64, 10> TABLE_SIZE = {128, 128, 128, 256, 512, 256, 512, 512, 512, 512};
-  static constexpr std::array<u64, 10> TAG_WIDTH  = {13, 13, 11, 10, 10,   9,   8,   7,   7,   7};
-  static constexpr std::array<u64, 10> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3};
-  static constexpr std::array<u64, 10> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0};
-  static constexpr std::array<u64, 10> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1};
-  static constexpr std::array<u64, 10> HIST_LEN   = {359, 226, 145, 91, 53, 37, 24, 13, 9, 4};
-};
-
-// 32Kbit TAGE-SC-L (Seznec) scaled 4x → ~128Kbit TAGE storage
-struct TDConfig32Kx4 {
-  static constexpr u64 NUM_TABLES = 10;
-  static constexpr u64 MINHIST = 4;
-  static constexpr u64 MAXHIST = 359;
-  static constexpr std::array<u64, 10> TABLE_SIZE = {256, 256, 256, 512, 1024, 512, 1024, 1024, 1024, 1024};
-  static constexpr std::array<u64, 10> TAG_WIDTH  = {13, 13, 11, 10, 10,   9,   8,   7,   7,   7};
-  static constexpr std::array<u64, 10> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3};
-  static constexpr std::array<u64, 10> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0};
-  static constexpr std::array<u64, 10> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1};
-  static constexpr std::array<u64, 10> HIST_LEN   = {359, 226, 145, 91, 53, 37, 24, 13, 9, 4};
-};
-
-// 256Kbit TAGE-SC-L (Seznec) scaled to ~96Kbit — 15 tables, graded tags 7→15
-// Original entries /4, rounded to powers of 2
-// Hist: 6,10,18,25,35,55,69,105,155,230,354,479,642,1012,1347
-struct TDConfig256Kd4 {
-  static constexpr u64 NUM_TABLES = 15;
-  static constexpr u64 MINHIST = 6;
-  static constexpr u64 MAXHIST = 1347;
-  static constexpr std::array<u64, 15> TABLE_SIZE = {32, 32, 64, 128, 128, 128, 256, 256, 256, 256, 256, 512, 256, 256, 256};
-  static constexpr std::array<u64, 15> TAG_WIDTH  = {15, 15, 15, 14, 13, 12, 12, 12, 11, 11, 10,  9,  9,  9,  7};
-  static constexpr std::array<u64, 15> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3,3,3,3,3,3};
-  static constexpr std::array<u64, 15> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-  static constexpr std::array<u64, 15> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
-  static constexpr std::array<u64, 15> HIST_LEN   = {1347, 1012, 642, 479, 354, 230, 155, 105, 69, 55, 35, 25, 18, 10, 6};
-};
-
-// 256Kbit L-TAGE (Seznec) scaled to ~96Kbit — 12 tables, graded tags 7→15
-// Original entries /4, rounded to powers of 2
-// Uses geometric history from MINH=5 to MAXH=800
-struct TDConfigLTAGE {
-  static constexpr u64 NUM_TABLES = 12;
-  static constexpr u64 MINHIST = 5;
-  static constexpr u64 MAXHIST = 800;
-  static constexpr std::array<u64, 12> TABLE_SIZE = {128, 128, 256, 256, 256, 512, 512, 512, 512, 256, 128, 128};
-  static constexpr std::array<u64, 12> TAG_WIDTH  = {15, 14, 13, 12, 12, 11, 10,  9,  8,  8,  7,  7};
-  static constexpr std::array<u64, 12> CTR_WIDTH  = {3,3,3,3,3,3,3,3,3,3,3,3};
-  static constexpr std::array<u64, 12> HYST_WIDTH = {0,0,0,0,0,0,0,0,0,0,0,0};
-  static constexpr std::array<u64, 12> U_WIDTH    = {1,1,1,1,1,1,1,1,1,1,1,1};
-  static constexpr std::array<u64, 12> HIST_LEN   = {800, 500, 320, 200, 130, 80, 50, 32, 20, 13, 8, 5};
-};
-
-// ============================================================================
-// Allocation Policy Configs
-// ============================================================================
-
-struct TDDefaultAllocConfig {
-  static constexpr u64 MAX_ALLOC = 1;
-  static constexpr bool NON_CONSECUTIVE = false;
-  static constexpr bool CONF_GATE = false;
-  static constexpr u64 PROB_START = 0;
-  static constexpr bool PARTIAL_UPDATE = false;
-  static constexpr bool MISPREDICT_ONLY_WRITE = false;
-  static constexpr bool DISAGREE_EXTRA_CYCLE = true;
-  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::MISPREDICT;
-  static constexpr AllocAction  ALLOC_ACTION  = AllocAction::STANDARD;
-  static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::ALWAYS_INC;
-  static constexpr u64 ALLOC_PRESSURE_BITS    = 0;  // 0 = disabled
-  static constexpr u64 ACCURACY_PRESSURE_BITS = 0;  // 0 = disabled
-};
-
-struct TDMispredOnlyAllocConfig {
-  static constexpr u64 MAX_ALLOC = 1;
-  static constexpr bool NON_CONSECUTIVE = false;
-  static constexpr bool CONF_GATE = false;
-  static constexpr u64 PROB_START = 0;
-  static constexpr bool PARTIAL_UPDATE = false;
-  static constexpr bool MISPREDICT_ONLY_WRITE = true;
-  static constexpr bool DISAGREE_EXTRA_CYCLE = false;
-  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::MISPREDICT;
-  static constexpr AllocAction  ALLOC_ACTION  = AllocAction::STANDARD;
-  static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::FARALLOC;
-  static constexpr u64 ALLOC_PRESSURE_BITS    = 0;
-  static constexpr u64 ACCURACY_PRESSURE_BITS = 0;
-};
-
-// ---- Test configs for allocation experiments ----
-
-// Fix epoch reset only (NOALLOC uctr policy)
-struct TDAllocNoalloc : TDDefaultAllocConfig {
-  static constexpr UctrPolicy UCTR_POLICY = UctrPolicy::NOALLOC;
-};
-
-// Allocate when P1 is wrong + NOALLOC uctr
-struct TDAllocBaseWrong : TDDefaultAllocConfig {
-  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::BASE_WRONG;
-  static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::NOALLOC;
-};
-
-// Allocate on P1/P2 disagree + NOALLOC uctr
-struct TDAllocDisagree : TDDefaultAllocConfig {
-  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::DISAGREE;
-  static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::NOALLOC;
-};
-
-// Allocate on TAGE miss + NOALLOC uctr
-struct TDAllocTageMiss : TDDefaultAllocConfig {
-  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::TAGE_MISS;
-  static constexpr UctrPolicy   UCTR_POLICY   = UctrPolicy::NOALLOC;
-};
-
-// ============================================================================
-// Decay Threshold Adaptation Policies
-// ============================================================================
-
-struct TDDecayMild {
-  template <u64 W>
-  static val<W> apply(val<W> &t, val<1> &correct,
-                      [[maybe_unused]] val<1> &uctrsat, val<1> &misp) {
-    return select(misp, td::update_ctr(t, hard<0>{}),
-                  select(correct, td::update_ctr(t, hard<1>{}), val<W>{t}));
-  }
-};
-
-struct TDDecayAggressive {
-  template <u64 W>
-  static val<W> apply(val<W> &t, [[maybe_unused]] val<1> &correct,
-                      [[maybe_unused]] val<1> &uctrsat, val<1> &misp) {
-    return select(misp, td::update_ctr(t, hard<0>{}), val<W>{t});
-  }
-};
-
-// ============================================================================
-// History Fold Functors
-// ============================================================================
-// A fold functor maintains a reg<F> and provides:
-//   get() -> val<F>
-//   update(global_history, hist_len, new_bits)
-//   fanout(fo)
-
-// Standard XOR fold (same as Seznec folded_gh)
-template <u64 F> struct XORFold {
-  reg<F> folded;
-
-  val<F> get() { return folded; }
-
-  void fanout(auto fo) { folded.fanout(fo); }
-
-  template <u64 MAXL> void update(auto &gh, u64 ghlen, auto in) {
-    constexpr u64 inbits = std::min(F, u64(decltype(in)::size));
-    val<inbits> input = in;
-    auto f = folded.make_array(val<1>{});
-    val<1> outbit = gh[ghlen - 1];
-    u64 outpos = ghlen % F;
-    arr<val<1>, F> ff = [&](u64 i) {
-      if (i == 0)
-        return (outpos == 0) ? f[F - 1].fo1() ^ outbit.fo1() : f[F - 1].fo1();
-      else
-        return (outpos == i) ? f[i - 1].fo1() ^ outbit.fo1() : f[i - 1].fo1();
-    };
-    auto x = input.fo1().make_array(val<1>{});
-    arr<val<1>, F> y = [&](u64 i) {
-      return (i < x.size) ? x[i].fo1() ^ ff[i].fo1() : ff[i].fo1();
-    };
-    folded = y.fo1().concat();
-  }
-};
-
-// Rotate-XOR fold (better hash distribution)
-template <u64 F> struct RotateXORFold {
-  reg<F> folded;
-
-  val<F> get() { return folded; }
-
-  void fanout(auto fo) { folded.fanout(fo); }
-
-  template <u64 MAXL> void update(auto &gh, u64 ghlen, auto in) {
-    constexpr u64 inbits = std::min(F, u64(decltype(in)::size));
-    val<inbits> input = in;
-    // Rotate left by 1 then XOR in new bits and XOR out old bit
-    auto f = folded.make_array(val<1>{});
-    val<1> outbit = gh[ghlen - 1];
-    u64 outpos = ghlen % F;
-    // Rotate: shift each bit left by 1 (with wrap)
-    arr<val<1>, F> rotated = [&](u64 i) {
-      return (i == 0) ? f[F - 1].fo1() : f[i - 1].fo1();
-    };
-    // XOR out the evicted bit at its fold position
-    arr<val<1>, F> after_out = [&](u64 i) {
-      return (i == outpos) ? rotated[i].fo1() ^ outbit.fo1() : rotated[i].fo1();
-    };
-    // XOR in new bits
-    auto x = input.fo1().make_array(val<1>{});
-    arr<val<1>, F> y = [&](u64 i) {
-      return (i < x.size) ? x[i].fo1() ^ after_out[i].fo1()
-                          : after_out[i].fo1();
-    };
-    folded = y.fo1().concat();
-  }
-};
-
-// ============================================================================
-// Global History Register
-// ============================================================================
-
-// Global history stored as array of 1-bit regs (supports >64 bits)
-template <u64 MAXLEN> struct TDGlobalHistory {
-  arr<reg<1>, MAXLEN> hist;
-
-  val<1> operator[](u64 pos) { return hist[pos]; }
-
-  void update(auto in) {
-    auto input = in.fo1().make_array(val<1>{});
-    static_assert(input.size <= MAXLEN);
-    // Shift by 1 and XOR input bits — matches global_history::update in
-    // common.hpp so that folded_gh / XORFold's rotate-by-1 stays in sync.
-    for (u64 i = MAXLEN - 1; i >= input.size; i--)
-      hist[i] = hist[i - 1];
-    for (u64 i = input.size - 1; i >= 1; i--)
-      hist[i] = hist[i - 1] ^ input[i].fo1();
-    hist[0] = input[0].fo1();
-  }
-
-  void fanout(auto fo) {
-    for (u64 i = 0; i < MAXLEN; i++)
-      hist[i].fanout(fo);
-  }
-};
-
-// ============================================================================
-// History Folder — manages global history + per-table folds
-// ============================================================================
-
-template <u64 NUM_TABLES, u64 MAXHIST, u64 IDX_FOLD_W, u64 TAG_FOLD_W,
-          template <u64> class FoldFn = XORFold,
-          std::array<u64, NUM_TABLES> HIST_LEN = std::array<u64, NUM_TABLES>{}>
-struct TDHistoryFolder {
-  TDGlobalHistory<MAXHIST> gh;
-
-  // Per-table: one fold for index, one fold for tag
-  std::array<FoldFn<IDX_FOLD_W>, NUM_TABLES> idx_folds;
-  std::array<FoldFn<TAG_FOLD_W>, NUM_TABLES> tag_folds;
-
-  // init() kept for backward compat but HIST_LEN template param is preferred
-  void init([[maybe_unused]] const std::array<u64, NUM_TABLES> &hl) {}
-
-  val<IDX_FOLD_W> get_idx_fold(u64 i) { return idx_folds[i].get(); }
-  val<TAG_FOLD_W> get_tag_fold(u64 i) { return tag_folds[i].get(); }
-
-  void fanout(auto fo) {
-    // Use static_loop so each table's fold is a distinct template instantiation
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      idx_folds[I].fanout(fo);
-      tag_folds[I].fanout(fo);
-    });
-  }
-
-  void update(auto branchbits) {
-    branchbits.fanout(hard<NUM_TABLES * 2 + 1>{});
-    gh.fanout(hard<std::max(u64(2), NUM_TABLES * 2 + 1)>{});
-    // Use static_loop + hard<> so each table's history length is a
-    // compile-time constant, matching geometric_folds' behavior.
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      static constexpr u64 HL = HIST_LEN[I];
-      idx_folds[I].template update<MAXHIST>(gh, HL, branchbits);
-      tag_folds[I].template update<MAXHIST>(gh, HL, branchbits);
-    });
-    gh.update(branchbits);
-  }
-};
-
-// ============================================================================
-// Banked RAM wrapper — rwram with configurable bank index bits
-// ============================================================================
-//
-// Like common.hpp's rwram but lets you choose which address bits select the
-// bank. BANK_SHIFT=0 uses the low bits (same as rwram). BANK_SHIFT=K uses
-// bits [K, K+log2(B)) as the bank ID.
-//
-// Template params:
-//   N = data width in bits
-//   M = total entries (power of 2)
-//   B = number of banks (power of 2, >= 2)
-//   BANK_SHIFT = which bit position starts the bank selection (default 0)
-
-template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0>
-struct td_rwram {
-  static_assert(std::has_single_bit(M));
-  static_assert(B >= 2 && B <= 64);
-  static_assert(std::has_single_bit(B));
-  static constexpr u64 A = std::bit_width(M - 1);     // address bits
-  static constexpr u64 E = M / B;                      // entries per bank
-  static_assert(E > 1);
-  static constexpr u64 L = std::bit_width(E - 1);      // local address bits
-  static constexpr u64 BANK_BITS = std::bit_width(B - 1); // bank ID bits
-  static_assert(A == L + BANK_BITS);
-  static_assert(BANK_SHIFT + BANK_BITS <= A);
-
-  hcm::ram<val<N>, E> bank[B];
-  reg<B> read_bank;
-
-  // buffered write
-  reg<B> write_bank;
-  reg<L> write_localaddr;
-  reg<N> write_data;
-
-  td_rwram(const char *label = "") : bank{label} {}
-
-  // Extract bank ID and local address from a full address.
-  // With BANK_SHIFT=0: addr = [local_hi | bankid | local_lo] where local_lo
-  // is empty. With BANK_SHIFT=K: bankid = addr[K +: BANK_BITS], local =
-  // remaining bits concatenated.
-  auto split_addr(val<A> addr) {
-    if constexpr (BANK_SHIFT == 0) {
-      // Low bits = bank ID (same as reference rwram)
-      return hcm::split<L, BANK_BITS>(addr);
-    } else if constexpr (BANK_SHIFT + BANK_BITS == A) {
-      // High bits = bank ID
-      return std::pair{val<L>{addr}, val<BANK_BITS>{addr >> BANK_SHIFT}};
-    } else {
-      // Middle bits = bank ID: extract and reconstruct local addr
-      val<BANK_SHIFT> lo = addr;
-      val<BANK_BITS> bankid = addr >> BANK_SHIFT;
-      val<A - BANK_SHIFT - BANK_BITS> hi = addr >> (BANK_SHIFT + BANK_BITS);
-      val<L> localaddr = concat(lo, hi);
-      return std::pair{localaddr, bankid};
-    }
-  }
-
-  val<N> read(val<A> addr) {
-    auto [localaddr, bankid] = split_addr(addr.fo1());
-    localaddr.fanout(hard<B>{});
-    arr<val<1>, B> banksel = bankid.fo1().decode();
-    banksel.fanout(hard<2>{});
-    arr<val<N>, B> data = [&](u64 i) -> val<N> {
-      return execute_if(banksel[i], [&]() { return bank[i].read(localaddr); });
-    };
-    read_bank = banksel.concat();
-    return data.fo1().fold_or();
-  }
-
-  void write(val<A> addr, val<N> data, val<1> noconflict) {
-    // noconflict=1: no read this cycle, write immediately.
-    // noconflict=0: buffer write, flush when bank is free.
-    auto [localaddr, bankid] = split_addr(addr.fo1());
-    data.fanout(hard<B + 1>{});
-    noconflict.fanout(hard<B + 2>{});
-    val<B> banksel = bankid.fo1().decode().concat();
-    banksel.fanout(hard<2>{});
-    val<B> noconflict_mask = noconflict.replicate(hard<B>{}).concat();
-    noconflict_mask.fanout(hard<2>{});
-    val<B> current_write = banksel & noconflict_mask;
-    current_write.fanout(hard<3>{});
-    arr<val<1>, B> current_write_split = current_write.make_array(val<1>{});
-    current_write_split.fanout(hard<3>{});
-    arr<val<1>, B> write_bank_split = write_bank.make_array(val<1>{});
-    arr<val<1>, B> read_bank_split = read_bank.make_array(val<1>{});
-    for (u64 i = 0; i < B; i++) {
-      execute_if(
-          current_write_split[i] |
-              (write_bank_split[i].fo1() & ~read_bank_split[i].fo1()),
-          [&]() {
-            val<L> a =
-                select(current_write_split[i], localaddr, write_localaddr);
-            val<N> d = select(current_write_split[i], data, write_data);
-            bank[i].write(a.fo1(), d.fo1());
-          });
-    }
-    // buffer the current write if not done
-    val<1> buffered_done =
-        (write_bank & (current_write | read_bank)) == hard<0>{};
-    execute_if(buffered_done.fo1() | ~noconflict, [&]() {
-      write_bank = banksel & ~noconflict_mask;
-      execute_if(~noconflict, [&]() {
-        write_localaddr = localaddr;
-        write_data = data;
-      });
-    });
-  }
-
-  void reset() {
-    for (u64 i = 0; i < B; i++)
-      bank[i].reset();
-  }
-
-#ifdef TD_VERBOSE
-  void debug_read_info(const char *name, u64 table_idx, val<A> addr) {
-    u64 a = static_cast<u64>(addr);
-    u64 bid = (a >> BANK_SHIFT) & (B - 1);
-    u64 wb = static_cast<u64>(write_bank);
-    std::cerr << "  " << name << "[" << table_idx << "] addr=" << a
-              << " bank=" << bid;
-    if ((wb >> bid) & 1)
-      std::cerr << " (pending-write in bank)";
-    std::cerr << "\n";
-  }
-
-  // Debug: extract bank ID from address and report conflict with read_bank.
-  void debug_write_info(const char *name, u64 table_idx, val<A> addr,
-                        val<1> noconflict) {
-    u64 a = static_cast<u64>(addr);
-    u64 bid = (a >> BANK_SHIFT) & (B - 1);
-    u64 rb = static_cast<u64>(read_bank);
-    u64 wb = static_cast<u64>(write_bank);
-    bool read_conflict = (rb >> bid) & 1;
-    bool write_buffered = !static_cast<u64>(noconflict);
-    std::cerr << "  " << name << "[" << table_idx << "] addr=" << a
-              << " bank=" << bid;
-    if (write_buffered)
-      std::cerr << " BUFFERED";
-    else
-      std::cerr << " DIRECT";
-    if (read_conflict && write_buffered)
-      std::cerr << " (read-conflict)";
-    if (wb)
-      std::cerr << " (pending_wb=0x" << std::hex << wb << std::dec << ")";
-    std::cerr << "\n";
-  }
-#endif
-};
-
-// ============================================================================
-// TAGE Table Storage — tag/pred use plain ram<>, hyst/u use td_rwram
-// ============================================================================
-//
-// tag_ram, pred_ram: plain ram<>. Writes are gated by conditions that imply
-// extra_cycle (allocate ⊆ mispredict, g_weak ⊆ some_badpred1), so they
-// never conflict with P2 reads.
-//
-// hyst_ram, u_ram: td_rwram with B banks. Can read+write same cycle via
-// banking. Write takes a noconflict bit (= extra_cycle) following the
-// reference tage.hpp pattern.
-
-template <u64 TABLE_SIZE, u64 TAG_WIDTH, u64 CTR_WIDTH, u64 HYST_WIDTH,
-          u64 U_WIDTH, u64 RWRAM_BANKS = 4, u64 RWRAM_BANK_SHIFT = 0,
-          bool SHARED_HYS = false>
-struct TDTable {
-  static constexpr u64 IDX_BITS = td::clog2(TABLE_SIZE);
-  static constexpr u64 HYST_SIZE = SHARED_HYS ? (TABLE_SIZE / 2) : TABLE_SIZE;
-  static constexpr u64 HYST_IDX_BITS = td::clog2(HYST_SIZE);
-  static constexpr u64 table_size = TABLE_SIZE;
-  static constexpr u64 tag_width = TAG_WIDTH;
-  static constexpr u64 ctr_width = CTR_WIDTH;
-  static constexpr u64 hyst_width = HYST_WIDTH;
-  static constexpr u64 u_width = U_WIDTH;
-
-  static_assert(TABLE_SIZE >= 2 * RWRAM_BANKS,
-                "TABLE_SIZE must be >= 2*RWRAM_BANKS for td_rwram");
-  static_assert(!SHARED_HYS || TABLE_SIZE >= 2,
-                "TABLE_SIZE must be >= 2 for shared hysteresis");
-
-  hcm::ram<val<TAG_WIDTH>, TABLE_SIZE> tag_ram{"td_tag"};
-  hcm::ram<val<CTR_WIDTH>, TABLE_SIZE> pred_ram{"td_pred"};
-  td_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, RWRAM_BANKS,
-           RWRAM_BANK_SHIFT>
-      hyst_ram{"td_hyst"};
-  td_rwram<U_WIDTH, TABLE_SIZE, RWRAM_BANKS, RWRAM_BANK_SHIFT>
-      u_ram{"td_u"};
-};
-
-// Generate a TDTable type from config arrays at index I
-template <typename Cfg, u64 I, u64 BANKS, u64 BSHIFT, bool SHYS = false>
-using TDTableAt =
-    TDTable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::CTR_WIDTH[I],
-            Cfg::HYST_WIDTH[I], Cfg::U_WIDTH[I], BANKS, BSHIFT, SHYS>;
-
-// Build a tuple of TDTable types
-template <typename Cfg, u64 BANKS, u64 BSHIFT, bool SHYS, typename Seq>
-struct TDMakeTableTuple;
-
-template <typename Cfg, u64 BANKS, u64 BSHIFT, bool SHYS, u64... Is>
-struct TDMakeTableTuple<Cfg, BANKS, BSHIFT, SHYS, std::index_sequence<Is...>> {
-  using type = std::tuple<TDTableAt<Cfg, Is, BANKS, BSHIFT, SHYS>...>;
-};
-
-} // namespace td
-
-// ============================================================================
-// TageDirectImpl
-// ============================================================================
-
 template <typename TableCfg, typename AllocCfg, u64 LINEINST_V, u64 N_V,
           u64 DECAY_CTR_V, u64 DECAY_GRAN_V,
-          typename DecayPolicy_V, bool P1_USE_GSHARE_V, u64 P1_TABLE_SIZE_V,
-          u64 P1_HIST_V, bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
+          typename DecayPolicy_V, u64 P1_TABLE_SIZE_V,
+          bool USE_META_V, u64 METABITS_V, u64 METAPIPE_V,
           bool USE_PATH_HIST_V, u64 PATH_HIST_WIDTH_V, u64 PATH_BITS_V,
           template <u64> class FoldFn_V,
           u64 RWRAM_BANKS_V = 4, u64 RWRAM_BANK_SHIFT_V = 0,
           u64 EPOCH_CTR_BITS_V = 18,
           bool SHARED_HYS_V = false,
           bool USE_DIR_HIST_V = false>
-struct TageDirectImpl : predictor {
+struct TageDirectBimImpl : predictor {
   using AllocTrigger = td::AllocTrigger;
   using AllocAction  = td::AllocAction;
   using UctrPolicy   = td::UctrPolicy;
@@ -888,10 +55,6 @@ struct TageDirectImpl : predictor {
   static constexpr u64 PATHBITS = PATH_BITS_V;
 
   static constexpr bool USE_PROB_DECAY = (DECAY_CTR_V > 0);
-
-  // static_assert(!P1_USE_GSHARE_V || TableCfg::MINHIST > P1_HIST_V,
-  //               "TAGE MINHIST must exceed P1 gshare history length; "
-  //               "tables with shorter history are redundant with gshare");
 
   // ---- Table tuple type ----
   using Tables =
@@ -927,11 +90,8 @@ struct TageDirectImpl : predictor {
   bool gfolds_inited = false;
   reg<1> true_block = 1;
 
-  // P1 gshare (gshareN pattern)
-  std::conditional_t<P1_USE_GSHARE_V, reg<P1_HIST_V>, EmptyMember>
-      global_history1;
+  // P1 bimodal
   reg<P1_INDEX_BITS> index1;
-  reg<LANES> X; // lane scrambling
   reg<LANES> unordered_pred1;
   arr<reg<1>, LANES> pred; // extracted per-lane P1 predictions
 
@@ -984,14 +144,16 @@ struct TageDirectImpl : predictor {
   reg<LOG_LINEINST> block_entry;
   u64 num_branch = 0;
   u64 block_size = 0;
-  arr<reg<1>, LANES> branch_dir;
-  reg<N + 1>
-      rank; // one-hot: rank of current branch in block (gshareN_ahead pattern)
+  arr<reg<1>, LANES> branch_dir;     // direction per branch rank (0..num_branch-1)
+  arr<reg<LOG_LANES>, LANES> branch_offset; // PC-derived offset per branch rank
+  // is_branch computed from hardware in update_cycle (no C++ bitmask needed)
+  reg<N + 1> rank;  // one-hot: rank of current branch (P1 lane scrambling)
+  reg<LANES> X;     // lane scrambling register (P1 bimodal)
 
   // P1 storage
   hcm::ram<val<LANES>, P1_ENTRIES> p1_pred{"P1 pred"};
   zone UPDATE_ONLY;
-  hcm::ram<val<1>, P1_ENTRIES> p1_hyst[N]{"P1 hyst"};
+  hcm::ram<val<1>, P1_ENTRIES> p1_hyst[LANES]{"P1 hyst"};
 
   // TAGE tables
   Tables tables;
@@ -1001,19 +163,27 @@ struct TageDirectImpl : predictor {
   // Shadow state for meta tracking (set in predict2, read in update_cycle)
   std::array<bool, LANES> mon_altsel{};     // meta chose alt for this rank
   std::array<bool, LANES> mon_meta_active{}; // meta override was active
-  ~TageDirectImpl() { mon.print_summary(); }
+  ~TageDirectBimImpl() { mon.print_summary(); }
 #endif
 
   bool params_printed = false;
 
   // ======== Helpers ========
 
+  // End block at LINEINST boundary
   val<1> line_end() { return (block_entry + block_size) >= hard<LINEINST>{}; }
 
   val<1> last_pred() {
-    assert(num_branch <= N);
-    return rank >> (N - num_branch);
+    return val<1>{num_branch >= N};
   }
+
+  // XOR fold intra-line PC bits into LOG_LANES bits for stable lane assignment
+  static u64 pc_hash_lane(u64 pc) {
+    u64 lo = (pc >> 2) & (LANES - 1);
+    u64 hi = (pc >> (2 + LOG_LANES)) & (LANES - 1);
+    return lo ^ hi;
+  }
+  // pc_hash_lane(val<64>) not used — val→u64 cast requires cheating mode
 
   void ensure_gfolds_init() {
     if (!gfolds_inited) {
@@ -1038,7 +208,7 @@ struct TageDirectImpl : predictor {
     os << "\nHist lens:   ";
     for (u64 i = 0; i < NUM_TABLES; i++)
       os << (i ? "," : "") << TableCfg::HIST_LEN[i];
-    os << "\nP1: TABLE_SIZE=" << P1_TABLE_SIZE_V << "  HIST=" << P1_HIST_V;
+    os << "\nP1: BIMODAL  TABLE_SIZE=" << P1_TABLE_SIZE_V;
     os << "\nMETA: USE=" << USE_META_V << "  BITS=" << METABITS_V
        << "  PIPE=" << METAPIPE_V;
     os << "\nMISPREDICT_ONLY_WRITE=" << AllocCfg::MISPREDICT_ONLY_WRITE;
@@ -1072,7 +242,6 @@ struct TageDirectImpl : predictor {
     inst_pc.fanout(hard<3>{});
     true_block.fanout(hard<4>{});
 
-    // Block entry: numeric offset (gshareN_ahead_best pattern)
     block_entry = select(true_block, val<LOG_LINEINST>{inst_pc >> 2},
                          val<LOG_LINEINST>{block_entry + block_size});
     block_entry.fanout(hard<LANES + 2>{});
@@ -1084,27 +253,9 @@ struct TageDirectImpl : predictor {
                X.rotate_left(num_branch));
     X.fanout(hard<LANES>{});
 
-    // P1 gshare: read on true blocks only
-    if constexpr (P1_USE_GSHARE_V) {
-      global_history1.fanout(hard<2>{});
-    }
+    // P1 bimodal: read on true blocks only
     execute_if(true_block, [&]() {
-      val<P1_INDEX_BITS> lineaddr = inst_pc >> 2;
-      if constexpr (P1_USE_GSHARE_V) {
-        if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
-          index1 = lineaddr ^ (val<P1_INDEX_BITS>{global_history1}
-                               << (P1_INDEX_BITS - P1_HIST_V));
-        } else {
-          index1 = global_history1.make_array(val<P1_INDEX_BITS>{})
-                       .append(lineaddr)
-                       .fold_xor();
-        }
-      } else {
-        index1 = lineaddr;
-      }
-#ifdef TD_VERBOSE
-      std::cerr << "P1: gshare p1_pred READ\n";
-#endif
+      index1 = inst_pc >> 2;
       unordered_pred1 = p1_pred.read(index1);
     });
 
@@ -1134,7 +285,9 @@ struct TageDirectImpl : predictor {
 #ifdef TAGE_MONITOR
     mon.record_predict2();
 #endif
-    val<LINEADDR_BITS> lineaddr = inst_pc >> 2;
+    // Line-level address: group LANES instructions per line (like tage.hpp's >> LOGLB)
+    // Offset within line is stored in the tag via LOG_LANES bits of (inst_pc >> 2)
+    val<LINEADDR_BITS> lineaddr = inst_pc >> (2 + LOG_LANES);
     lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
     gfolds.fanout(hard<2>{});
 
@@ -1216,14 +369,14 @@ struct TageDirectImpl : predictor {
     static_loop<NUM_TABLES>([&]<u64 I>() {
       using Table = std::tuple_element_t<I, Tables>;
       static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
-      htagcmp_reg[I] = (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
+      htagcmp_reg[I] = (val<PER_HTAG>{readt[I] >> LOG_LANES} == val<PER_HTAG>{htag[I]});
     });
     htagcmp_reg.fanout(hard<LANES + 1>{});
 
     // Per-rank tag match
     static_loop<LANES>([&]<u64 R>() {
       arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
-        return val<LOG_LANES>{readt[i] >> MAX_HTAGBITS} == hard<R>{};
+        return val<LOG_LANES>{readt[i]} == hard<R>{};
       };
       match[R] =
           concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp_reg.concat());
@@ -1288,9 +441,12 @@ struct TageDirectImpl : predictor {
     }
 
     p2.fanout(hard<LANES>{});
-    val<1> taken = p2 >> num_branch;
+    // Select prediction by static PC-derived offset (not dynamic rank)
+    val<LOG_LANES> pc_offset = val<LOG_LANES>{inst_pc >> 2};
+    val<LANES> offset_mask = pc_offset.fo1().decode().concat();
+    val<1> taken = (offset_mask & p2) != hard<0>{};
     taken.fanout(hard<2>{});
-    reuse_prediction(~val<1>{block_entry >> (LINEINST - 1)});
+    reuse_prediction(~line_end());
     return taken;
   }
 
@@ -1298,7 +454,10 @@ struct TageDirectImpl : predictor {
 #ifdef TAGE_MONITOR
     mon.record_reuse_predict2();
 #endif
-    val<1> taken = p2 >> num_branch;
+    // Select prediction by static PC-derived offset (not dynamic rank)
+    val<LOG_LANES> pc_offset = val<LOG_LANES>{inst_pc >> 2};
+    val<LANES> offset_mask = pc_offset.fo1().decode().concat();
+    val<1> taken = (offset_mask & p2) != hard<0>{};
     taken.fanout(hard<2>{});
     block_size++;
     reuse_prediction(~line_end());
@@ -1312,6 +471,8 @@ struct TageDirectImpl : predictor {
     mon.record_branch_pc(static_cast<u64>(branch_pc));
 #endif
     branch_dir[num_branch] = taken.fo1();
+    // Save static PC-derived offset for this branch (like reference tage.hpp)
+    branch_offset[num_branch] = val<LOG_LANES>{branch_pc >> 2};
     num_branch++;
     reuse_prediction(~(line_end() | last_pred()));
   }
@@ -1332,10 +493,6 @@ struct TageDirectImpl : predictor {
 #endif
       execute_if(true_block, [&]() {
         next_pc.fanout(hard<2>{});
-        if constexpr (P1_USE_GSHARE_V) {
-          global_history1 =
-              (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
-        }
         if constexpr (USE_DIR_HIST_V)
           gfolds.update(concat(val<1>{0}, val<PATHBITS>{next_pc >> 2}));
         else
@@ -1386,23 +543,36 @@ struct TageDirectImpl : predictor {
     // conditions, etc. from the reg values read in predict2.
     // No RAM access here.
 
-    // last_rank: which lane held the last conditional branch in this block
-    val<LOG_LANES> last_rank = val<LOG_LANES>{num_branch - 1};
-    last_rank.fanout(hard<4 * NUM_TABLES + 2>{});
+    // last_offset: PC-derived offset of the last conditional branch
+    branch_offset.fanout(hard<LANES + NUM_TABLES + 2>{});
+    val<LOG_LANES> last_offset = val<LOG_LANES>{branch_offset[num_branch - 1]};
+    last_offset.fanout(hard<4 * NUM_TABLES + 2>{});
 
-    // Per-lane: was this lane used by a branch in this block?
-    arr<val<1>, LANES> is_branch = [&](u64 r) -> val<1> {
-      return val<1>{r < num_branch ? 1u : 0u};
+    // Per-offset: was this offset used by a branch in this block?
+    // Computed from hardware: check if any branch_offset[j] matches offset o.
+    arr<val<1>, LANES> is_branch = [&](u64 o) -> val<1> {
+      arr<val<1>, LANES> mo = [&](u64 j) -> val<1> {
+        if (j >= num_branch) return val<1>{0};
+        return val<LOG_LANES>{branch_offset[j]} == val<LOG_LANES>{o};
+      };
+      return mo.fo1().fold_or();
     };
     if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::DISAGREE)
       is_branch.fanout(hard<5>{});
     else
       is_branch.fanout(hard<4>{});
 
-    // Per-lane: actual branch direction (0 for unused lanes)
-    arr<val<1>, LANES> branch_taken = [&](u64 r) -> val<1> {
-      if (r < num_branch) return branch_dir[r];
-      return val<1>{0};
+    // Per-offset: actual branch direction (0 for offsets without branches).
+    // Maps offset → direction using branch_offset[] matching (like reference).
+    u64 update_valid = (u64(1) << num_branch) - 1;
+    val<LANES> actualdirs = branch_dir.concat();
+    actualdirs.fanout(hard<LANES + NUM_TABLES>{});
+    arr<val<1>, LANES> branch_taken = [&](u64 o) -> val<1> {
+      arr<val<1>, LANES> match_off = [&](u64 j) -> val<1> {
+        if (j >= num_branch) return val<1>{0};
+        return val<LOG_LANES>{branch_offset[j]} == val<LOG_LANES>{o};
+      };
+      return (match_off.fo1().concat() & val<LANES>{update_valid} & actualdirs) != hard<0>{};
     };
     branch_taken.fanout(hard<3>{});
 
@@ -1421,13 +591,13 @@ struct TageDirectImpl : predictor {
 
     // ---- Allocation decision (combinational) ----
 
-    // Tag comparison for the last branch's rank specifically
+    // Tag comparison for the last branch's offset specifically
     // (computed first so last_match1 is available for TAGE_MISS trigger)
     static_loop<NUM_TABLES>([&]<u64 I>() {
       using Table = std::tuple_element_t<I, Tables>;
       static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
-      last_tagcmp_reg[I] = (val<LOG_LANES>{readt[I] >> PER_HTAG} == last_rank)
-                         & (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
+      last_tagcmp_reg[I] = (val<LOG_LANES>{readt[I]} == last_offset)
+                         & (val<PER_HTAG>{readt[I] >> LOG_LANES} == val<PER_HTAG>{htag[I]});
     });
     val<NUM_TABLES + 1> last_match1 =
         last_tagcmp_reg.fo1().append(1).concat().one_hot();
@@ -1443,7 +613,15 @@ struct TageDirectImpl : predictor {
       } else if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::BASE_WRONG) {
         return val<1>{pred[num_branch - 1]} != branch_dir[num_branch - 1];
       } else if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::DISAGREE) {
-        return ((pred.concat() ^ p2) & is_branch.concat()) != hard<0>{};
+        // P1 is rank-indexed, P2 is offset-indexed — compare per branch
+        arr<val<1>, LANES> disag = [&](u64 j) -> val<1> {
+          if (j >= num_branch) return val<1>{0};
+          val<LOG_LANES> off = val<LOG_LANES>{branch_offset[j]};
+          val<LANES> mask = off.fo1().decode().concat();
+          val<1> p2_j = (mask & p2) != hard<0>{};
+          return pred[j] != p2_j;
+        };
+        return disag.fo1().fold_or();
       } else if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_MISS) {
         return val<1>{last_match1 >> NUM_TABLES};
       } else {
@@ -1536,12 +714,18 @@ struct TageDirectImpl : predictor {
 
     // ---- Per-table update conditions (combinational) ----
 
-    // bdir[i]: branch direction for the rank stored in table i's tag.
-    // On allocation, uses last_rank instead.
+    // bdir[i]: branch direction for the offset stored in table i's tag.
+    // On allocation, uses last_offset instead.  Follows reference pattern:
+    // match branch_offset[j] against stored/allocated offset to find direction.
     arr<val<1>, NUM_TABLES> bdir = [&](u64 i) {
-      val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
-      val<LOG_LANES> use_rank = select(allocate[i], last_rank, stored_rank.fo1());
-      return branch_dir.select(use_rank);
+      val<LOG_LANES> stored_offset = val<LOG_LANES>{readt[i]};
+      val<LOG_LANES> use_offset = select(allocate[i], last_offset, stored_offset.fo1());
+      use_offset.fanout(hard<LANES>{});
+      arr<val<1>, LANES> match_off = [&](u64 j) -> val<1> {
+        if (j >= num_branch) return val<1>{0};
+        return val<LOG_LANES>{branch_offset[j]} == use_offset;
+      };
+      return (match_off.fo1().concat() & val<LANES>{update_valid} & actualdirs) != hard<0>{};
     };
     bdir.fanout(hard<2>{});
 
@@ -1558,14 +742,14 @@ struct TageDirectImpl : predictor {
         if constexpr (MAX_CTR_WIDTH == 1) return readc[i];
         else return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
       }();
-      val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
-      return pred_dir != pred2_tage.select(stored_rank.fo1());
+      val<LOG_LANES> stored_offset = val<LOG_LANES>{readt[i]};
+      return pred_dir != pred2_tage.select(stored_offset.fo1());
     };
 
-    // goodpred[i]: was this table's prediction correct for its stored rank?
+    // goodpred[i]: was this table's prediction correct for its stored offset?
     arr<val<1>, NUM_TABLES> goodpred = [&](u64 i) {
-      val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
-      return (stored_rank.fo1() != last_rank) | correct_pred;
+      val<LOG_LANES> stored_offset = val<LOG_LANES>{readt[i]};
+      return (stored_offset.fo1() != last_offset) | correct_pred;
     };
     goodpred.fanout(hard<2>{});
 
@@ -1578,9 +762,22 @@ struct TageDirectImpl : predictor {
     };
     g_weak.fanout(hard<2>{});
 
-    // P1 vs P2 disagreement — need extra cycle to update P1
-    val<LANES> p1_concat = pred.concat();
-    val<LANES> disagree_mask = (p1_concat ^ p2) & is_branch.concat();
+    // P1 vs P2 disagreement — P1 is rank-indexed, P2 is offset-indexed.
+    // Build per-branch disagreement: for each branch j at offset branch_offset[j],
+    // compare pred[j] (P1, rank-indexed) with p2 bit at that offset.
+    arr<val<1>, LANES> per_branch_disagree = [&](u64 o) -> val<1> {
+      // Find if any branch maps to offset o, get its P1 prediction
+      arr<val<1>, LANES> match_j = [&](u64 j) -> val<1> {
+        if (j >= num_branch) return val<1>{0};
+        return val<LOG_LANES>{branch_offset[j]} == val<LOG_LANES>{o};
+      };
+      match_j.fanout(hard<2>{});
+      val<1> any_match = match_j.fold_or();
+      val<1> p1_for_o = (match_j.fo1().concat() & pred.concat()) != hard<0>{};
+      val<1> p2_for_o = (p2 >> o) & hard<1>{};
+      return any_match & (p1_for_o != p2_for_o);
+    };
+    val<LANES> disagree_mask = per_branch_disagree.concat();
     disagree_mask.fanout(hard<2>{});
 
     // U-bit clear helpers (combinational)
@@ -1672,15 +869,16 @@ struct TageDirectImpl : predictor {
     // Block stats
     mon.record_block(static_cast<u64>(block_entry), block_size, num_branch,
                      static_cast<u64>(extra_cycle));
-    // Per-branch outcome + prediction tracking
+    // Per-branch outcome + prediction tracking (p2 indexed by offset now)
     for (u64 r = 0; r < num_branch; r++) {
       bool actual = static_cast<u64>(branch_dir[r]);
       bool p1_pr = static_cast<u64>(pred[r]);
-      bool p2_pr = static_cast<u64>((p2 >> r) & hard<1>{});
+      u64 off_c = static_cast<u64>(branch_offset[r]) & (LANES - 1);
+      bool p2_pr = (static_cast<u64>(p2) >> off_c) & 1;
       bool misp = (r == num_branch - 1) ? static_cast<u64>(mispredict) : false;
-      mon.record_prediction(r, static_cast<u64>(match1[r]),
-                            static_cast<u64>(match2[r]),
-                            mon_meta_active[r], mon_altsel[r],
+      mon.record_prediction(r, static_cast<u64>(match1[off_c]),
+                            static_cast<u64>(match2[off_c]),
+                            mon_meta_active[off_c], mon_altsel[off_c],
                             p1_pr, p2_pr);
       mon.record_outcome(r, actual, misp);
     }
@@ -1749,7 +947,7 @@ struct TageDirectImpl : predictor {
     }
 
     // ---- TAGE tag write (allocation) ----
-    // Write new tag = concat(last_rank, htag) into allocated table entries.
+    // Write new tag = concat(htag, last_offset) into allocated table entries.
     // tag_ram was read in predict2 (cycle 1), safe to write in cycle 2.
     // Gate: allocate[I] ⊆ mispredict ⊆ extra_cycle, so no third arg needed.
     static_loop<NUM_TABLES>([&]<u64 I>() {
@@ -1759,7 +957,7 @@ struct TageDirectImpl : predictor {
           std::cerr << "UC: tage tag_ram[" << I << "] WRITE (alloc)\n";
 #endif
         std::get<I>(tables).tag_ram.write(tidx<I>(gindex[I]),
-                                          concat(last_rank, htag[I]));
+                                          concat(htag[I], last_offset));
       });
     });
 
@@ -2033,9 +1231,6 @@ struct TageDirectImpl : predictor {
     true_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
     execute_if(true_block, [&]() {
       next_pc.fanout(hard<2>{});
-      if constexpr (P1_USE_GSHARE_V) {
-        global_history1 = (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
-      }
       if constexpr (USE_DIR_HIST_V)
         gfolds.update(concat(branch_dir[num_branch - 1], val<PATHBITS>{next_pc >> 2}));
       else
@@ -2057,29 +1252,28 @@ struct TageDirectImpl : predictor {
 // User-facing Alias
 // ============================================================================
 
-template <typename TableCfg = td::TDTableConfig<>, // NOTE: @modify table config (TDTableConfig<...>, TDConfig32Kx2, TDConfig32Kx4, TDConfig256Kd4, TDConfigLTAGE)
-          typename AllocCfg = td::TDDefaultAllocConfig, // NOTE: @modify allocation policy
-          u64 TD_LINEINST = 1024,  // NOTE: @modify max instructions per line
-          u64 TD_N = 7,            // NOTE: @modify max branches per block
-          u64 TD_DECAY_CTR = 0, u64 TD_DECAY_GRAN = 2,          // NOTE: @modify decay timing (0=epoch reset, >0=prob decay)
-          typename TD_DECAY_POLICY = td::TDDecayMild,            // NOTE: @modify decay policy
-          bool TD_P1_USE_GSHARE = true, u64 TD_P1_TABLE_SIZE = 4096, // NOTE: @modify P1 gshare
-          u64 TD_P1_HIST = 6,          // NOTE: @modify P1 history length
-          bool TD_USE_META = true, u64 TD_METABITS = 4,  // NOTE: @modify meta predictor
-          u64 TD_METAPIPE = 2,         // NOTE: @modify meta pipeline depth
-          bool TD_USE_PATH_HIST = false,                  // NOTE: @modify path history
-          u64 TD_PATH_HIST_WIDTH = 27, u64 TD_PATH_BITS = 6, // NOTE: @modify path params
-          template <u64> class TD_FOLD_FN = td::XORFold,  // NOTE: @modify fold function
-          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0, // NOTE: @modify rwram banking
-          u64 TD_EPOCH_CTR_BITS = 8, // NOTE: @modify epoch counter width (8=reset every ~256 like reference, 18=reset every ~256K)
-          bool TD_SHARED_HYS = false, // NOTE: @modify shared hysteresis (halves hyst table size, 2 entries share 1 hyst)
-          bool TD_USE_DIR_HIST = false> // NOTE: @modify direction history in fold (concat dir bit with path bits)
+template <typename TableCfg = td::TDTableConfig<>,
+          typename AllocCfg = td::TDDefaultAllocConfig,
+          u64 TD_LINEINST = 1024,
+          u64 TD_N = 7,
+          u64 TD_DECAY_CTR = 0, u64 TD_DECAY_GRAN = 2,
+          typename TD_DECAY_POLICY = td::TDDecayMild,
+          u64 TD_P1_TABLE_SIZE = 256,
+          bool TD_USE_META = true, u64 TD_METABITS = 4,
+          u64 TD_METAPIPE = 2,
+          bool TD_USE_PATH_HIST = false,
+          u64 TD_PATH_HIST_WIDTH = 27, u64 TD_PATH_BITS = 6,
+          template <u64> class TD_FOLD_FN = td::XORFold,
+          u64 TD_RWRAM_BANKS = 4, u64 TD_RWRAM_BANK_SHIFT = 0,
+          u64 TD_EPOCH_CTR_BITS = 8,
+          bool TD_SHARED_HYS = false,
+          bool TD_USE_DIR_HIST = false>
 
-using TageDirect =
-    TageDirectImpl<TableCfg, AllocCfg, TD_LINEINST, TD_N, TD_DECAY_CTR,
-                   TD_DECAY_GRAN, TD_DECAY_POLICY, TD_P1_USE_GSHARE,
-                   TD_P1_TABLE_SIZE, TD_P1_HIST, TD_USE_META, TD_METABITS,
-                   TD_METAPIPE, TD_USE_PATH_HIST, TD_PATH_HIST_WIDTH,
-                   TD_PATH_BITS, TD_FOLD_FN, TD_RWRAM_BANKS,
-                   TD_RWRAM_BANK_SHIFT, TD_EPOCH_CTR_BITS, TD_SHARED_HYS,
-                   TD_USE_DIR_HIST>;
+using TageDirectBim =
+    TageDirectBimImpl<TableCfg, AllocCfg, TD_LINEINST, TD_N, TD_DECAY_CTR,
+                      TD_DECAY_GRAN, TD_DECAY_POLICY,
+                      TD_P1_TABLE_SIZE, TD_USE_META, TD_METABITS,
+                      TD_METAPIPE, TD_USE_PATH_HIST, TD_PATH_HIST_WIDTH,
+                      TD_PATH_BITS, TD_FOLD_FN, TD_RWRAM_BANKS,
+                      TD_RWRAM_BANK_SHIFT, TD_EPOCH_CTR_BITS, TD_SHARED_HYS,
+                      TD_USE_DIR_HIST>;

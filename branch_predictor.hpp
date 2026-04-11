@@ -3,6 +3,7 @@
 #include "predictors/bimodalN.hpp"
 #include "predictors/custom/Tage.hpp"
 #include "predictors/custom/TageDirect.hpp"
+#include "predictors/custom/TageDirectBim.hpp"
 #include "predictors/experiment_perceptron.hpp"
 #include "predictors/gshare.hpp"
 #include "predictors/gshareN.hpp"
@@ -21,6 +22,7 @@ using branch_predictor = PREDICTOR;
 #else
 // using branch_predictor = bimodal<>;
 // using branch_predictor = gshare<>;
-using branch_predictor = tage<>;
+// using branch_predictor = tage<>;
+using branch_predictor = TageDirectBim<>;
 // using branch_predictor = experiment_perceptron<>;
 #endif

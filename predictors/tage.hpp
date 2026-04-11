@@ -7,10 +7,19 @@
 #include "../harcom.hpp"
 #include "common.hpp"
 
+#ifdef TAGE_MONITOR
+#include <array>
+#include <bitset>
+#include <iostream>
+#include <iomanip>
+#include <unordered_set>
+#endif
+
 using namespace hcm;
 
 template <u64 LOGLB = 6, u64 NUMG = 8, u64 LOGG = 11, u64 LOGB = 12,
-          u64 TAGW = 11, u64 GHIST = 100, u64 LOGP1 = 14, u64 GHIST1 = 6>
+          u64 TAGW = 11, u64 GHIST = 100, u64 LOGP1 = 14, u64 GHIST1 = 6,
+          bool SHARED_HYS = false>
 struct tage : predictor {
   // provides 2^(LOGLB-2) predictions per cycle
   // P2 is a TAGE, P1 is a gshare
@@ -96,6 +105,185 @@ struct tage : predictor {
       "P1 hyst"}; // P1 hysteresis
   ram<val<1>, (1 << bindex_bits)> bhyst[LINEINST]{
       "bhyst"}; // bimodal hysteresis
+
+#ifdef TAGE_MONITOR
+  struct TageMonitor {
+    static constexpr u64 NT = NUMG;
+    static constexpr u64 LI = LINEINST;
+    static constexpr u64 WINDOW = 100000;
+
+    struct Counters {
+      u64 branches = 0, mispredictions = 0, blocks = 0, extra_cycles = 0;
+      std::array<u64, NT + 1> provider_count{};   // NT = bimodal
+      std::array<u64, NT + 1> provider_correct{};
+      std::array<u64, NT> tag_lookups{}, tag_matches{};
+      u64 p1_predictions = 0, p1_correct = 0;
+      u64 p1p2_disagree = 0, p1_right_p2_wrong = 0, p2_right_p1_wrong = 0;
+      u64 alloc_attempts = 0, alloc_success = 0, alloc_blocked = 0;
+      std::array<u64, NT> alloc_per_table{};
+      std::array<u64, NT + 1> alloc_from_provider{};
+      std::array<std::array<u64, NT>, NT + 1> alloc_cascade{};
+      u64 epoch_resets = 0, uctr_sum = 0, uctr_samples = 0;
+      void reset() { *this = Counters{}; }
+    };
+    Counters cum, win;
+    u64 window_num = 0;
+    bool header_printed = false;
+    std::unordered_set<u64> unique_branch_pcs;
+
+    // Shadow state per offset (set in predict2/update_cycle)
+    std::array<u64, LI> shadow_provider{};
+    std::array<bool, LI> shadow_p1{}, shadow_p2{};
+
+    static u64 decode_prov(u64 one_hot) {
+      for (u64 i = 0; i <= NT; i++)
+        if (one_hot & (u64(1) << i)) return i;
+      return NT;
+    }
+    static double pct(u64 n, u64 d) { return d > 0 ? 100.0 * n / d : 0.0; }
+
+    void record_prediction(u64 offset, u64 match1_val, bool p1, bool p2) {
+      shadow_provider[offset] = decode_prov(match1_val);
+      shadow_p1[offset] = p1;
+      shadow_p2[offset] = p2;
+    }
+
+    void record_tag_lookup(u64 table, bool matched) {
+      cum.tag_lookups[table]++; win.tag_lookups[table]++;
+      if (matched) { cum.tag_matches[table]++; win.tag_matches[table]++; }
+    }
+
+    void record_outcome(u64 offset, bool actual, bool is_last_br, bool mispredict) {
+      bool p2_ok = (shadow_p2[offset] == actual);
+      bool p1_ok = (shadow_p1[offset] == actual);
+      auto rec = [&](Counters &c) {
+        c.branches++;
+        if (is_last_br && mispredict) c.mispredictions++;
+        u64 prov = shadow_provider[offset];
+        c.provider_count[prov]++;
+        if (p2_ok) c.provider_correct[prov]++;
+        c.p1_predictions++;
+        if (p1_ok) c.p1_correct++;
+        if (shadow_p1[offset] != shadow_p2[offset]) {
+          c.p1p2_disagree++;
+          if (p1_ok && !p2_ok) c.p1_right_p2_wrong++;
+          if (p2_ok && !p1_ok) c.p2_right_p1_wrong++;
+        }
+      };
+      rec(cum); rec(win);
+      if (win.branches >= WINDOW) { print_window(std::cerr); win.reset(); window_num++; }
+    }
+
+    void record_block(bool extra) {
+      cum.blocks++; win.blocks++;
+      if (extra) { cum.extra_cycles++; win.extra_cycles++; }
+    }
+
+    void record_alloc(u64 provider_idx, u64 alloc_mask) {
+      auto rec = [&](Counters &c) {
+        c.alloc_attempts++;
+        if (alloc_mask) {
+          c.alloc_success++;
+          c.alloc_from_provider[provider_idx]++;
+          for (u64 i = 0; i < NT; i++)
+            if (alloc_mask & (u64(1) << i)) { c.alloc_per_table[i]++; c.alloc_cascade[provider_idx][i]++; }
+        } else {
+          c.alloc_blocked++;
+        }
+      };
+      rec(cum); rec(win);
+    }
+
+    void record_uctr(u64 v) { cum.uctr_sum += v; cum.uctr_samples++; win.uctr_sum += v; win.uctr_samples++; }
+    void record_epoch_reset() { cum.epoch_resets++; win.epoch_resets++; }
+    void record_branch_pc(u64 pc) { unique_branch_pcs.insert(pc); }
+
+    void print_window(std::ostream &os) {
+      if (!header_printed) {
+        os << "# win,br,misp%,extra%,bim%,";
+        for (u64 i = 0; i < NT; i++) os << "T" << i << "%,";
+        os << "p1acc%,p1p2dis%,alloc_ok%,uctr_avg\n";
+        header_printed = true;
+      }
+      auto &w = win;
+      os << std::fixed << std::setprecision(1);
+      os << window_num << "," << w.branches << "," << pct(w.mispredictions, w.branches) << ","
+         << pct(w.extra_cycles, w.blocks) << "," << pct(w.provider_count[NT], w.branches) << ",";
+      for (u64 i = 0; i < NT; i++) os << pct(w.provider_count[i], w.branches) << ",";
+      os << pct(w.p1_correct, w.p1_predictions) << ","
+         << pct(w.p1p2_disagree, w.branches) << ","
+         << pct(w.alloc_success, w.alloc_attempts) << ","
+         << (w.uctr_samples > 0 ? double(w.uctr_sum) / w.uctr_samples : 0) << "\n";
+    }
+
+    void print_summary(std::ostream &os = std::cerr) const {
+      const auto &c = cum;
+      os << "\n=== Tage<> Monitor Summary ===\n";
+      os << "Branches: " << c.branches << "  Mispredictions: " << c.mispredictions
+         << " (" << std::fixed << std::setprecision(2) << pct(c.mispredictions, c.branches) << "%)\n";
+      os << "Blocks: " << c.blocks << "  Extra cycles: " << c.extra_cycles
+         << " (" << pct(c.extra_cycles, c.blocks) << "%)\n";
+      os << "Unique branch PCs: " << unique_branch_pcs.size() << "\n\n";
+
+      os << "Provider Distribution:\n";
+      os << "  Table     | Provided  |  Correct  | Accuracy | TagMatch%\n";
+      os << "  ----------+-----------+-----------+----------+----------\n";
+      os << "  Bimodal   |" << std::setw(10) << c.provider_count[NT]
+         << " |" << std::setw(10) << c.provider_correct[NT]
+         << " |" << std::setw(7) << std::setprecision(1)
+         << pct(c.provider_correct[NT], c.provider_count[NT]) << "% |      --\n";
+      for (u64 i = 0; i < NT; i++) {
+        os << "  T" << i << std::setw(8 - (i >= 10 ? 2 : 1)) << ""
+           << "|" << std::setw(10) << c.provider_count[i]
+           << " |" << std::setw(10) << c.provider_correct[i]
+           << " |" << std::setw(7) << pct(c.provider_correct[i], c.provider_count[i]) << "%"
+           << " |" << std::setw(7) << pct(c.tag_matches[i], c.tag_lookups[i]) << "%\n";
+      }
+      u64 tage_total = 0, tage_correct = 0;
+      for (u64 i = 0; i < NT; i++) { tage_total += c.provider_count[i]; tage_correct += c.provider_correct[i]; }
+      os << "  TAGE total: " << tage_total << " (" << pct(tage_total, c.branches) << "% of branches)"
+         << "  Accuracy: " << pct(tage_correct, tage_total) << "%\n";
+
+      os << "\nP1 (gshare):\n";
+      os << "  Accuracy: " << c.p1_correct << "/" << c.p1_predictions
+         << " (" << pct(c.p1_correct, c.p1_predictions) << "%)\n";
+      os << "  Disagree with P2: " << c.p1p2_disagree
+         << " (" << pct(c.p1p2_disagree, c.branches) << "%)\n";
+      os << "  P1 right P2 wrong: " << c.p1_right_p2_wrong
+         << "  P2 right P1 wrong: " << c.p2_right_p1_wrong << "\n";
+
+      os << "\nAllocation:\n";
+      os << "  Attempts: " << c.alloc_attempts
+         << "  Success: " << c.alloc_success
+         << " (" << pct(c.alloc_success, c.alloc_attempts) << "%)"
+         << "  Blocked: " << c.alloc_blocked << "\n";
+      os << "  Per table:";
+      for (u64 i = 0; i < NT; i++) os << " T" << i << "=" << c.alloc_per_table[i];
+      os << "\n";
+
+      os << "\nAllocation Cascade (provider -> target):\n";
+      os << "  Provider  | Allocs  |";
+      for (u64 i = 0; i < NT; i++) os << std::setw(7) << "T" + std::to_string(i);
+      os << "\n  ----------+---------+";
+      for (u64 i = 0; i < NT; i++) os << "-------";
+      os << "\n";
+      for (u64 p = 0; p <= NT; p++) {
+        if (c.alloc_from_provider[p] == 0) continue;
+        if (p == NT) os << "  Bimodal   |";
+        else os << "  T" << p << std::setw(8 - (p >= 10 ? 2 : 1)) << "" << "|";
+        os << std::setw(8) << c.alloc_from_provider[p] << " |";
+        for (u64 t = 0; t < NT; t++) os << std::setw(7) << c.alloc_cascade[p][t];
+        os << "\n";
+      }
+      os << "\n  Epoch resets: " << c.epoch_resets
+         << "  Avg uctr: " << (c.uctr_samples > 0 ? double(c.uctr_sum) / c.uctr_samples : 0) << "\n";
+      os << "=== End Tage<> Monitor ===\n\n";
+    }
+  };
+
+  TageMonitor mon;
+  ~tage() { mon.print_summary(); }
+#endif
 
   tage() {
 #ifdef TAGE_VERBOSE
@@ -270,6 +458,9 @@ struct tage : predictor {
     assert(num_branch < LINEINST);
     branch_offset[num_branch] = branch_pc.fo1() >> 2;
     branch_dir[num_branch] = taken.fo1();
+#ifdef TAGE_MONITOR
+    mon.record_branch_pc(static_cast<u64>(branch_pc));
+#endif
     num_branch++;
   }
 
@@ -437,6 +628,36 @@ struct tage : predictor {
         extra_cycle.fanout(hard<NUMG*2+1>{});
         need_extra_cycle(extra_cycle);
 
+#ifdef TAGE_MONITOR
+        mon.record_block(static_cast<u64>(extra_cycle));
+        // Per-table tag match tracking (htag match, not full tag with offset)
+        for (u64 i = 0; i < NUMG; i++) {
+          bool matched = static_cast<u64>(val<HTAGBITS>{readt[i]} == htag[i]);
+          mon.record_tag_lookup(i, matched);
+        }
+        // Per-offset predictions and outcomes
+        for (u64 offset = 0; offset < LINEINST; offset++) {
+          if (!static_cast<u64>(is_branch[offset])) continue;
+          bool p1_pr = static_cast<u64>(readp1[offset]); // P1 gshare prediction for this offset
+          bool p2_pr = static_cast<u64>((p2 >> offset) & hard<1>{});
+          mon.record_prediction(offset, static_cast<u64>(match1[offset]), p1_pr, p2_pr);
+          bool actual = static_cast<u64>(branch_taken[offset]);
+          bool is_last = (offset == static_cast<u64>(last_offset));
+          mon.record_outcome(offset, actual, is_last, static_cast<u64>(mispredict));
+        }
+        // Allocation tracking
+        if (static_cast<u64>(mispredict)) {
+          u64 lm1 = static_cast<u64>(last_match1);
+          u64 prov_idx = NUMG; // default = bimodal
+          for (u64 i = 0; i < NUMG; i++)
+            if (lm1 & (u64(1) << i)) { prov_idx = i; break; }
+          u64 amask = 0;
+          for (u64 i = 0; i < NUMG; i++)
+            if (static_cast<u64>(allocate[i])) amask |= (u64(1) << i);
+          mon.record_alloc(prov_idx, amask);
+        }
+#endif
+
 #ifdef USE_META
     // update meta counter
     arr<val<1>, LINEINST> altdiff = [&](u64 offset) {
@@ -543,6 +764,10 @@ struct tage : predictor {
       for (auto &uram : ubit)
         uram.reset();
     });
+#ifdef TAGE_MONITOR
+    mon.record_uctr(static_cast<u64>(uctr));
+    if (static_cast<u64>(uctrsat)) mon.record_epoch_reset();
+#endif
 #endif
 
         // update global history

@@ -8,10 +8,12 @@
 #include <bitset>
 #include <iostream>
 #include <iomanip>
+#include <unordered_set>
 
 using u64 = uint64_t;
 
-template <u64 NUM_TABLES, u64 LANES, u64 P1_ENTRIES, u64 RWRAM_BANKS>
+template <u64 NUM_TABLES, u64 LANES, u64 P1_ENTRIES, u64 RWRAM_BANKS,
+          u64 MAX_TABLE_ENTRIES = 2048>
 struct TDMonitor {
 
   static constexpr u64 WINDOW_SIZE = 100000; // branches per window
@@ -76,13 +78,20 @@ struct TDMonitor {
     u64 alloc_attempts = 0;
     u64 alloc_success = 0;
     u64 alloc_fail = 0;
+    u64 alloc_blocked = 0;  // mispredict but postmask==0 (P1 was provider)
     std::array<u64, NUM_TABLES> alloc_per_table{};
+    // cascade: alloc_from_provider[i] = allocations when Ti was provider
+    // alloc_from_provider[NUM_TABLES] = allocations when P1 was provider
+    std::array<u64, NUM_TABLES + 1> alloc_from_provider{};
+    std::array<std::array<u64, NUM_TABLES>, NUM_TABLES + 1> alloc_cascade{}; // [provider][target]
 
     // u-bit
     std::array<u64, NUM_TABLES> u_set_count{};
     std::array<u64, NUM_TABLES> u_clear_count{};
     u64 decay_fire_count = 0;
     u64 epoch_resets = 0;
+    u64 uctr_sum = 0;
+    u64 uctr_samples = 0;
 
     // rwram banking (hyst + u combined per table)
     std::array<u64, NUM_TABLES> rwram_reads{};
@@ -103,6 +112,13 @@ struct TDMonitor {
   // P1 occupancy — 1 bit per entry per lane
   std::array<std::bitset<P1_ENTRIES>, LANES> p1_occupied{};
   std::array<u64, LANES> p1_unique_entries{};
+
+  // TAGE table occupancy — 1 bit per entry per table
+  std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> tage_occupied{};
+  std::array<u64, NUM_TABLES> tage_unique_entries{};
+
+  // Unique branch PCs
+  std::unordered_set<u64> unique_branch_pcs;
 
   // ======== Shadow state (set in predict2, consumed in update_cycle) ========
   static constexpr u64 MAX_FW = 64;
@@ -233,6 +249,29 @@ struct TDMonitor {
     record(win);
   }
 
+  // Allocation blocked (mispredict/trigger fired but postmask==0)
+  void record_alloc_blocked() {
+    cum.alloc_blocked++; win.alloc_blocked++;
+  }
+
+  // Cascade: provider_idx = which table was provider (NUM_TABLES = P1),
+  //          allocate_mask = which tables got allocated
+  void record_alloc_cascade(u64 provider_idx, u64 allocate_mask) {
+    auto record = [&](Counters &c) {
+      if (allocate_mask == 0) return;
+      c.alloc_from_provider[provider_idx]++;
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        if (allocate_mask & (u64(1) << i)) c.alloc_cascade[provider_idx][i]++;
+    };
+    record(cum);
+    record(win);
+  }
+
+  // Branch PC tracking
+  void record_branch_pc(u64 pc) {
+    unique_branch_pcs.insert(pc);
+  }
+
   // u-bit write
   void record_u_write(u64 table, bool new_u) {
     if (new_u) { cum.u_set_count[table]++; win.u_set_count[table]++; }
@@ -241,6 +280,10 @@ struct TDMonitor {
 
   void record_decay_fire() { cum.decay_fire_count++; win.decay_fire_count++; }
   void record_epoch_reset() { cum.epoch_resets++; win.epoch_resets++; }
+  void record_uctr(u64 val) {
+    cum.uctr_sum += val; cum.uctr_samples++;
+    win.uctr_sum += val; win.uctr_samples++;
+  }
 
   // P1 write — track per-lane occupancy
   void record_p1_write(u64 lane, u64 index) {
@@ -248,6 +291,14 @@ struct TDMonitor {
     if (lane < LANES && index < P1_ENTRIES && !p1_occupied[lane].test(index)) {
       p1_occupied[lane].set(index);
       p1_unique_entries[lane]++;
+    }
+  }
+
+  // TAGE table write — track occupancy
+  void record_tage_write(u64 table, u64 index) {
+    if (table < NUM_TABLES && index < MAX_TABLE_ENTRIES && !tage_occupied[table].test(index)) {
+      tage_occupied[table].set(index);
+      tage_unique_entries[table]++;
     }
   }
 
@@ -292,7 +343,7 @@ struct TDMonitor {
       os << "# win,br,misp%,extra%,i/blk,br/blk,";
       os << "p1%,";
       for (u64 i = 0; i < NUM_TABLES; i++) os << "T" << i << "%,";
-      os << "p1acc%,p1p2dis%,alloc_ok%";
+      os << "p1acc%,p1p2dis%,alloc_ok%,uctr_avg";
       os << "\n";
       header_printed = true;
     }
@@ -310,7 +361,8 @@ struct TDMonitor {
       os << pct(w.provider_count[i], w.branches) << ",";
     os << pct(w.p1_correct, w.p1_predictions) << ","
        << pct(w.p1p2_disagree, w.branches) << ","
-       << pct(w.alloc_success, w.alloc_attempts);
+       << pct(w.alloc_success, w.alloc_attempts) << ","
+       << (w.uctr_samples > 0 ? double(w.uctr_sum) / w.uctr_samples : 0);
     os << "\n";
   }
 
@@ -452,11 +504,45 @@ struct TDMonitor {
     os << "  Attempts: " << c.alloc_attempts
        << "  Success: " << c.alloc_success
        << " (" << pct(c.alloc_success, c.alloc_attempts) << "%)"
-       << "  Fail: " << c.alloc_fail << "\n";
+       << "  Fail: " << c.alloc_fail
+       << "  Blocked: " << c.alloc_blocked << "\n";
     os << "  Per table:";
     for (u64 i = 0; i < NUM_TABLES; i++)
       os << " T" << i << "=" << c.alloc_per_table[i];
     os << "\n";
+    os << "  Unique branch PCs: " << unique_branch_pcs.size() << "\n";
+
+    // Allocation cascade (provider → target)
+    os << "\nAllocation Cascade (provider → target):\n";
+    os << "  Provider  | Allocs  |";
+    for (u64 i = 0; i < NUM_TABLES; i++) os << std::setw(7) << "T" + std::to_string(i);
+    os << "\n  ----------+---------+";
+    for (u64 i = 0; i < NUM_TABLES; i++) os << "-------";
+    os << "\n";
+    for (u64 p = 0; p <= NUM_TABLES; p++) {
+      if (c.alloc_from_provider[p] == 0) continue;
+      if (p == NUM_TABLES)
+        os << "  P1(gshr)  |";
+      else
+        os << "  T" << p << std::setw(8 - (p >= 10 ? 2 : 1)) << "" << "|";
+      os << std::setw(8) << c.alloc_from_provider[p] << " |";
+      for (u64 t = 0; t < NUM_TABLES; t++)
+        os << std::setw(7) << c.alloc_cascade[p][t];
+      os << "\n";
+    }
+
+    // TAGE table occupancy
+    os << "\nTAGE Table Occupancy:\n";
+    os << "  Table  | Size  | Occupied |  Occ% | Accuracy | Allocs\n";
+    os << "  -------+-------+----------+-------+----------+-------\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << ""
+         << "|" << std::setw(6) << MAX_TABLE_ENTRIES
+         << " |" << std::setw(9) << tage_unique_entries[i]
+         << " |" << std::setw(5) << pct(tage_unique_entries[i], MAX_TABLE_ENTRIES) << "%"
+         << " |" << std::setw(7) << pct(c.provider_correct[i], c.provider_count[i]) << "%"
+         << " |" << std::setw(7) << c.alloc_per_table[i] << "\n";
+    }
 
     // u-bit
     os << "\nU-bit Writes:\n";
@@ -470,7 +556,8 @@ struct TDMonitor {
          << " |" << std::setw(7) << pct(c.u_clear_count[i], total_u) << "%\n";
     }
     os << "  Decay fires: " << c.decay_fire_count
-       << "  Epoch resets: " << c.epoch_resets << "\n";
+       << "  Epoch resets: " << c.epoch_resets
+       << "  Avg uctr: " << (c.uctr_samples > 0 ? double(c.uctr_sum) / c.uctr_samples : 0) << "\n";
 
     // rwram
     os << "\nRWRAM Bank Stats (per table, hyst+u combined):\n";
