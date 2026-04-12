@@ -1057,8 +1057,6 @@ struct TageDirectImpl : predictor {
                       TableCfg::HIST_LEN>
       gfolds;
   bool gfolds_inited = false;
-  reg<1> true_block = 1;
-
   // P1 gshare (gshareN pattern)
   std::conditional_t<P1_USE_GSHARE_V, reg<P1_HIST_V>, EmptyMember>
       global_history1;
@@ -1087,6 +1085,7 @@ struct TageDirectImpl : predictor {
   arr<reg<1>, LANES> pred1_tage;
   arr<reg<1>, LANES> pred2_tage;
   reg<LANES> p2;
+  arr<reg<1>, LANES> p2_rank;  // per-rank final prediction (combinational → reg)
 
   // Meta
   std::conditional_t<USE_META_V, arr<reg<METABITS_V, i64>, METAPIPE_V>,
@@ -1206,56 +1205,51 @@ struct TageDirectImpl : predictor {
     mon.record_predict1();
 #endif
 
-    inst_pc.fanout(hard<3>{});
-    true_block.fanout(hard<4>{});
+    inst_pc.fanout(hard<2>{});
 
-    // Block entry: numeric offset (gshareN_ahead_best pattern)
-    block_entry = select(true_block, val<LOG_LINEINST>{inst_pc >> 2},
-                         val<LOG_LINEINST>{block_entry + block_size});
+    // Block tracking — always fresh (predict1 = new block start, no select)
+    block_entry = val<LOG_LINEINST>{inst_pc >> 2};
     block_entry.fanout(hard<LANES + 2>{});
-
-    // Lane scrambling
-    rank = select(true_block, val<N + 1>{1}, rank << num_branch);
+    rank = 1;
     rank.fanout(hard<N + 2>{});
-    X = select(true_block, val<LOG_LANES>{inst_pc >> 2}.decode().concat(),
-               X.rotate_left(num_branch));
-    X.fanout(hard<LANES>{});
+    X = val<LOG_LANES>{inst_pc >> 2}.decode().concat();
 
-    // P1 gshare: read on true blocks only
+    // P1 gshare: inst_pc → hash → RAM read → AND → return
+    // Use val for index to keep it off reg round-trip
+    val<P1_INDEX_BITS> lineaddr = inst_pc >> 2;
     if constexpr (P1_USE_GSHARE_V) {
       global_history1.fanout(hard<2>{});
-    }
-    execute_if(true_block, [&]() {
-      val<P1_INDEX_BITS> lineaddr = inst_pc >> 2;
-      if constexpr (P1_USE_GSHARE_V) {
-        if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
-          index1 = lineaddr ^ (val<P1_INDEX_BITS>{global_history1}
-                               << (P1_INDEX_BITS - P1_HIST_V));
-        } else {
-          index1 = global_history1.make_array(val<P1_INDEX_BITS>{})
-                       .append(lineaddr)
-                       .fold_xor();
-        }
+      if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
+        index1 = lineaddr ^ (val<P1_INDEX_BITS>{global_history1}
+                             << (P1_INDEX_BITS - P1_HIST_V));
       } else {
-        index1 = lineaddr;
+        index1 = global_history1.make_array(val<P1_INDEX_BITS>{})
+                     .append(lineaddr)
+                     .fold_xor();
       }
-#ifdef TD_VERBOSE
-      std::cerr << "P1: gshare p1_pred READ\n";
-#endif
-      unordered_pred1 = p1_pred.read(index1);
-    });
-
-    // Extract per-lane predictions
-    unordered_pred1.fanout(hard<LANES>{});
-    for (u64 i = 0; i < LANES; i++) {
-      pred[i] = (unordered_pred1 & X.rotate_left(i)) != hard<0>{};
+    } else {
+      index1 = lineaddr;
     }
-    pred.fanout(hard<LANES * 2>{});
+    index1.fanout(hard<LANES>{});
+#ifdef TD_VERBOSE
+    std::cerr << "P1: gshare p1_pred READ\n";
+#endif
+    val<LANES> p1_read = p1_pred.read(index1);
+    unordered_pred1 = p1_read;  // persist for update_cycle
+    p1_read.fanout(hard<2>{});
+
+    // Persist per-lane predictions for predict2/reuse (off critical path)
+    val<LANES> X_val = val<LOG_LANES>{inst_pc >> 2}.decode().concat();
+    X_val.fanout(hard<LANES>{});
+    for (u64 i = 0; i < LANES; i++) {
+      pred[i] = (p1_read & X_val.rotate_left(i)) != hard<0>{};
+    }
 
     block_size = 1;
     num_branch = 0;
     reuse_prediction(~line_end());
-    return pred[0];
+    // TEMP TEST: return constant — no data dependency on anything
+    return val<1>{0};
   }
 
   val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) override {
@@ -1320,8 +1314,10 @@ struct TageDirectImpl : predictor {
     if constexpr (MAX_HYST_WIDTH > 0)
       readh.fanout(hard<2>{});
     readu.fanout(hard<2>{});
-    notumask = ~readu.concat();
-    notumask.fanout(hard<2>{});
+    // Compute notumask as val (combinational), persist to reg
+    val<NUM_TABLES> notumask_v = ~readu.concat();
+    notumask_v.fanout(hard<3>{});
+    notumask = notumask_v;
 #ifdef TAGE_MONITOR
     u64 t_ram_read = 0;
     for (u64 i = 0; i < NUM_TABLES; i++) {
@@ -1368,7 +1364,7 @@ struct TageDirectImpl : predictor {
     };
     htagcmp_split.fanout(hard<2>{});
     static_loop<NUM_TABLES>([&]<u64 I>() {
-      htagcmp_reg[I] = htagcmp_split[I];  // persist for update_cycle
+      htagcmp_reg[I] = htagcmp_split[I];
     });
     val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
     htagcmp.fanout(hard<LANES>{});
@@ -1376,79 +1372,100 @@ struct TageDirectImpl : predictor {
     u64 t_tag_cmp = htagcmp.time();
 #endif
 
-    // Per-rank tag match
+    // Pre-compute meta inputs (combinational vals, no reg reads on path)
+    [[maybe_unused]] val<NUM_TABLES> coldctr_v = [&]() -> val<NUM_TABLES> {
+      if constexpr (USE_META_V) {
+        arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
+          return readh[i] == hard<0>{};
+        };
+        return notumask_v & weakctr.fo1().concat();
+      } else {
+        return hard<0>{};
+      }
+    }();
+    coldctr_v.fanout(hard<LANES>{});
+    [[maybe_unused]] val<1> metasign_v = [&]() -> val<1> {
+      if constexpr (USE_META_V) {
+        meta.fanout(hard<2>{});
+        return (meta[METAPIPE_V - 1] >= hard<0>{});
+      } else {
+        return hard<0>{};
+      }
+    }();
+    metasign_v.fanout(hard<LANES>{});
+
+    // ---- Fully combinational per-rank datapath ----
+    // Compute match → one_hot → pred → meta → p2 with NO intermediate regs.
+    // Write to regs at the end of each rank for update_cycle only.
     static_loop<LANES>([&]<u64 R>() {
+      // Tag match (combinational)
       arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
         return val<LOG_LANES>{readt[i] >> MAX_HTAGBITS} == hard<R>{};
       };
-      match[R] =
+      val<NUM_TABLES + 1> match_v =
           concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
+      match_v.fanout(hard<4>{});
+
+      // Provider = longest matching table (combinational)
+      val<NUM_TABLES + 1> match1_v = match_v.one_hot();
+      match1_v.fanout(hard<5>{});
+
+      // Primary prediction (combinational)
+      val<1> pred1_v = (match1_v & preds[R]) != hard<0>{};
+      pred1_v.fanout(hard<3>{});
+
+      // Alt provider (combinational)
+      val<NUM_TABLES + 1> match2_v = (match_v ^ match1_v).one_hot();
+      match2_v.fanout(hard<3>{});
+
+      // Alt prediction (combinational)
+      val<1> pred2_v = (match2_v & preds[R]) != hard<0>{};
+      pred2_v.fanout(hard<3>{});
+
+      // Meta override (combinational)
+      val<1> final_pred = [&]() -> val<1> {
+        if constexpr (USE_META_V) {
+          val<1> newly_v = (match1_v & coldctr_v) != hard<0>{};
+          newly_v.fanout(hard<2>{});
+          newly_alloc[R] = newly_v;  // persist for update_cycle
+          arr<val<1>, 3> inputs = {metasign_v, newly_v,
+                                   match2_v != hard<0>{}};
+          val<1> altsel = inputs.fo1().fold_and();
+          altsel.fanout(hard<2>{});
+#ifdef TAGE_MONITOR
+          mon_altsel[R] = static_cast<u64>(altsel);
+          mon_meta_active[R] = static_cast<u64>(match2_v != hard<0>{})
+                            && (static_cast<u64>(pred2_v) != static_cast<u64>(pred1_v))
+                            && static_cast<u64>(newly_v);
+#endif
+          return select(altsel, pred2_v, pred1_v);
+        } else {
+#ifdef TAGE_MONITOR
+          mon_altsel[R] = false;
+          mon_meta_active[R] = false;
+#endif
+          return pred1_v;
+        }
+      }();
+
+      // ---- Persist to regs for update_cycle (off critical path) ----
+      match[R] = match_v;
+      match1[R] = match1_v;
+      match2[R] = match2_v;
+      pred1_tage[R] = pred1_v;
+      pred2_tage[R] = pred2_v;
+
+      // Store per-rank final prediction for p2 assembly
+      // (write to p2_rank reg — one reg level at the end)
+      p2_rank[R] = final_pred;
     });
-    match.fanout(hard<2>{});
 #ifdef TAGE_MONITOR
     u64 t_match = match[0].time();
-#endif
-
-    // Provider/alt selection per rank
-    for (u64 r = 0; r < LANES; r++) {
-      match1[r] = match[r].one_hot();
-    }
-    match1.fanout(hard<3>{});
-#ifdef TAGE_MONITOR
     u64 t_onehot = match1[0].time();
 #endif
-    for (u64 r = 0; r < LANES; r++) {
-      pred1_tage[r] = (match1[r] & preds[r]) != hard<0>{};
-    }
-    pred1_tage.fanout(hard<2>{});
 
-    for (u64 r = 0; r < LANES; r++) {
-      match2[r] = (match[r] ^ match1[r]).one_hot();
-    }
-    match2.fanout(hard<2>{});
-    for (u64 r = 0; r < LANES; r++) {
-      pred2_tage[r] = (match2[r] & preds[r]) != hard<0>{};
-    }
-    pred2_tage.fanout(hard<2>{});
-
-    // Meta prediction
-    if constexpr (USE_META_V) {
-      meta.fanout(hard<2>{});
-      arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
-        return readh[i] == hard<0>{};
-      };
-      val<NUM_TABLES> coldctr = notumask & weakctr.fo1().concat();
-      coldctr.fanout(hard<LANES>{});
-      val<1> metasign = (meta[METAPIPE_V - 1] >= hard<0>{});
-      metasign.fanout(hard<LANES>{});
-      for (u64 r = 0; r < LANES; r++) {
-        newly_alloc[r] = (match1[r] & coldctr) != hard<0>{};
-      }
-      newly_alloc.fanout(hard<2>{});
-      arr<val<1>, LANES> altsel = [&](u64 r) {
-        arr<val<1>, 3> inputs = {metasign, newly_alloc[r],
-                                 match2[r] != hard<0>{}};
-        return inputs.fo1().fold_and();
-      };
-      p2 = arr<val<1>, LANES>{[&](u64 r) {
-             return select(altsel[r].fo1(), pred2_tage[r], pred1_tage[r]);
-           }}.concat();
-#ifdef TAGE_MONITOR
-      for (u64 r = 0; r < LANES; r++) {
-        bool has_alt = static_cast<u64>(match2[r] != hard<0>{});
-        bool pri_ne_alt = static_cast<u64>(pred1_tage[r]) != static_cast<u64>(pred2_tage[r]);
-        mon_altsel[r] = static_cast<u64>(altsel[r]);
-        bool is_newly_alloc = static_cast<u64>(newly_alloc[r]);
-        mon_meta_active[r] = has_alt && pri_ne_alt && is_newly_alloc;
-      }
-#endif
-    } else {
-      p2 = pred1_tage.concat();
-#ifdef TAGE_MONITOR
-      for (u64 r = 0; r < LANES; r++) { mon_altsel[r] = false; mon_meta_active[r] = false; }
-#endif
-    }
-
+    // Assemble p2 from per-rank results (single reg read level)
+    p2 = p2_rank.concat();
     p2.fanout(hard<LANES>{});
 #ifdef TAGE_MONITOR
     u64 t_meta = p2.time();
@@ -1496,22 +1513,19 @@ struct TageDirectImpl : predictor {
 #ifdef TD_VERBOSE
       std::cerr << "UC: EXIT (no branches)\n";
 #endif
-      execute_if(true_block, [&]() {
-        next_pc.fanout(hard<2>{});
-        if constexpr (P1_USE_GSHARE_V) {
-          global_history1 =
-              (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
-        }
-        if constexpr (USE_DIR_HIST_V)
-          gfolds.update(concat(val<1>{0}, val<PATHBITS>{next_pc >> 2}));
-        else
-          gfolds.update(val<PATHBITS>{next_pc >> 2});
-        if constexpr (USE_PATH_HIST_V) {
-          path_hist =
-              (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
-        }
-        true_block = 1;
-      });
+      next_pc.fanout(hard<2>{});
+      if constexpr (P1_USE_GSHARE_V) {
+        global_history1 =
+            (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
+      }
+      if constexpr (USE_DIR_HIST_V)
+        gfolds.update(concat(val<1>{0}, val<PATHBITS>{next_pc >> 2}));
+      else
+        gfolds.update(val<PATHBITS>{next_pc >> 2});
+      if constexpr (USE_PATH_HIST_V) {
+        path_hist =
+            (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
+      }
       return;
     }
 
@@ -2224,25 +2238,19 @@ struct TageDirectImpl : predictor {
       });
     }
 
-    // ---- History update ----
-    true_block = arr<val<1>, 4>{~mispredict, branch_dir[num_branch - 1],
-                                last_pred(), line_end()}
-                     .fold_or();
-    true_block.fanout(hard<MAXHIST + NUM_TABLES * 2 + 2>{});
-    execute_if(true_block, [&]() {
-      next_pc.fanout(hard<2>{});
-      if constexpr (P1_USE_GSHARE_V) {
-        global_history1 = (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
-      }
-      if constexpr (USE_DIR_HIST_V)
-        gfolds.update(concat(branch_dir[num_branch - 1], val<PATHBITS>{next_pc >> 2}));
-      else
-        gfolds.update(val<PATHBITS>{next_pc >> 2});
-      if constexpr (USE_PATH_HIST_V) {
-        path_hist =
-            (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
-      }
-    });
+    // ---- History update (unconditional — no ahead pipelining in direct mode) ----
+    next_pc.fanout(hard<2>{});
+    if constexpr (P1_USE_GSHARE_V) {
+      global_history1 = (global_history1 << 1) ^ val<P1_HIST_V>{next_pc >> 2};
+    }
+    if constexpr (USE_DIR_HIST_V)
+      gfolds.update(concat(branch_dir[num_branch - 1], val<PATHBITS>{next_pc >> 2}));
+    else
+      gfolds.update(val<PATHBITS>{next_pc >> 2});
+    if constexpr (USE_PATH_HIST_V) {
+      path_hist =
+          (path_hist << PATHBITS) ^ val<PATH_HIST_WIDTH_V>{next_pc >> 2};
+    }
 
 #ifdef TAGE_MONITOR
     mon.end_update_cycle();

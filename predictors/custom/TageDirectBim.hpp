@@ -223,6 +223,11 @@ struct TageDirectBimImpl : predictor {
     os << "\n  ALLOC_PRESSURE_BITS=" << AllocCfg::ALLOC_PRESSURE_BITS
        << "  ACCURACY_PRESSURE_BITS=" << AllocCfg::ACCURACY_PRESSURE_BITS;
     os << "\n  DISAGREE_EXTRA_CYCLE=" << AllocCfg::DISAGREE_EXTRA_CYCLE;
+    os << "\n  TARGET_POLICY=" << AllocCfg::TARGET_POLICY::name();
+    if constexpr (requires { AllocCfg::TARGET_POLICY::skip(); })
+      os << "  SKIP=" << AllocCfg::TARGET_POLICY::skip();
+    if constexpr (requires { AllocCfg::TARGET_POLICY::prob(); })
+      os << "  PROB=" << AllocCfg::TARGET_POLICY::prob() << "/256";
     os << "\nSHARED_HYS=" << SHARED_HYS_V;
     os << "\n\n";
   }
@@ -335,8 +340,9 @@ struct TageDirectBimImpl : predictor {
     if constexpr (MAX_HYST_WIDTH > 0)
       readh.fanout(hard<2>{});
     readu.fanout(hard<2>{});
-    notumask = ~readu.concat();
-    notumask.fanout(hard<2>{});
+    val<NUM_TABLES> notumask_v = ~readu.concat();
+    notumask_v.fanout(hard<3>{});
+    notumask = notumask_v;
 
     // Compute hashed tags (parallel with RAM reads)
     for (u64 i = 0; i < NUM_TABLES; i++) {
@@ -365,13 +371,25 @@ struct TageDirectBimImpl : predictor {
     };
     preds.fanout(hard<2 * LANES>{});
 
-    // Per-table htag comparison
-    static_loop<NUM_TABLES>([&]<u64 I>() {
-      using Table = std::tuple_element_t<I, Tables>;
-      static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
-      htagcmp_reg[I] = (val<PER_HTAG>{readt[I] >> LOG_LANES} == val<PER_HTAG>{htag[I]});
-    });
-    htagcmp_reg.fanout(hard<LANES + 1>{});
+    // Per-table htag comparison — combinational val for datapath,
+    // also persist to htagcmp_reg for update_cycle.
+    // Per-table PER_HTAG requires compile-time index; build val<NUM_TABLES>
+    // via IIFE + static_loop since arr<val> can't be move-assigned.
+    val<NUM_TABLES> htagcmp = [&]() -> val<NUM_TABLES> {
+      arr<val<1>, NUM_TABLES> splits = [&]<u64... Is>(std::index_sequence<Is...>) {
+        return arr<val<1>, NUM_TABLES>{[&]() -> val<1> {
+          using Table = std::tuple_element_t<Is, Tables>;
+          static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
+          return (val<PER_HTAG>{readt[Is] >> LOG_LANES} == val<PER_HTAG>{htag[Is]});
+        }()...};
+      }(std::make_index_sequence<NUM_TABLES>{});
+      splits.fanout(hard<2>{});
+      static_loop<NUM_TABLES>([&]<u64 I>() {
+        htagcmp_reg[I] = splits[I];  // persist for update_cycle
+      });
+      return splits.fo1().concat();
+    }();
+    htagcmp.fanout(hard<LANES>{});
 
     // Per-rank tag match
     static_loop<LANES>([&]<u64 R>() {
@@ -379,7 +397,7 @@ struct TageDirectBimImpl : predictor {
         return val<LOG_LANES>{readt[i]} == hard<R>{};
       };
       match[R] =
-          concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp_reg.concat());
+          concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
     });
     match.fanout(hard<2>{});
 
@@ -408,7 +426,7 @@ struct TageDirectBimImpl : predictor {
       arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
         return readh[i] == hard<0>{};
       };
-      val<NUM_TABLES> coldctr = notumask & weakctr.fo1().concat();
+      val<NUM_TABLES> coldctr = notumask_v & weakctr.fo1().concat();
       coldctr.fanout(hard<LANES>{});
       val<1> metasign = (meta[METAPIPE_V - 1] >= hard<0>{});
       metasign.fanout(hard<LANES>{});
@@ -685,7 +703,12 @@ struct TageDirectBimImpl : predictor {
       }
     }();
     candallocmask.fanout(hard<2>{});
-    val<NUM_TABLES> collamask = candallocmask.reverse();
+    val<NUM_TABLES> collamask_raw = candallocmask.reverse();
+    // Apply target policy functor (may skip closest candidates)
+    u64 ap_val = [&]() -> u64 { if constexpr (ALLOC_PRESS_W > 0) return alloc_pressure; else return 0; }();
+    u64 acp_val = [&]() -> u64 { if constexpr (ACC_PRESS_W > 0) return accuracy_pressure; else return 0; }();
+    val<NUM_TABLES> collamask = AllocCfg::TARGET_POLICY::template apply<NUM_TABLES>(
+        collamask_raw, ap_val, acp_val);
     collamask.fanout(hard<2>{});
     val<NUM_TABLES> collamask1 = collamask.one_hot();
     collamask1.fanout(hard<3>{});
