@@ -887,14 +887,17 @@ struct TageImpl : predictor {
     };
     preds.fanout(hard<2 * FETCH_WIDTH>{});
 
-    // tag comparisons — per-table tag widths via static_loop
+    // tag comparisons — combinational vals for datapath,
+    // also persist to htagcmp_reg for update_cycle.
+    arr<val<1>, NUM_TABLES> htagcmp_split = [&](int i) {
+      return val<MAX_HTAGBITS>{readt[i]} == val<MAX_HTAGBITS>{htag[i]};
+    };
+    htagcmp_split.fanout(hard<2>{});
     static_loop<NUM_TABLES>([&]<u64 I>() {
-      using Table = std::tuple_element_t<I, typename Base::Tables>;
-      static constexpr u64 PER_HTAG = (BR_P_ENTRY_V == 1)
-          ? Table::tag_width - LOG_FETCH_WIDTH : Table::tag_width;
-      htagcmp_reg[I] = (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
+      htagcmp_reg[I] = htagcmp_split[I];  // persist for update_cycle
     });
-    htagcmp_reg.fanout(hard<FETCH_WIDTH + 1>{});
+    val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
+    htagcmp.fanout(hard<FETCH_WIDTH>{});
 
     if constexpr (BR_P_ENTRY_V == 1) {
       static_loop<FETCH_WIDTH>([&]<u64 offset>() {
@@ -902,10 +905,9 @@ struct TageImpl : predictor {
           return val<LOG_FETCH_WIDTH>{readt[i] >> MAX_HTAGBITS} ==
                  hard<offset>{};
         };
-        match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp_reg.concat());
+        match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
       });
     } else {
-      val<NUM_TABLES> htagcmp = htagcmp_reg.concat();
       for (u64 offset = 0; offset < FETCH_WIDTH; offset++) {
         match[offset] = concat(val<1>{1}, htagcmp);
       }

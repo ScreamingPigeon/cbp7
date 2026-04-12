@@ -75,6 +75,11 @@ struct TDMonitor {
     u64 p1_right_p2_wrong = 0;
     u64 p2_right_p1_wrong = 0;
 
+    // Diverge@end: P1/P2 disagreement on block-ending branch only
+    u64 p1p2_disagree_at_end = 0;
+    u64 p1_right_at_end = 0;
+    u64 p2_right_at_end = 0;
+
     // Allocation
     u64 alloc_attempts = 0;
     u64 alloc_success = 0;
@@ -109,6 +114,14 @@ struct TDMonitor {
     std::array<u64, NUM_TABLES> rwram_writes_buffered{};
     std::array<u64, NUM_TABLES> rwram_same_bank_conflict{};
     std::array<u64, NUM_TABLES> rwram_buffer_pending{};
+
+    // P2 timing breakdown (picoseconds, max across all calls)
+    u64 max_p2_ram_read_ps = 0;     // after RAM reads complete
+    u64 max_p2_tag_cmp_ps = 0;      // after tag comparison
+    u64 max_p2_match_ps = 0;        // after per-rank match concat
+    u64 max_p2_onehot_ps = 0;       // after one_hot priority encoding
+    u64 max_p2_meta_ps = 0;         // after meta + final mux (= p2 output)
+    u64 max_p2_base_ps = 0;         // input timestamp (predict2 entry)
 
     void reset() { *this = Counters{}; }
   };
@@ -208,7 +221,9 @@ struct TDMonitor {
 
   // Branch outcome — called per branch in update_cycle monitor block
   // mispredict: simulator-level (only true for block-ending misprediction)
-  void record_outcome(u64 rank, bool actual_taken, bool mispredict) {
+  // is_block_end: true for the last branch in the block
+  void record_outcome(u64 rank, bool actual_taken, bool mispredict,
+                      bool is_block_end = false) {
     // Per-branch correctness derived from actual vs predicted
     bool p2_ok = (shadow_p2_pred[rank] == actual_taken);
     auto record = [&](Counters &c) {
@@ -248,6 +263,12 @@ struct TDMonitor {
         c.p1p2_disagree++;
         if (p1_ok && !p2_ok) c.p1_right_p2_wrong++;
         if (p2_ok && !p1_ok) c.p2_right_p1_wrong++;
+        // Diverge@end: only the block-ending branch matters for fetch redirection
+        if (is_block_end) {
+          c.p1p2_disagree_at_end++;
+          if (p1_ok && !p2_ok) c.p1_right_at_end++;
+          if (p2_ok && !p1_ok) c.p2_right_at_end++;
+        }
       }
     };
     record(cum);
@@ -365,6 +386,23 @@ struct TDMonitor {
     }
   }
 
+  void record_p2_timing(u64 base_ps, u64 ram_read_ps, u64 tag_cmp_ps,
+                        u64 match_ps, u64 onehot_ps, u64 meta_ps) {
+    auto upd = [](u64 &mx, u64 v) { if (v > mx) mx = v; };
+    upd(cum.max_p2_base_ps, base_ps);
+    upd(cum.max_p2_ram_read_ps, ram_read_ps);
+    upd(cum.max_p2_tag_cmp_ps, tag_cmp_ps);
+    upd(cum.max_p2_match_ps, match_ps);
+    upd(cum.max_p2_onehot_ps, onehot_ps);
+    upd(cum.max_p2_meta_ps, meta_ps);
+    upd(win.max_p2_base_ps, base_ps);
+    upd(win.max_p2_ram_read_ps, ram_read_ps);
+    upd(win.max_p2_tag_cmp_ps, tag_cmp_ps);
+    upd(win.max_p2_match_ps, match_ps);
+    upd(win.max_p2_onehot_ps, onehot_ps);
+    upd(win.max_p2_meta_ps, meta_ps);
+  }
+
   // ======== Helpers ========
 
   static u64 decode_provider(u64 one_hot) {
@@ -382,18 +420,22 @@ struct TDMonitor {
 
   void print_window(std::ostream &os) {
     if (!header_printed) {
-      os << "# win,br,misp%,extra%,i/blk,br/blk,";
+      os << "# win,br,misp%,MPKI,extra%,i/blk,br/blk,";
       os << "p1%,";
       for (u64 i = 0; i < NUM_TABLES; i++) os << "T" << i << "%,";
-      os << "p1acc%,p1p2dis%,alloc_ok%,uctr_avg";
+      os << "p1acc%,diverge%,div@end%,alloc_ok%,uctr_avg";
       os << "\n";
       header_printed = true;
     }
     auto &w = win;
+    double win_mpki = w.total_block_instr > 0
+                        ? 1000.0 * w.mispredictions / w.total_block_instr
+                        : 0.0;
     os << std::fixed << std::setprecision(1);
     os << window_num << ","
        << w.branches << ","
        << pct(w.mispredictions, w.branches) << ","
+       << std::setprecision(3) << win_mpki << "," << std::setprecision(1)
        << pct(w.extra_cycles, w.blocks) << ","
        << (w.blocks > 0 ? double(w.total_block_instr) / w.blocks : 0) << ","
        << (w.blocks > 0 ? double(w.total_block_branches) / w.blocks : 0) << ",";
@@ -403,6 +445,7 @@ struct TDMonitor {
       os << pct(w.provider_count[i], w.branches) << ",";
     os << pct(w.p1_correct, w.p1_predictions) << ","
        << pct(w.p1p2_disagree, w.branches) << ","
+       << pct(w.p1p2_disagree_at_end, w.branches) << ","
        << pct(w.alloc_success, w.alloc_attempts) << ","
        << (w.uctr_samples > 0 ? double(w.uctr_sum) / w.uctr_samples : 0);
     os << "\n";
@@ -414,13 +457,18 @@ struct TDMonitor {
     const auto &c = cum;
 
     os << "\n=== TageDirect Monitor Summary ===\n";
-    os << "Branches: " << c.branches
+    double mpki = c.total_block_instr > 0
+                    ? 1000.0 * c.mispredictions / c.total_block_instr
+                    : 0.0;
+    os << "Instructions: " << c.total_block_instr
+       << "  Branches: " << c.branches
        << "  Mispredictions: " << c.mispredictions
        << " (" << std::fixed << std::setprecision(2)
-       << pct(c.mispredictions, c.branches) << "%)\n";
+       << pct(c.mispredictions, c.branches) << "%)"
+       << "  MPKI: " << std::setprecision(3) << mpki << "\n";
     os << "Blocks: " << c.blocks
        << "  Extra cycles: " << c.extra_cycles
-       << " (" << pct(c.extra_cycles, c.blocks) << "%)"
+       << " (" << std::setprecision(2) << pct(c.extra_cycles, c.blocks) << "%)"
        << "  All-silent: " << c.extra_cycles_all_silent
        << " (" << pct(c.extra_cycles_all_silent, c.extra_cycles) << "% of extra)\n";
 
@@ -536,12 +584,18 @@ struct TDMonitor {
     os << "  Total occupancy: " << total_occ << "/" << P1_ENTRIES * LANES
        << " (" << pct(total_occ, P1_ENTRIES * LANES) << "%)\n";
 
-    // P1 vs P2
-    os << "\nP1 vs P2:\n";
-    os << "  Disagree: " << c.p1p2_disagree
-       << " (" << pct(c.p1p2_disagree, c.branches) << "%)\n";
-    os << "  P1 right, P2 wrong: " << c.p1_right_p2_wrong
-       << "  P2 right, P1 wrong: " << c.p2_right_p1_wrong << "\n";
+    // P1 vs P2: Diverge ratio
+    os << "\nP1 vs P2 (Diverge):\n";
+    os << "  Diverge ratio:     " << c.p1p2_disagree
+       << "/" << c.branches
+       << " (" << pct(c.p1p2_disagree, c.branches) << "%)"
+       << "  [P1 right: " << c.p1_right_p2_wrong
+       << "  P2 right: " << c.p2_right_p1_wrong << "]\n";
+    os << "  Diverge@end ratio: " << c.p1p2_disagree_at_end
+       << "/" << c.branches
+       << " (" << pct(c.p1p2_disagree_at_end, c.branches) << "%)"
+       << "  [P1 right: " << c.p1_right_at_end
+       << "  P2 right: " << c.p2_right_at_end << "]\n";
 
     // Allocation
     os << "\nAllocation:\n";
@@ -647,6 +701,31 @@ struct TDMonitor {
          << " |" << std::setw(9) << c.rwram_writes_buffered[i]
          << " |" << std::setw(9) << c.rwram_same_bank_conflict[i]
          << " |" << std::setw(7) << c.rwram_buffer_pending[i] << "\n";
+    }
+
+    // P2 Timing Breakdown
+    if (c.max_p2_meta_ps > 0) {
+      auto cyc = [](u64 ps) { return ps * (1.0 / 300.0); }; // 300ps per cycle
+      auto delta = [](u64 a, u64 b) -> u64 { return a > b ? a - b : 0; };
+      os << "\nP2 Timing Breakdown (max across all calls):\n";
+      os << "  Stage          |  Time(ps) | Cycles | Delta(ps) | Delta(cyc)\n";
+      os << "  ---------------+-----------+--------+-----------+-----------\n";
+      auto row = [&](const char *name, u64 ps, u64 base) {
+        u64 d = delta(ps, base);
+        os << "  " << std::setw(15) << std::left << name << std::right
+           << "|" << std::setw(10) << ps
+           << " |" << std::setw(6) << std::fixed << std::setprecision(2) << cyc(ps)
+           << " |" << std::setw(10) << d
+           << " |" << std::setw(10) << std::fixed << std::setprecision(2) << cyc(d) << "\n";
+      };
+      row("entry",     c.max_p2_base_ps,     c.max_p2_base_ps);
+      row("ram_read",  c.max_p2_ram_read_ps,  c.max_p2_base_ps);
+      row("tag_cmp",   c.max_p2_tag_cmp_ps,   c.max_p2_ram_read_ps);
+      row("match",     c.max_p2_match_ps,     c.max_p2_tag_cmp_ps);
+      row("one_hot",   c.max_p2_onehot_ps,    c.max_p2_match_ps);
+      row("meta/out",  c.max_p2_meta_ps,      c.max_p2_onehot_ps);
+      os << "  Total P2 latency: " << std::fixed << std::setprecision(2)
+         << cyc(delta(c.max_p2_meta_ps, c.max_p2_base_ps)) << " cycles\n";
     }
 
     os << "=== End TageDirect Monitor ===\n\n";

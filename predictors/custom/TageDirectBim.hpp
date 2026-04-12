@@ -881,7 +881,8 @@ struct TageDirectBimImpl : predictor {
                             static_cast<u64>(match2[off_c]),
                             mon_meta_active[off_c], mon_altsel[off_c],
                             p1_pr, p2_pr);
-      mon.record_outcome(r, actual, misp);
+      bool is_end = (r == num_branch - 1);
+      mon.record_outcome(r, actual, misp, is_end);
     }
     // Tag match tracking
     for (u64 i = 0; i < NUM_TABLES; i++) {

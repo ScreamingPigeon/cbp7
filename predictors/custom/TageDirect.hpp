@@ -335,8 +335,8 @@ constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
 // Table Config
 // ============================================================================
 
-template <u64 N = 8, u64 SIZE = 2048, u64 TAG = 11, u64 CTR = 1, u64 HYST = 2,
-          u64 U = 1, u64 MINH = 8, u64 MAXH = 100, u64 SIZE_RATIO = 1,
+template <u64 N = 10, u64 SIZE = 2048, u64 TAG = 11, u64 CTR = 1, u64 HYST = 2,
+          u64 U = 1, u64 MINH = 8, u64 MAXH = 256, u64 SIZE_RATIO = 1,
           HistSeries HIST = HistSeries::GEOMETRIC,
           typename TagFn = GradedTag<TAG, TAG - 3>,
           typename SizeFn = GeoSize<SIZE, SIZE_RATIO>>
@@ -1270,6 +1270,7 @@ struct TageDirectImpl : predictor {
   val<1> predict2(val<64> inst_pc) override {
 #ifdef TAGE_MONITOR
     mon.record_predict2();
+    u64 t_base = inst_pc.time();
 #endif
     val<LINEADDR_BITS> lineaddr = inst_pc >> 2;
     lineaddr.fanout(hard<1 + NUM_TABLES * 2>{});
@@ -1321,6 +1322,17 @@ struct TageDirectImpl : predictor {
     readu.fanout(hard<2>{});
     notumask = ~readu.concat();
     notumask.fanout(hard<2>{});
+#ifdef TAGE_MONITOR
+    u64 t_ram_read = 0;
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      u64 t = readt[i].time();
+      if (t > t_ram_read) t_ram_read = t;
+      t = readc[i].time();
+      if (t > t_ram_read) t_ram_read = t;
+      t = readu[i].time();
+      if (t > t_ram_read) t_ram_read = t;
+    }
+#endif
 
     // Compute hashed tags (parallel with RAM reads)
     for (u64 i = 0; i < NUM_TABLES; i++) {
@@ -1349,13 +1361,20 @@ struct TageDirectImpl : predictor {
     };
     preds.fanout(hard<2 * LANES>{});
 
-    // Per-table htag comparison
+    // Per-table htag comparison — combinational vals for datapath,
+    // also persist to htagcmp_reg for update_cycle.
+    arr<val<1>, NUM_TABLES> htagcmp_split = [&](int i) {
+      return val<MAX_HTAGBITS>{readt[i]} == htag[i];
+    };
+    htagcmp_split.fanout(hard<2>{});
     static_loop<NUM_TABLES>([&]<u64 I>() {
-      using Table = std::tuple_element_t<I, Tables>;
-      static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
-      htagcmp_reg[I] = (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
+      htagcmp_reg[I] = htagcmp_split[I];  // persist for update_cycle
     });
-    htagcmp_reg.fanout(hard<LANES + 1>{});
+    val<NUM_TABLES> htagcmp = htagcmp_split.fo1().concat();
+    htagcmp.fanout(hard<LANES>{});
+#ifdef TAGE_MONITOR
+    u64 t_tag_cmp = htagcmp.time();
+#endif
 
     // Per-rank tag match
     static_loop<LANES>([&]<u64 R>() {
@@ -1363,15 +1382,21 @@ struct TageDirectImpl : predictor {
         return val<LOG_LANES>{readt[i] >> MAX_HTAGBITS} == hard<R>{};
       };
       match[R] =
-          concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp_reg.concat());
+          concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp);
     });
     match.fanout(hard<2>{});
+#ifdef TAGE_MONITOR
+    u64 t_match = match[0].time();
+#endif
 
     // Provider/alt selection per rank
     for (u64 r = 0; r < LANES; r++) {
       match1[r] = match[r].one_hot();
     }
     match1.fanout(hard<3>{});
+#ifdef TAGE_MONITOR
+    u64 t_onehot = match1[0].time();
+#endif
     for (u64 r = 0; r < LANES; r++) {
       pred1_tage[r] = (match1[r] & preds[r]) != hard<0>{};
     }
@@ -1425,6 +1450,10 @@ struct TageDirectImpl : predictor {
     }
 
     p2.fanout(hard<LANES>{});
+#ifdef TAGE_MONITOR
+    u64 t_meta = p2.time();
+    mon.record_p2_timing(t_base, t_ram_read, t_tag_cmp, t_match, t_onehot, t_meta);
+#endif
     val<1> taken = p2 >> num_branch;
     taken.fanout(hard<2>{});
     reuse_prediction(~val<1>{block_entry >> (LINEINST - 1)});
@@ -1825,7 +1854,8 @@ struct TageDirectImpl : predictor {
                             static_cast<u64>(match2[r]),
                             mon_meta_active[r], mon_altsel[r],
                             p1_pr, p2_pr);
-      mon.record_outcome(r, actual, misp);
+      bool is_end = (r == num_branch - 1);
+      mon.record_outcome(r, actual, misp, is_end);
     }
     // Tag match tracking
     for (u64 i = 0; i < NUM_TABLES; i++) {
