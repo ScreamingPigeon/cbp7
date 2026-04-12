@@ -202,7 +202,7 @@ def run_trace(binary: Path, trace: Path, warmup: int, measure: int) -> tuple:
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=600, check=True)
+                                timeout=1800, check=True)
     except subprocess.CalledProcessError as e:
         return (None, f"Run failed: {e.stderr[:200]}")
     except subprocess.TimeoutExpired:

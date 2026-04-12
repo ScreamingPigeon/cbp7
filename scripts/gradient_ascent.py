@@ -288,7 +288,7 @@ def run_monitor(binary: Path, trace: Path, warmup: int, measure: int,
     trace_name = trace.stem.replace("_trace", "")
     cmd = [str(binary), str(trace), trace_name, str(warmup), str(measure)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             f.write(result.stderr)
@@ -395,24 +395,27 @@ def evaluate_config(cfg: TDConfig, build_dir: Path, trace_paths: list[Path],
             runs.append(data)
 
     eval_time = time.monotonic() - t0
-    if not runs:
+    if len(runs) != len(trace_paths):
+        print(f"    INCOMPLETE: only {len(runs)}/{len(trace_paths)} traces completed",
+              file=sys.stderr)
         return None, build_time, eval_time
     return compute_metrics(runs), build_time, eval_time
 
 
-def evaluate_monitor(cfg: TDConfig, build_dir: Path, monitor_dir: Path,
-                     monitor_trace: Path, warmup: int, measure: int,
-                     extra_flags: str = "") -> float:
-    """Build + run monitor binary on one trace. Returns build_time."""
+def build_monitor(cfg: TDConfig, build_dir: Path, extra_flags: str = ""):
+    """Build monitor binary. Returns (binary_path, err_or_None)."""
     _, binary, bt, err = build_td_config(cfg, build_dir, extra_flags, monitor=True)
-    if err:
-        print(f"    MON BUILD FAIL {cfg.config_id}: {err[:80]}", file=sys.stderr)
-        return bt
-    out = monitor_dir / f"{cfg.config_id}.txt"
-    mon_err = run_monitor(binary, monitor_trace, warmup, measure, out)
-    if mon_err:
-        print(f"    MON RUN FAIL {cfg.config_id}: {mon_err[:60]}", file=sys.stderr)
-    return bt
+    return binary, bt, err
+
+
+def run_monitor_one(binary: Path, trace: Path, monitor_dir: Path,
+                    cfg_id: str, warmup: int, measure: int) -> str | None:
+    """Run monitor binary on one trace. Output: monitor_dir/{cfg_id}__{trace_stem}.txt"""
+    trace_stem = trace.stem.replace("_trace", "")
+    out = monitor_dir / f"{cfg_id}__{trace_stem}.txt"
+    if out.exists():
+        return None
+    return run_monitor(binary, trace, warmup, measure, out)
 
 
 def make_row(iteration, param, cfg, metrics, is_improvement, build_time, eval_time):
@@ -521,9 +524,19 @@ def gradient_ascent(args):
         total_evals += 1
         row = make_row(0, "init", current, metrics, True, bt, et)
         append_csv_row(csv_path, row, GRADIENT_FIELDS)
-        # Run monitor for starting config
-        evaluate_monitor(current, build_dir, monitor_dir, monitor_trace,
-                         args.warmup, args.measure, args.extra_flags)
+        # Run monitor for starting config across all traces in parallel
+        mon_bin, _, mon_err = build_monitor(current, build_dir, args.extra_flags)
+        if mon_err:
+            print(f"    MON BUILD FAIL {current.config_id}: {mon_err[:80]}", file=sys.stderr)
+        else:
+            with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                mfuts = [pool.submit(run_monitor_one, mon_bin, t, monitor_dir,
+                                     current.config_id, args.warmup, args.measure)
+                         for t in trace_paths]
+                for fut in as_completed(mfuts):
+                    err = fut.result()
+                    if err:
+                        print(f"    MON RUN FAIL {current.config_id}: {err[:60]}", file=sys.stderr)
         print(f"Start: MPKI={current_mpki:.3f} EPI={current_epi:.0f}",
               file=sys.stderr)
 
@@ -616,7 +629,7 @@ def gradient_ascent(args):
                                           args.warmup, args.measure)
                         cfg_futures[cid].append(fut)
 
-                # Collect results per config
+                # Collect results per config — require ALL traces to complete
                 for cid, futs_list in cfg_futures.items():
                     pname, nv, cfg, bt = meta_by_cid[cid]
                     runs = []
@@ -627,26 +640,40 @@ def gradient_ascent(args):
                             runs.append(data)
                     et = time.monotonic() - t0
                     total_evals += 1
-                    if runs:
+                    if len(runs) == len(trace_paths):
                         metrics = compute_metrics(runs)
                         cache.put(cid, metrics)
                         results.append((pname, nv, cfg, metrics, bt, et))
                     else:
-                        print(f"    EVAL FAIL {pname}={nv}", file=sys.stderr)
+                        print(f"    EVAL FAIL {pname}={nv}: only {len(runs)}/{len(trace_paths)} traces completed", file=sys.stderr)
 
-        # Phase 3: Build and run monitor for all evaluated configs
-        print(f"  Running monitors...", file=sys.stderr)
+        # Phase 3: Build monitor binaries (parallel), then run each on all traces (parallel)
+        print(f"  Building monitor binaries...", file=sys.stderr)
+        mon_binaries = {}
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            mon_futs = []
-            for pname, nv, cfg, metrics, bt, et in results:
-                mon_out = monitor_dir / f"{cfg.config_id}.txt"
-                if not mon_out.exists():
-                    mon_futs.append(pool.submit(
-                        evaluate_monitor, cfg, build_dir, monitor_dir,
-                        monitor_trace, args.warmup, args.measure,
-                        args.extra_flags))
-            for fut in as_completed(mon_futs):
-                fut.result()  # collect errors
+            bfuts = {pool.submit(build_monitor, cfg, build_dir, args.extra_flags): cfg
+                     for _, _, cfg, _, _, _ in results}
+            for fut in as_completed(bfuts):
+                cfg = bfuts[fut]
+                binary, _, err = fut.result()
+                if err:
+                    print(f"    MON BUILD FAIL {cfg.config_id}: {err[:80]}", file=sys.stderr)
+                else:
+                    mon_binaries[cfg.config_id] = (cfg, binary)
+
+        print(f"  Running monitors ({len(mon_binaries)} configs × {len(trace_paths)} traces)...",
+              file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            mfuts = []
+            for cid, (cfg, binary) in mon_binaries.items():
+                for trace in trace_paths:
+                    mfuts.append(pool.submit(
+                        run_monitor_one, binary, trace, monitor_dir,
+                        cid, args.warmup, args.measure))
+            for fut in as_completed(mfuts):
+                err = fut.result()
+                if err:
+                    print(f"    MON RUN FAIL: {err[:60]}", file=sys.stderr)
 
         # Filter by EPI budget and find best
         best_neighbor = None

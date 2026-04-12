@@ -1646,8 +1646,8 @@ struct TageDirectImpl : predictor {
     candallocmask.fanout(hard<2>{});
     val<NUM_TABLES> collamask_raw = candallocmask.reverse();
     // Apply target policy functor (may skip closest candidates)
-    u64 ap_val = [&]() -> u64 { if constexpr (ALLOC_PRESS_W > 0) return alloc_pressure; else return 0; }();
-    u64 acp_val = [&]() -> u64 { if constexpr (ACC_PRESS_W > 0) return accuracy_pressure; else return 0; }();
+    u64 ap_val = 0;  // pressure values only used by SkipByPressure/SkipByAccuracy policies
+    u64 acp_val = 0;
     val<NUM_TABLES> collamask = AllocCfg::TARGET_POLICY::template apply<NUM_TABLES>(
         collamask_raw, ap_val, acp_val);
     collamask.fanout(hard<2>{});
