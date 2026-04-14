@@ -3,6 +3,9 @@
 #include "../../cbp.hpp"
 #include "../../harcom.hpp"
 #include "custom_common.hpp"
+#ifdef TAGE_MONITOR
+#include "TAMonitor.hpp"
+#endif
 
 using namespace hcm;
 
@@ -10,7 +13,7 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 4, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 8,
+template <u64 N = 6, u64 SIZE = 2048, u64 TAG = 11, u64 MINH = 4,
           u64 MAXH = 100, u64 SIZE_RATIO = 1,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::GradedTag<TAG, TAG - 1>,
@@ -45,25 +48,42 @@ struct TATableConfig {
 // Follows gshareN_ahead_best pipeline pattern.
 // ============================================================================
 
-template <typename TableCfg = TATableConfig<>,
-          u64 N = 8,                   // max conditional branches per block
-          u64 PATHBITS = 6,            // bits of next_pc injected into history
-          u64 SEC_TAG_BITS = 3,        // secondary tag width (ahead ambiguity)
-          u64 CTR_WIDTH = 1,           // prediction counter width per lane
-          u64 HYST_WIDTH = 2,          // hysteresis width (separate from ctr)
-          u64 U_WIDTH = 1,             // usefulness counter width
-          u64 BIMODAL_CAPACITY = 8192, // bimodal fallback table size
-          u64 META_WIDTH = 4,          // meta counter width (provider vs alt)
-          u64 META_CAPACITY = 256,     // meta table entries
-          u64 META_PIPE = 2,           // meta pipeline depth
-          u64 LINEINST = 8,            // line size in instructions
-          bool SHARED_HYS = true,      // shared hyst: 2 entries share 1 counter
-          HistUpdate HIST_MODE =
-              HistUpdate::PATH // what goes into history: PATH, DIR, or BOTH
-          >
+template <
+    typename TableCfg = TATableConfig<>,
+    u64 N = 8,                   // max conditional branches per block
+    u64 PATHBITS = 6,            // bits of next_pc injected into history
+    u64 SEC_TAG_BITS = 3,        // secondary tag width (ahead ambiguity)
+    bool USE_SEC_TAG = true,     // enable secondary tag matching
+    u64 CTR_WIDTH = 1,           // prediction counter width per lane
+    u64 HYST_WIDTH = 2,          // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 1,             // usefulness counter width
+    u64 BIMODAL_CAPACITY = 8192, // bimodal fallback table size
+    u64 META_WIDTH = 4,          // meta counter width (provider vs alt)
+    u64 META_CAPACITY = 256,     // meta table entries
+    u64 META_PIPE = 2,           // meta pipeline depth
+    u64 LINEINST = 1024,         // line size in instructions
+    bool SHARED_HYS = true,      // shared hyst: 2 entries share 1 counter
+    HistUpdate HIST_MODE =
+        HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
+    // ---- Global pressure counters ----
+    u64 ACC_WIDTH = 4,   // accuracy counter width
+    u64 ALLOC_WIDTH = 4, // alloc pressure counter width
+    // ---- Probabilistic u-bit decay ----
+    bool DECAY_ENABLE = false, DecayMiss DECAY_MISS = DecayMiss::TAG_OR_SEC,
+    DecayOp DECAY_OP = DecayOp::DECREMENT,
+    auto DECAY_LFSR_WIDTHS = ta::uniform_array<u64, TableCfg::NUM_TABLES>(8),
+    typename DecayThreshFn = ta::DefaultDecayThresh,
+    // ---- Epoch-based u-bit reset ----
+    bool EPOCH_ENABLE = true, typename EpochTriggerFn = ta::DefaultEpochTrigger,
+    bool EPOCH_RESET_ACC = false, // reset acc_ctr on epoch fire
+    bool EPOCH_RESET_ALLOC = true // reset alloc_ctr on epoch fire
+    >
 struct TageAhead : predictor {
 
   // ======== Derived Constants ========
+
+  static_assert(!(DECAY_ENABLE && EPOCH_ENABLE),
+                "DECAY_ENABLE and EPOCH_ENABLE are mutually exclusive");
 
   static constexpr u64 NT = TableCfg::NUM_TABLES;
   static constexpr u64 LOGLINEINST = ta::clog2(LINEINST);
@@ -71,6 +91,12 @@ struct TageAhead : predictor {
   static constexpr u64 MAX_TAG_WIDTH = ta::array_max(TableCfg::TAG_WIDTH);
   static constexpr u64 MAX_TABLE_SIZE = ta::array_max(TableCfg::TABLE_SIZE);
   static constexpr u64 MAX_IDX_BITS = ta::clog2(MAX_TABLE_SIZE);
+
+  static constexpr u64 MATCH_BITS = NT + 1; // NT tables + bimodal
+
+  // Per-bit gh fanout: only fanout bits each table actually reads
+  static constexpr auto GH_FANOUT =
+      ta::gh_per_bit_fanout<MAXHIST, NT, TableCfg::HIST_LEN>();
 
   // Prediction bits per entry: one CTR_WIDTH counter per branch
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -84,7 +110,7 @@ struct TageAhead : predictor {
                                            std::make_index_sequence<NT>>::type;
   Tables tables;
   hcm::ram<val<N>, BIMODAL_CAPACITY> bim_ctr{"bim"};
-  hcm::ram<val<META_WIDTH>, META_CAPACITY> meta_ctr{"meta"};
+  ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
 
   // ======================================================================
   // Registers
@@ -95,6 +121,14 @@ struct TageAhead : predictor {
   // ---- Bimodal Fallback (ahead-pipelined) ----
   reg<PRED_BITS> prefetch_bim;
   reg<PRED_BITS> current_bim;
+  static constexpr u64 BIM_IDX_BITS = ta::clog2(BIMODAL_CAPACITY);
+  reg<BIM_IDX_BITS> prefetch_bim_idx;
+  reg<BIM_IDX_BITS> current_bim_idx;
+
+  // Piped PC for allocation tag recomputation (stores inst_pc >> 2)
+  static constexpr u64 ALLOC_PC_BITS = MAX_TAG_WIDTH + 2;
+  reg<ALLOC_PC_BITS> prefetch_pc;
+  reg<ALLOC_PC_BITS> current_pc;
 
   // ---- Block Tracking ----
   reg<1> true_block = 1;
@@ -125,6 +159,7 @@ struct TageAhead : predictor {
   reg<MAX_IDX_BITS> prefetch_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> prefetch_hyst[NT];
   reg<U_WIDTH> prefetch_u[NT];
+  reg<MAX_TAG_WIDTH> prefetch_ctag[NT]; // computed tag for allocation piping
 
   // current_*: shifted from prefetch, used for prediction
   reg<MAX_TAG_WIDTH> current_tag[NT];
@@ -134,13 +169,50 @@ struct TageAhead : predictor {
   reg<MAX_IDX_BITS> current_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> current_hyst[NT];
   reg<U_WIDTH> current_u[NT];
+  reg<MAX_TAG_WIDTH> current_ctag[NT]; // piped computed tag for allocation
+
+  // train_*: saved from current_* before pipeline shift, used for training
+  // (training is for block A, resolution is for block B)
+  reg<MAX_IDX_BITS> train_idx[NT];
+  reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT];
+  reg<U_WIDTH> train_u[NT];
+  reg<PRED_BITS> train_bim;
+  reg<BIM_IDX_BITS> train_bim_idx;
+  reg<ALLOC_PC_BITS> train_pc;
+  reg<MAX_TAG_WIDTH> train_ctag[NT]; // piped computed tag for allocation
+
+  // Piped resolution values from previous update_cycle (block A's resolution)
+  reg<MATCH_BITS> train_match1;
+  reg<PRED_BITS> train_provider_pred;
+  reg<1> train_provider_weak;
+  reg<1> train_altdiff;
+
+  // Guard: skip training until piped resolution regs have been populated
+  reg<1> train_valid = 0;
+
+  // ---- U-bit decay (probabilistic) ----
+  // Piped tag/sec hit for decay miss detection
+  reg<1> train_tag_hit[NT];
+  reg<1> train_sec_hit[NT];
+
+  // Global pressure counters (always declared, zero-cost when unused)
+  reg<ACC_WIDTH> acc_ctr;
+  reg<ALLOC_WIDTH> alloc_ctr;
+
+  // Per-table LFSRs (varying widths via tuple)
+  static constexpr u64 MAX_LFSR_WIDTH =
+      DECAY_ENABLE ? ta::array_max(DECAY_LFSR_WIDTHS) : 1;
+  typename ta::TALfsrTuple<DECAY_LFSR_WIDTHS,
+                           std::make_index_sequence<NT>>::type decay_lfsrs;
 
   // ---- Prediction reg (shared by
   // predict1/reuse_predict1/predict2/reuse_predict2) ----
   arr<reg<1>, N> pred;
 
   // ---- Meta pipeline (shifted each update_cycle) ----
+  static constexpr u64 META_IDX_BITS = ta::clog2(META_CAPACITY);
   reg<META_WIDTH, i64> meta_pipe[META_PIPE];
+  reg<META_IDX_BITS> meta_idx_pipe[META_PIPE];
 
 // ---- Timing debug taps (zero cost in normal builds) ----
 #ifdef TIMING_DEBUG
@@ -168,6 +240,11 @@ struct TageAhead : predictor {
   reg<1> dbg_fold_apply;    // after apply_update (fold write)
 #endif
 
+#ifdef TAGE_MONITOR
+  TAMonitor<NT, N, MAX_TABLE_SIZE> mon;
+  ~TageAhead() { mon.print_summary(); }
+#endif
+
   // ======================================================================
   // Helpers
   // ======================================================================
@@ -179,6 +256,9 @@ struct TageAhead : predictor {
   // ======================================================================
 
   val<1> predict1([[maybe_unused]] val<64> inst_pc) {
+#ifdef TAGE_MONITOR
+    mon.record_predict1();
+#endif
     inst_pc.fanout(
         hard<2 * NT + 1>{}); // 2 reads per table (>>2, >>4) + bimodal (>>2)
 
@@ -206,40 +286,55 @@ struct TageAhead : predictor {
         prefetch_tag[I] = stored_tag;
         prefetch_tag_hit[I] =
             val<MAX_TAG_WIDTH>{stored_tag} == val<MAX_TAG_WIDTH>{computed_tag};
+        prefetch_ctag[I] = computed_tag;
         prefetch_pred[I] = t.pred_ram.read(idx);
-        prefetch_sec[I] = t.sec_ram.read(idx);
+        if constexpr (USE_SEC_TAG)
+          prefetch_sec[I] = t.sec_ram.read(idx);
         prefetch_idx[I] = idx;
         prefetch_hyst[I] = t.hyst_ram.read(val<t.HYST_IDX_BITS>{idx});
         prefetch_u[I] = t.u_ram.read(idx);
       });
 
       // Bimodal ahead read (direct-mapped, no tag match needed)
-      auto bim_idx = val<ta::clog2(BIMODAL_CAPACITY)>{inst_pc >> 2};
+      auto bim_idx = val<BIM_IDX_BITS>{inst_pc >> 2};
+      prefetch_bim_idx = bim_idx;
       prefetch_bim = bim_ctr.read(bim_idx);
+      prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
     });
 
     // Crit path: just read precomputed prediction from reg
     block_entry.fanout(hard<2 * LINEINST>{}); // read in line_end() across
                                               // predict + reuse + update_condbr
-    pred.fanout(
-        hard<2 * LINEINST + 1>{}); // predict1/2, reuse + 1 training old_pred read
+    pred.fanout(hard<2 * LINEINST + 1>{});    // predict1/2, reuse + 1 training
+                                              // old_pred read
     block_size = 1;
     num_branch = 0;
-    reuse_prediction((block_entry + block_size) == hard<LINEINST>{});
+    reuse_prediction(~line_end());
 #ifdef TIMING_DEBUG
     dbg_p1_return = val<1>{pred[num_branch]};
 #endif
     return pred[num_branch];
   }
   val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) {
+#ifdef TAGE_MONITOR
+    mon.record_reuse_predict1();
+#endif
     block_size++;
-    reuse_prediction((block_entry + block_size) == hard<LINEINST>{});
+    reuse_prediction(~line_end());
     return pred[num_branch];
   }
 
-  val<1> predict2([[maybe_unused]] val<64> inst_pc) { return pred[num_branch]; }
+  val<1> predict2([[maybe_unused]] val<64> inst_pc) {
+#ifdef TAGE_MONITOR
+    mon.record_predict2();
+#endif
+    return pred[num_branch];
+  }
 
   val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) {
+#ifdef TAGE_MONITOR
+    mon.record_reuse_predict2();
+#endif
     return pred[num_branch];
   }
 
@@ -252,23 +347,51 @@ struct TageAhead : predictor {
   }
 
   void update_cycle([[maybe_unused]] instruction_info &block_end_info) {
+    // std::cerr << "=== ENTER update_cycle (num_branch=" << num_branch << ")
+    // ===\n";
     // ---- Prefetch part ------
     // 1. Pipeline shift: prefetch → current (unconditional — only true blocks
     // reach here)
+
+    // Save current_* into train_* before shift (block A's data for training)
+    static_loop<NT>([&]<u64 I>() {
+      train_idx[I] = current_idx[I];
+      train_hyst[I] = current_hyst[I];
+      train_u[I] = current_u[I];
+      train_ctag[I] = current_ctag[I];
+      train_tag_hit[I] = current_tag_hit[I];
+      if constexpr (USE_SEC_TAG)
+        train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I]} ==
+                            val<SEC_TAG_BITS>{curr_sec_tag});
+    });
+    train_bim = current_bim;
+    train_bim_idx = current_bim_idx;
+    train_pc = current_pc;
+
     static_loop<NT>([&]<u64 I>() {
       current_tag[I] = prefetch_tag[I];
       current_tag_hit[I] = prefetch_tag_hit[I];
       current_pred[I] = prefetch_pred[I];
-      current_sec[I] = prefetch_sec[I];
+      if constexpr (USE_SEC_TAG)
+        current_sec[I] = prefetch_sec[I];
       current_idx[I] = prefetch_idx[I];
       current_hyst[I] = prefetch_hyst[I];
       current_u[I] = prefetch_u[I];
+      current_ctag[I] = prefetch_ctag[I];
     });
     current_bim = prefetch_bim;
+    current_bim_idx = prefetch_bim_idx;
+    current_pc = prefetch_pc;
 
     // Precompute secondary tag for next block
-    block_end_info.next_pc.fanout(hard<3>{}); // curr_sec_tag + meta_idx + hist path_bits
-    curr_sec_tag = val<SEC_TAG_BITS>{block_end_info.next_pc >> 2};
+    if constexpr (USE_SEC_TAG) {
+      block_end_info.next_pc.fanout(
+          hard<3>{}); // curr_sec_tag + meta_idx + hist path_bits
+      curr_sec_tag = val<SEC_TAG_BITS>{block_end_info.next_pc >> 2};
+    } else {
+      block_end_info.next_pc.fanout(
+          hard<2>{}); // meta_idx + hist path_bits
+    }
 
     // ================================================================
     // Provider / altpred resolution via bitmask + one_hot
@@ -284,12 +407,31 @@ struct TageAhead : predictor {
     // ================================================================
 
     // 2. Per-table hit: primary tag matched (off crit path) AND
-    //    stored secondary tag matches curr_sec_tag (same successor path)
-    curr_sec_tag.fanout(hard<NT>{}); // compared once per table
+    //    optionally stored secondary tag matches curr_sec_tag
+    if constexpr (USE_SEC_TAG)
+      curr_sec_tag.fanout(hard<NT>{}); // compared once per table
     arr<val<1>, NT> full_hits = [&](u64 i) {
-      return val<1>{current_tag_hit[i]} & (val<SEC_TAG_BITS>{current_sec[i]} ==
-                                           val<SEC_TAG_BITS>{curr_sec_tag});
+      if constexpr (USE_SEC_TAG) {
+        return val<1>{current_tag_hit[i]} &
+               (val<SEC_TAG_BITS>{current_sec[i]} ==
+                val<SEC_TAG_BITS>{curr_sec_tag});
+      } else {
+        return val<1>{current_tag_hit[i]};
+      }
     };
+
+#ifdef TAGE_MONITOR
+    for (u64 i = 0; i < NT; i++) {
+      if constexpr (USE_SEC_TAG) {
+        mon.record_tag_lookup(
+            i, static_cast<u64>(current_tag_hit[i]),
+            static_cast<u64>(val<SEC_TAG_BITS>{current_sec[i]} ==
+                             val<SEC_TAG_BITS>{curr_sec_tag}));
+      } else {
+        mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
+      }
+    }
+#endif
 
 #ifdef TIMING_DEBUG
     dbg_full_hits = full_hits[0];
@@ -309,11 +451,11 @@ struct TageAhead : predictor {
     //      bit NT    = bimodal (always 1 — fallback)
     //    one_hot() returns lowest set bit → longest-history hit = provider.
     //    Second one_hot() on (match ^ match1) → alt provider.
-    val<NT + 1> match = concat(val<1>{1}, full_hits.concat());
+    val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
     match.fanout(hard<2>{}); // one_hot + XOR
-    val<NT + 1> match1 = match.one_hot();
-    match1.fanout(hard<2>{}); // make_array + XOR with match
-    val<NT + 1> match2 = (match ^ match1).one_hot();
+    val<MATCH_BITS> match1 = match.one_hot();
+    match1.fanout(hard<3>{}); // make_array + XOR with match + alloc_base
+    val<MATCH_BITS> match2 = (match ^ match1).one_hot();
     match2.fanout(hard<2>{}); // make_array + has_alt mask
 
 #ifdef TIMING_DEBUG
@@ -336,7 +478,7 @@ struct TageAhead : predictor {
     //    one table contributes non-zero bits. fold_or collapses to that pred.
     arr<val<1>, NT + 1> m1_bits = match1.make_array(val<1>{});
     arr<val<1>, NT + 1> m2_bits = match2.make_array(val<1>{});
-    m1_bits.fanout(hard<2>{});
+    m1_bits.fanout(hard<6>{});
     m2_bits.fanout(hard<2>{});
 
     arr<val<PRED_BITS>, NT + 1> provider_masked = [&](u64 i) {
@@ -368,7 +510,8 @@ struct TageAhead : predictor {
 
     // 8. has_alt: does the alt match point to a TAGE table (not bimodal)?
     //    Mask out the bimodal bit (MSB) and check if anything remains.
-    val<1> has_alt = (match2 & val<NT + 1>{(u64(1) << NT) - 1}) != hard<0>{};
+    val<1> has_alt =
+        (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
 
 #ifdef TIMING_DEBUG
     dbg_provider_weak = provider_weak;
@@ -378,10 +521,13 @@ struct TageAhead : predictor {
     // 9. Meta counter: predicts whether to trust a newly-allocated provider
     //    or fall back to alt. Read from PC-indexed RAM, shifted through a
     //    META_PIPE-stage pipeline. Sign bit of oldest stage decides.
-    auto meta_idx = val<ta::clog2(META_CAPACITY)>{block_end_info.next_pc >> 2};
+    auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
     meta_pipe[0] = meta_ctr.read(meta_idx);
-    for (u64 i = META_PIPE - 1; i > 0; i--)
+    meta_idx_pipe[0] = meta_idx;
+    for (u64 i = META_PIPE - 1; i > 0; i--) {
       meta_pipe[i] = meta_pipe[i - 1];
+      meta_idx_pipe[i] = meta_idx_pipe[i - 1];
+    }
     val<1> meta_use_alt =
         val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
 
@@ -403,29 +549,62 @@ struct TageAhead : predictor {
 #endif
 
     // 11. Save old prediction (block B) before scatter overwrites with B+1.
-    branch_dir.fanout(hard<3>{}); // badpred + true_block + hist_input(BOTH)
-    arr<val<1>, N> old_pred = [&](u64 i) -> val<1> {
-      return val<1>{pred[i]};
-    };
+    branch_dir.fanout(
+        hard<4>{}); // badpred + true_block + hist_input + actual_dir
+    arr<val<1>, N> old_pred = [&](u64 i) -> val<1> { return val<1>{pred[i]}; };
 
     // 12. Scatter PRED_BITS into per-branch prediction regs.
     //     pred[0] = LSB = branch 0's prediction, pred[I] = bit I.
     static_loop<N>([&]<u64 I>() { pred[I] = final_pred >> I; });
 
+#ifdef TAGE_MONITOR
+    // Record resolution for each branch in this block
+    for (u64 r = 0; r < num_branch; r++) {
+      bool meta_overrode =
+          static_cast<u64>(provider_weak) && static_cast<u64>(has_alt);
+      bool meta_chose = static_cast<u64>(use_alt);
+      bool pred_taken = (static_cast<u64>(final_pred) >> r) & 1;
+      mon.record_prediction(r, static_cast<u64>(match1),
+                            static_cast<u64>(match2), meta_overrode, meta_chose,
+                            pred_taken);
+    }
+#endif
+
     // ================================================================
-    // Training (for block B, using old_pred[] and branch_dir[])
+    // Training (for block A, using old_pred[], branch_dir[],
+    // and piped resolution from previous cycle's train_* regs)
     //
-    // old_pred[i] = what we predicted for branch i of block B
+    // old_pred[i] = what we predicted for branch i of block A
     // branch_dir[i] = actual direction of branch i (from update_condbr)
+    // t_m1/t_pp/t_pw/t_ad = block A's resolution (piped from prev cycle)
+    // train_idx/hyst/u/bim = block A's prefetched data
     // ================================================================
 
+    // Read OLD piped resolution values BEFORE overwriting with current
+    // resolution
+    val<MATCH_BITS> t_match1 = train_match1;
+    arr<val<1>, NT + 1> t_m1 = t_match1.make_array(val<1>{});
+    val<PRED_BITS> t_pp = train_provider_pred;
+    val<1> t_pw = train_provider_weak;
+    val<1> t_ad = train_altdiff;
+
+    // Save current resolution → train regs (for NEXT cycle's training)
+    alt_pred.fanout(hard<2>{});
+    val<1> altdiff = (provider_pred ^ alt_pred) != hard<0>{};
+    train_match1 = match1;
+    train_provider_pred = provider_pred;
+    train_provider_weak = provider_weak;
+    train_altdiff = altdiff;
+
+    // Read train_valid BEFORE setting it to 1 (regs may be immediate-write)
+    val<1> do_train = train_valid;
+    train_valid = 1;
+
     // ---- No conditional branches: update history, skip training ----
-    // (matches gshareN_ahead_best pattern: history always advances,
-    //  true_block=1 since there's nothing to mispredict)
     if (num_branch == 0) {
       val<PATHBITS> path_bits = val<PATHBITS>{block_end_info.next_pc >> 2};
       path_bits.fanout(hard<NT * 2 + 1>{});
-      gh.fanout(hard<NT * 2 + 1>{});
+      gh.template fanout_per_bit<GH_FANOUT>();
       static_loop<NT>([&]<u64 I>() {
         auto &t = std::get<I>(tables);
         t.fold_idx.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
@@ -438,20 +617,248 @@ struct TageAhead : predictor {
     }
 
     // ---- Step 1: Correctness ----
-    // badpred[i] = 1 when prediction for branch i was wrong
-    // (used by counter/alloc updates in later steps)
     val<1> &mispredict = block_end_info.is_mispredict;
+    mispredict.fanout(
+        hard<5>{}); // extra_cycle + bim + true_block + dbg + alloc
     need_extra_cycle(mispredict);
+    do_train.fanout(hard<4 * NT + 3>{}); // gates bim, meta, 4 writes per table
+
+#ifdef TAGE_MONITOR
+    mon.record_block(block_size, num_branch, static_cast<u64>(mispredict));
+    for (u64 r = 0; r < num_branch; r++)
+      mon.record_outcome(r, static_cast<u64>(branch_dir[r]),
+                         r == num_branch - 1 && static_cast<u64>(mispredict));
+    if (!static_cast<u64>(do_train))
+      mon.record_train_skip();
+#endif
     [[maybe_unused]] arr<val<1>, N> badpred = [&](u64 i) -> val<1> {
       return old_pred[i] ^ val<1>{branch_dir[i]};
     };
 
+    // ---- Compute training signals ----
+    val<PRED_BITS> actual_dir = arr<val<1>, N>{[&](u64 i) -> val<1> {
+                                  return val<1>{branch_dir[i]};
+                                }}.concat();
+
+    // Provider wrong on any branch? (uses piped provider_pred)
+    t_pp.fanout(hard<2>{});
+    actual_dir.fanout(hard<NT + 1>{});
+    val<1> any_provider_wrong = (t_pp ^ actual_dir) != hard<0>{};
+    any_provider_wrong.fanout(hard<3 * NT + 1>{});
+    t_pw.fanout(hard<NT + 1>{});
+    t_m1.fanout(hard<6>{});
+    t_ad.fanout(hard<NT + 1>{});
+
+    // ---- Allocation masks (needed before merged loop) ----
+    val<NT> alloc_base = val<NT>{t_match1 - 1};
+    arr<val<1>, NT> u_zero = [&](u64 i) -> val<1> {
+      return val<U_WIDTH>{train_u[i]} == hard<0>{};
+    };
+    val<NT> notumask = u_zero.concat();
+    notumask.fanout(hard<2>{});
+    val<NT> misp_alloc = alloc_base & mispredict.replicate(hard<NT>{}).concat();
+    misp_alloc.fanout(hard<2>{});
+    val<NT> candallocmask = misp_alloc & notumask;
+    candallocmask.fanout(hard<2>{});
+    val<NT> alloc_target = candallocmask.reverse().one_hot().reverse();
+    arr<val<1>, NT> allocate = alloc_target.make_array(val<1>{});
+    allocate.fanout(hard<6>{});
+    val<1> noalloc = (candallocmask == hard<0>{});
+    val<NT> uclearmask = misp_alloc & noalloc.replicate(hard<NT>{}).concat();
+    arr<val<1>, NT> uclear = uclearmask.make_array(val<1>{});
+    uclear.fanout(hard<2>{});
+
+#ifdef TAGE_MONITOR
+    mon.record_allocation(static_cast<u64>(alloc_target) != 0,
+                          static_cast<u64>(alloc_target));
+#endif
+
+    // ---- Step 4: Bimodal update (mispredict + bimodal is provider only) ----
+    val<1> bim_changed = actual_dir != val<PRED_BITS>{train_bim};
+    execute_if(do_train & t_m1[NT] & mispredict & bim_changed, [&]() {
+      bim_ctr.write(val<BIM_IDX_BITS>{train_bim_idx}, actual_dir);
+    });
+
+    // ---- Step 5: Meta counter update ----
+    auto old_meta = val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]};
+    auto new_meta = ta_update_ctr(old_meta, any_provider_wrong);
+    execute_if(do_train & t_pw & t_ad & (new_meta != old_meta), [&]() {
+      meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1]}, new_meta,
+                     hard<0>{});
+    });
+
+    // ---- Merged per-table writes (one write per RAM per table) ----
+    // For each table: alloc takes priority over update. Mux selects data.
+    train_pc.fanout(hard<NT>{});
+    static_loop<NT>([&]<u64 I>() {
+      auto &t = std::get<I>(tables);
+      val<1> do_alloc = allocate[I];
+
+      // pred_ram: alloc writes actual_dir, update writes actual_dir → same data
+      val<1> do_pred_update = t_m1[I] & t_pw & any_provider_wrong;
+      execute_if(do_train & (do_alloc | do_pred_update), [&]() {
+        t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, actual_dir, hard<0>{});
+      });
+
+      // hyst_ram: alloc writes 0, update writes new_hyst → mux on do_alloc
+      constexpr u64 HW = std::max(u64(1), HYST_WIDTH);
+      auto old_hyst = val<HW>{train_hyst[I]};
+      auto new_hyst = ta_update_ctr(old_hyst, ~any_provider_wrong);
+      auto hyst_data = select(do_alloc, val<HW>{0}, new_hyst);
+      val<1> do_hyst_update = t_m1[I] & (new_hyst != old_hyst);
+      execute_if(do_train & (do_alloc | do_hyst_update), [&]() {
+        t.hyst_ram.write(val<t.HYST_IDX_BITS>{train_idx[I]}, hyst_data,
+                         hard<0>{});
+      });
+
+      // tag_ram + sec_ram: alloc only (plain RAM, protected by extra_cycle)
+      execute_if(do_train & do_alloc, [&]() {
+        // Use piped computed tag (from predict1 time, not current folds)
+        t.tag_ram.write(val<t.IDX_BITS>{train_idx[I]},
+                        val<t.tag_width>{train_ctag[I]});
+        if constexpr (USE_SEC_TAG)
+          t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
+                          val<SEC_TAG_BITS>{curr_sec_tag});
+      });
+
+      // u_ram: combined provider update + allocation + uclear + decay
+      val<U_WIDTH> base_newu = val<U_WIDTH>{~any_provider_wrong} &
+                               val<U_WIDTH>{~allocate[I]} &
+                               val<U_WIDTH>{~uclear[I]};
+      val<1> base_u_write = (t_m1[I] & t_ad) | allocate[I] | uclear[I];
+
+      // Probabilistic decay: on tag/sec miss, LFSR < threshold → decay u
+      auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
+        if constexpr (!DECAY_ENABLE) {
+          return {base_newu, base_u_write};
+        } else {
+          constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
+          auto &lfsr = std::get<I>(decay_lfsrs);
+
+          // Miss condition from piped tag/sec hit
+          val<1> tag_missed = ~val<1>{train_tag_hit[I]};
+          val<1> decay_miss = [&]() {
+            if constexpr (!USE_SEC_TAG || DECAY_MISS == DecayMiss::TAG)
+              return tag_missed;
+            else {
+              val<1> sec_missed = ~val<1>{train_sec_hit[I]};
+              if constexpr (DECAY_MISS == DecayMiss::SEC)
+                return sec_missed;
+              else if constexpr (DECAY_MISS == DecayMiss::TAG_OR_SEC)
+                return tag_missed | sec_missed;
+            else
+              return tag_missed & sec_missed;
+          }();
+
+          // Threshold from global counters
+          auto thresh = DecayThreshFn::template compute<I, LW>(
+              val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
+
+          // LFSR fires when below threshold, on miss, not allocating
+          val<1> decay_fire =
+              decay_miss & ~allocate[I] & (val<LW>{lfsr} < thresh);
+
+          // Apply decay op to train_u
+          val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
+          val<U_WIDTH> decayed_u = [&]() {
+            if constexpr (DECAY_OP == DecayOp::DECREMENT)
+              return select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
+            else if constexpr (DECAY_OP == DecayOp::HALVE)
+              return val<U_WIDTH>{old_u >> 1};
+            else // CLEAR
+              return val<U_WIDTH>{0};
+          }();
+
+          // Mux: if base write active, use base_newu; else if decay, use
+          // decayed_u
+          val<U_WIDTH> merged = select(base_u_write, base_newu,
+                                       select(decay_fire, decayed_u, old_u));
+          val<1> merged_write = base_u_write | decay_fire;
+          val<1> merged_changed = merged != old_u;
+          return {merged, merged_write & merged_changed};
+        }
+      }();
+
+      execute_if(do_train & u_write, [&]() {
+        t.u_ram.write(val<t.IDX_BITS>{train_idx[I]}, newu, hard<0>{});
+      });
+
+#ifdef TAGE_MONITOR
+      if (static_cast<u64>(do_train & u_write))
+        mon.record_u_write(I, static_cast<u64>(newu) != 0);
+      if constexpr (DECAY_ENABLE) {
+        // decay_fire = u_write & ~base_u_write (only non-base u write is decay)
+        if (static_cast<u64>(do_train & u_write & ~base_u_write))
+          mon.record_decay_fire();
+      }
+#endif
+    });
+
+    // ---- Global pressure counter updates ----
+    if constexpr (DECAY_ENABLE || EPOCH_ENABLE) {
+      // Accuracy counter: increment on correct, decrement on mispredict
+      auto new_acc = ta_update_ctr(val<ACC_WIDTH>{acc_ctr}, ~mispredict);
+
+      // Alloc pressure counter: increment when no alloc slot found
+      val<1> any_alloc = alloc_target != hard<0>{};
+      auto new_alloc = ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
+
+      if constexpr (EPOCH_ENABLE) {
+        // Epoch: bulk reset u_ram when trigger fires
+        val<1> epoch_fire =
+            EpochTriggerFn::template should_fire<ACC_WIDTH, ALLOC_WIDTH>(
+                val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
+        execute_if(epoch_fire, [&]() {
+          static_loop<NT>([&]<u64 I>() { std::get<I>(tables).u_ram.reset(); });
+        });
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(epoch_fire))
+          mon.record_epoch_reset();
+#endif
+        // Optionally reset counters on epoch fire
+        if constexpr (EPOCH_RESET_ACC)
+          acc_ctr = select(epoch_fire, val<ACC_WIDTH>{0}, new_acc);
+        else
+          acc_ctr = new_acc;
+        if constexpr (EPOCH_RESET_ALLOC)
+          alloc_ctr = select(epoch_fire, val<ALLOC_WIDTH>{0}, new_alloc);
+        else
+          alloc_ctr = new_alloc;
+      } else {
+        acc_ctr = new_acc;
+        alloc_ctr = new_alloc;
+      }
+    }
+
+#ifdef TAGE_MONITOR
+    if constexpr (DECAY_ENABLE || EPOCH_ENABLE)
+      mon.record_pressure(static_cast<u64>(acc_ctr),
+                          static_cast<u64>(alloc_ctr));
+#endif
+
+    // ---- Decay: LFSR tick ----
+    if constexpr (DECAY_ENABLE) {
+      static_loop<NT>([&]<u64 I>() {
+        constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
+        auto &lfsr = std::get<I>(decay_lfsrs);
+        val<LW> old_lfsr = val<LW>{lfsr};
+        val<1> feedback = old_lfsr & hard<1>{};
+        val<LW> shifted = val<LW>{old_lfsr >> 1};
+        val<LW> tap_mask = val<LW>{u64(1) << (LW - 1)};
+        lfsr = shifted ^ (tap_mask & feedback.replicate(hard<LW>{}).concat());
+      });
+    }
+
     // ---- Step 8: History update ----
     // true_block uses framework's mispredict signal (not our computed
     // correct_pred) to avoid timing bleed from old_pred reg reads
-    true_block =
-        ~mispredict | val<1>{branch_dir[num_branch - 1]} | line_end();
+    true_block = ~mispredict | val<1>{branch_dir[num_branch - 1]} | line_end();
     true_block.fanout(hard<NT * 2 + 3>{});
+
+#ifdef TAGE_MONITOR
+    if (static_cast<u64>(true_block))
+      mon.record_true_block();
+#endif
 
 #ifdef TIMING_DEBUG
     dbg_mispredict = mispredict;
@@ -472,7 +879,7 @@ struct TageAhead : predictor {
     }();
 
     hist_input.fanout(hard<NT * 2 + 1>{});
-    gh.fanout(hard<NT * 2 + 1>{});
+    gh.template fanout_per_bit<GH_FANOUT>();
 
 #ifdef TIMING_DEBUG
     dbg_hist_input = val<1>{hist_input};
@@ -502,5 +909,6 @@ struct TageAhead : predictor {
 #endif
     });
     gh.update(hist_input, true_block);
+    // std::cerr << "=== EXIT update_cycle ===\n";
   }
 };

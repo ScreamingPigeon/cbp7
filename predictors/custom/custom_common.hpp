@@ -52,6 +52,15 @@ struct ta_global_history {
 
     val<1>& operator[] (u64 i) { return h[i]; }
     void fanout(hardval auto fo) { h.fanout(fo); }
+
+    // Per-bit fanout: set each bit's fanout from a constexpr array
+    template <auto const &FO_ARRAY>
+    void fanout_per_bit() {
+      static_assert(FO_ARRAY.size() == N);
+      static_loop<N>([&]<u64 I>() {
+        h[I].fanout(hard<FO_ARRAY[I]>{});
+      });
+    }
 };
 
 // ============================================================================
@@ -120,6 +129,8 @@ struct ta_folded_gh {
 // ============================================================================
 
 enum class HistUpdate { PATH, DIR, BOTH };
+enum class DecayMiss { TAG, SEC, TAG_OR_SEC, TAG_AND_SEC };
+enum class DecayOp { DECREMENT, HALVE, CLEAR };
 
 // ============================================================================
 // geometric_folds_ex — geometric_folds with templated update mode
@@ -237,6 +248,22 @@ constexpr T array_min(const std::array<T, N> &a) {
   T m = a[0];
   for (std::size_t i = 1; i < N; i++) m = (a[i] < m) ? a[i] : m;
   return m;
+}
+
+// Compute per-bit gh fanout: for each bit position 0..MAXHIST-1,
+// count how many tables need gh[HIST_LEN[I]-1] at that position.
+// Each table reads the outgoing bit twice (fold_idx + fold_tag).
+// Add 1 for the gh.update() shift read.
+template <std::size_t MAXHIST, std::size_t NT, auto const &HIST_LEN>
+constexpr std::array<u64, MAXHIST> gh_per_bit_fanout() {
+  std::array<u64, MAXHIST> fo{};
+  // Base: each bit is read by update() for shift (h[i-1]) and mux hold (h[i])
+  for (std::size_t i = 0; i < MAXHIST; i++) fo[i] = 3;
+  for (std::size_t t = 0; t < NT; t++) {
+    u64 bit = HIST_LEN[t] - 1;
+    fo[bit] += 2; // fold_idx + fold_tag read the outgoing bit
+  }
+  return fo;
 }
 
 constexpr double constexpr_pow(double base, double exp) {
@@ -427,6 +454,39 @@ constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
   return s;
 }
 
+// ============================================================================
+// Decay helpers
+// ============================================================================
+
+// Generate a tuple of reg<W> with per-element widths from a constexpr array.
+// Usage: TALfsrTuple<LFSR_WIDTHS, std::make_index_sequence<NT>>::type
+template <auto const &Widths, typename Seq>
+struct TALfsrTuple;
+
+template <auto const &Widths, u64... Is>
+struct TALfsrTuple<Widths, std::index_sequence<Is...>> {
+  using type = std::tuple<reg<std::max(u64(1), Widths[Is])>...>;
+};
+
+// Default threshold functor: threshold = alloc_ctr (ignore accuracy).
+// Users can define custom functors with the same interface.
+struct DefaultDecayThresh {
+  // Returns a val<LW> threshold from the global counters.
+  // I = table index (allows per-table differentiation).
+  template <u64 I, u64 LW, u64 AW, u64 PW>
+  static auto compute(val<AW> /*accuracy_ctr*/, val<PW> alloc_ctr) {
+    return val<LW>{alloc_ctr};
+  }
+};
+
+// Default epoch trigger: fire when alloc_ctr saturates.
+struct DefaultEpochTrigger {
+  template <u64 AW, u64 PW>
+  static val<1> should_fire(val<AW> /*acc_ctr*/, val<PW> alloc_ctr) {
+    return alloc_ctr == hard<alloc_ctr.maxval>{};
+  }
+};
+
 } // namespace ta
 
 // ============================================================================
@@ -575,10 +635,10 @@ struct TATable {
 
   // ---- RAMs ----
   hcm::ram<val<TAG_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
-  hcm::ram<val<PRED_BITS>, TABLE_SIZE>    pred_ram{"ta_pred"};
+  ta_rwram<PRED_BITS, TABLE_SIZE, 2>      pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
-  hcm::ram<val<std::max(u64(1), HYST_WIDTH)>, HYST_SIZE> hyst_ram{"ta_hyst"};
-  hcm::ram<val<U_WIDTH>, TABLE_SIZE>      u_ram{"ta_u"};
+  ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
+  ta_rwram<U_WIDTH, TABLE_SIZE, 2>        u_ram{"ta_u"};
 
   // ---- Per-table folded histories (fold into exact widths) ----
   ta_folded_gh<IDX_BITS> fold_idx;
