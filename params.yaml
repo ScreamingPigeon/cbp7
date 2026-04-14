@@ -1,7 +1,7 @@
 # Predictor compile-time config used by `make cbp`.
 # Generates PREDICTOR_TYPE via: predictor<template_args[0], template_args[1], ...>
 # Or override directly with predictor_type (bypasses predictor + template_args).
-predictor: Tage
+predictor: TageAhead
 
 # Tage template args (positional — order matters):
 #

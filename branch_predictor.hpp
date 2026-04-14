@@ -3,6 +3,7 @@
 #include "predictors/bimodalN.hpp"
 #include "predictors/custom/Tage.hpp"
 #include "predictors/custom/TageDirect.hpp"
+#include "predictors/custom/TageAhead.hpp"
 #include "predictors/custom/TageDirectBim.hpp"
 #include "predictors/experiment_perceptron.hpp"
 #include "predictors/gshare.hpp"
