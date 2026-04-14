@@ -2,9 +2,118 @@
 #define CUSTOM_COMMON_H
 
 #include "../../harcom.hpp"
-#include "../common.hpp"
 
 using namespace hcm;
+
+// ============================================================================
+// update_ctr — saturating up-down counter
+// ============================================================================
+
+template<u64 N, typename T>
+[[nodiscard]] val<N,T> ta_update_ctr(val<N,T> ctr, val<1> incr)
+{
+    ctr.fanout(hard<6>{});
+    val<N,T> incsat = select(ctr==hard<ctr.maxval>{},ctr,val<N,T>{ctr+1});
+    val<N,T> decsat = select(ctr==hard<ctr.minval>{},ctr,val<N,T>{ctr-1});
+    return select(incr.fo1(),incsat.fo1(),decsat.fo1());
+}
+
+// ============================================================================
+// ta_global_history — shift register updated by XOR with branch bits
+// ============================================================================
+
+template<u64 N>
+struct ta_global_history {
+    arr<reg<1>,N> h;
+
+    void update(valtype auto in)
+    {
+        auto input = in.fo1().make_array(val<1>{});
+        static_assert(input.size<=N);
+        for (u64 i=N-1; i>=input.size; i--) h[i] = h[i-1];
+        for (u64 i=input.size-1; i>=1; i--) h[i] = h[i-1] ^ input[i].fo1();
+        h[0] = input[0].fo1();
+    }
+
+    // Unconditional write with enable mux — avoids execute_if gate timing.
+    // When enable=1: shift and XOR in new input (normal update).
+    // When enable=0: hold current state (registers still written, mux selects old value).
+    void update(valtype auto in, val<1> enable)
+    {
+        auto input = in.fo1().make_array(val<1>{});
+        static_assert(input.size<=N);
+        enable.fanout(hard<N>{});
+        for (u64 i=N-1; i>=input.size; i--)
+            h[i] = select(enable, h[i-1], h[i]);
+        for (u64 i=input.size-1; i>=1; i--)
+            h[i] = select(enable, h[i-1] ^ input[i].fo1(), h[i]);
+        h[0] = select(enable, input[0].fo1(), h[0]);
+    }
+
+    val<1>& operator[] (u64 i) { return h[i]; }
+    void fanout(hardval auto fo) { h.fanout(fo); }
+};
+
+// ============================================================================
+// ta_folded_gh — incremental folded history with compute/apply split
+//
+// compute_update() returns the new fold value WITHOUT writing the register.
+// apply_update() writes a precomputed value into the register.
+// update() does both (compute + apply) for convenience.
+//
+// The split allows computing new fold values in parallel with a gate signal
+// (e.g. true_block) and only applying writes inside execute_if, changing
+// timing from additive to max(fold_computation, gate_signal).
+// ============================================================================
+
+template<u64 F>
+struct ta_folded_gh {
+    static_assert(F!=0);
+
+    reg<F> folded;
+
+    val<F> get() { return folded; }
+    void fanout(hardval auto fo) { folded.fanout(fo); }
+
+    // Compute new fold value without writing the register
+    template<u64 MAXL>
+    [[nodiscard]] inline val<F> compute_update(ta_global_history<MAXL> &gh, hardval auto ghlen, valtype auto in)
+    {
+        constexpr u64 inbits = std::min(F,std::min(in.size,ghlen.value));
+        val<inbits> input = in.fo1();
+        auto f = folded.make_array(val<1>{});
+        static_assert(f.size==F);
+        val<1> outbit = gh[ghlen-1];
+        u64 outpos = ghlen % F;
+        arr<val<1>,F> ff = [&](u64 i){
+            if (i==0) return (outpos==0)? f[F-1].fo1()^outbit.fo1() : f[F-1].fo1();
+            else return (outpos==i)? f[i-1].fo1()^outbit.fo1() : f[i-1].fo1();
+        };
+        auto x = input.fo1().make_array(val<1>{});
+        arr<val<1>,F> y = [&](u64 i){return (i<x.size)? x[i].fo1()^ff[i].fo1() : ff[i].fo1();};
+        return y.fo1().concat();
+    }
+
+    // Write a precomputed fold value into the register
+    void apply_update(val<F> new_val)
+    {
+        folded = new_val;
+    }
+
+    // Unconditional write with enable mux — avoids execute_if gate timing.
+    // When enable=1: write new_val. When enable=0: hold current value.
+    void apply_update(val<F> new_val, val<1> enable)
+    {
+        folded = select(enable, new_val, folded);
+    }
+
+    // Combined compute + apply (convenience, same as original folded_gh::update)
+    template<u64 MAXL>
+    void update(ta_global_history<MAXL> &gh, hardval auto ghlen, valtype auto in)
+    {
+        apply_update(compute_update(gh, ghlen, in));
+    }
+};
 
 // ============================================================================
 // History update mode for geometric_folds_ex
@@ -40,8 +149,8 @@ struct geometric_folds_ex {
 
   static_assert(HLEN[0] == MAXH);
 
-  global_history<MAXH> gh;
-  std::array<std::tuple<folded_gh<FOLDS>...>, NH> folds;
+  ta_global_history<MAXH> gh;
+  std::array<std::tuple<ta_folded_gh<FOLDS>...>, NH> folds;
 
   template<u64 J = 0>
   auto get(u64 i) {
@@ -321,6 +430,115 @@ constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
 } // namespace ta
 
 // ============================================================================
+// rwram — Banked RAM with configurable bank index bits
+//
+// Allows simultaneous read and write (to different banks). If both access
+// the same bank, the write is buffered and flushed when the bank is free.
+//
+// Template params:
+//   N = data width in bits
+//   M = total entries (power of 2)
+//   B = number of banks (power of 2, >= 2)
+//   BANK_SHIFT = which bit position starts bank selection (default 0)
+//                0 = low bits select bank, K = bits [K, K+log2(B))
+// ============================================================================
+
+template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0>
+struct ta_rwram {
+  static_assert(std::has_single_bit(M));
+  static_assert(B >= 2 && B <= 64);
+  static_assert(std::has_single_bit(B));
+  static constexpr u64 A = std::bit_width(M - 1);         // address bits
+  static constexpr u64 E = M / B;                          // entries per bank
+  static_assert(E > 1);
+  static constexpr u64 L = std::bit_width(E - 1);          // local address bits
+  static constexpr u64 BANK_BITS = std::bit_width(B - 1);  // bank ID bits
+  static_assert(A == L + BANK_BITS);
+  static_assert(BANK_SHIFT + BANK_BITS <= A);
+
+  hcm::ram<val<N>, E> bank[B];
+  reg<B> read_bank;
+
+  // buffered write state
+  reg<B> write_bank;
+  reg<L> write_localaddr;
+  reg<N> write_data;
+
+  ta_rwram(const char *label = "") : bank{label} {}
+
+  // Split full address into (local_addr, bank_id).
+  auto split_addr(val<A> addr) {
+    if constexpr (BANK_SHIFT == 0) {
+      return hcm::split<L, BANK_BITS>(addr);
+    } else if constexpr (BANK_SHIFT + BANK_BITS == A) {
+      return std::pair{val<L>{addr}, val<BANK_BITS>{addr >> BANK_SHIFT}};
+    } else {
+      val<BANK_SHIFT> lo = addr;
+      val<BANK_BITS> bankid = addr >> BANK_SHIFT;
+      val<A - BANK_SHIFT - BANK_BITS> hi = addr >> (BANK_SHIFT + BANK_BITS);
+      val<L> localaddr = concat(lo, hi);
+      return std::pair{localaddr, bankid};
+    }
+  }
+
+  val<N> read(val<A> addr) {
+    auto [localaddr, bankid] = split_addr(addr.fo1());
+    localaddr.fanout(hard<B>{});
+    arr<val<1>, B> banksel = bankid.fo1().decode();
+    banksel.fanout(hard<2>{});
+    arr<val<N>, B> data = [&](u64 i) -> val<N> {
+      return execute_if(banksel[i], [&]() { return bank[i].read(localaddr); });
+    };
+    read_bank = banksel.concat();
+    return data.fo1().fold_or();
+  }
+
+  void write(val<A> addr, val<N> data, val<1> noconflict) {
+    // noconflict=1: no read this cycle, write immediately.
+    // noconflict=0: buffer write, flush when bank is free.
+    auto [localaddr, bankid] = split_addr(addr.fo1());
+    data.fanout(hard<B + 1>{});
+    noconflict.fanout(hard<B + 2>{});
+    val<B> banksel = bankid.fo1().decode().concat();
+    banksel.fanout(hard<2>{});
+    val<B> noconflict_mask = noconflict.replicate(hard<B>{}).concat();
+    noconflict_mask.fanout(hard<2>{});
+    val<B> current_write = banksel & noconflict_mask;
+    current_write.fanout(hard<3>{});
+    arr<val<1>, B> current_write_split = current_write.make_array(val<1>{});
+    current_write_split.fanout(hard<3>{});
+    arr<val<1>, B> write_bank_split = write_bank.make_array(val<1>{});
+    arr<val<1>, B> read_bank_split = read_bank.make_array(val<1>{});
+    for (u64 i = 0; i < B; i++) {
+      execute_if(
+          current_write_split[i] |
+              (write_bank_split[i].fo1() & ~read_bank_split[i].fo1()),
+          [&]() {
+            val<L> a =
+                select(current_write_split[i], localaddr, write_localaddr);
+            val<N> d = select(current_write_split[i], data, write_data);
+            bank[i].write(a.fo1(), d.fo1());
+          });
+    }
+    // buffer the current write if not done
+    val<1> buffered_done =
+        (write_bank & (current_write | read_bank)) == hard<0>{};
+    execute_if(buffered_done.fo1() | ~noconflict, [&]() {
+      write_bank = banksel & ~noconflict_mask;
+      execute_if(~noconflict, [&]() {
+        write_localaddr = localaddr;
+        write_data = data;
+      });
+    });
+  }
+
+  void reset() {
+    for (u64 i = 0; i < B; i++)
+      bank[i].reset();
+  }
+};
+
+// ============================================================================
 // TATable — Per-table storage for ahead-pipelined TAGE
 //
 // Each table has its own compile-time TAG_WIDTH and TABLE_SIZE.
@@ -335,7 +553,8 @@ template <u64 TABLE_SIZE,
           u64 HYST_WIDTH,
           u64 U_WIDTH,
           u64 SEC_TAG_BITS,
-          u64 N>            // max branches per block (= lanes of pred)
+          u64 N,            // max branches per block (= lanes of pred)
+          bool SHARED_HYS = false>  // shared hyst: 2 entries share 1 counter
 struct TATable {
   static constexpr u64 IDX_BITS = ta::clog2(TABLE_SIZE);
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -347,6 +566,10 @@ struct TATable {
   static constexpr u64 u_width = U_WIDTH;
   static constexpr u64 sec_tag_bits = SEC_TAG_BITS;
 
+  // When SHARED_HYS=true, halve the hyst table: pairs of entries share one counter
+  static constexpr u64 HYST_SIZE = SHARED_HYS ? (TABLE_SIZE / 2) : TABLE_SIZE;
+  static constexpr u64 HYST_IDX_BITS = ta::clog2(std::max(u64(2), HYST_SIZE));
+
   static_assert(TABLE_SIZE >= 2 && std::has_single_bit(TABLE_SIZE),
                 "TABLE_SIZE must be a power of 2 >= 2");
 
@@ -354,33 +577,33 @@ struct TATable {
   hcm::ram<val<TAG_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
   hcm::ram<val<PRED_BITS>, TABLE_SIZE>    pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
-  hcm::ram<val<std::max(u64(1), HYST_WIDTH)>, TABLE_SIZE> hyst_ram{"ta_hyst"};
+  hcm::ram<val<std::max(u64(1), HYST_WIDTH)>, HYST_SIZE> hyst_ram{"ta_hyst"};
   hcm::ram<val<U_WIDTH>, TABLE_SIZE>      u_ram{"ta_u"};
 
   // ---- Per-table folded histories (fold into exact widths) ----
-  folded_gh<IDX_BITS> fold_idx;
-  folded_gh<TAG_WIDTH> fold_tag;
+  ta_folded_gh<IDX_BITS> fold_idx;
+  ta_folded_gh<TAG_WIDTH> fold_tag;
 
 };
 
 // Generate a TATable type from config arrays at index I
 template <typename Cfg, u64 I, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS = false>
 using TATableAt =
     TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I],
-            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N>;
+            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS>;
 
 // Build a tuple of TATable types
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, typename Seq>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, typename Seq>
 struct TAMakeTableTuple;
 
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, u64... Is>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, u64... Is>
 struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                        SEC_TAG_BITS, N, std::index_sequence<Is...>> {
+                        SEC_TAG_BITS, N, SHARED_HYS, std::index_sequence<Is...>> {
   using type = std::tuple<TATableAt<Cfg, Is, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                                    SEC_TAG_BITS, N>...>;
+                                    SEC_TAG_BITS, N, SHARED_HYS>...>;
 };
 
 #endif // CUSTOM_COMMON_H

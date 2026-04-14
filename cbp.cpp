@@ -5,6 +5,17 @@
 
 branch_predictor pred;
 
+#ifdef TIMING_DEBUG
+void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
+    auto &pp = static_cast<branch_predictor &>(p);
+    auto [v, t] = pp.pred[0].get_vt();
+    std::cerr << "pred[0].time()=" << t
+              << " cycle_end=" << next_time
+              << " delta_ps=" << (int64_t(t) - int64_t(next_time))
+              << "\n";
+}
+#endif
+
 static void usage(const char* name) {
     printf("Usage:\n  %s <path to trace> <name of trace> <warmup instructions> <measurement instructions> [--format csv|human]\n", name);
     std::exit(1);

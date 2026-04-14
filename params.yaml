@@ -60,7 +60,7 @@ build_type: release # release | debug | relwithdebinfo
 warnings_as_errors: true
 native_arch: false
 sanitize: none
-defines: []
+defines: ["TIMING_DEBUG"]
 extra_include_dirs: []
 
 trace: traces/502-gcc-all_16112_trace.gz

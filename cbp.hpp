@@ -258,6 +258,11 @@ public:
                     info.is_mispredict = {p2_misprediction, next_time};
                     info.next_pc = {instruction.next_pc, next_time};
                     p.update_cycle(info);
+                    #ifdef TIMING_DEBUG
+                    if (warmed_up && npred < 20) {
+                        timing_debug(p, next_time);
+                    }
+                    #endif
                     panel.next_cycle();
                     time = next_time;
                     npred++;
@@ -273,6 +278,10 @@ public:
             }
         } catch (const out_of_instructions &e) { }
     }
+
+    #ifdef TIMING_DEBUG
+    void timing_debug(predictor &p, uint64_t next_time);
+    #endif
 
     ~harcom_superuser()
     {
