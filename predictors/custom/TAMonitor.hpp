@@ -4,9 +4,11 @@
 // All counters are plain C++ types (zero HARCOM cost).
 
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <unordered_set>
 
 using u64 = uint64_t;
 
@@ -36,6 +38,8 @@ struct TAMonitor {
     u64 total_block_branches = 0;
     std::array<u64, MAX_BLOCK_INSTR> block_instr_hist{};
     std::array<u64, MAX_BLOCK_BR> block_br_hist{};
+    std::array<u64, 1024> entry_point_hist{};
+    std::array<u64, 1024> exit_point_hist{};
 
     // True block rate (pipeline reuse)
     u64 true_block_count = 0;
@@ -60,15 +64,19 @@ struct TAMonitor {
 
     // Tag match rate per table (primary + secondary)
     std::array<u64, NUM_TABLES> tag_lookups{};
-    std::array<u64, NUM_TABLES> tag_matches{};    // primary tag match
-    std::array<u64, NUM_TABLES> sec_matches{};    // secondary tag match
-    std::array<u64, NUM_TABLES> full_matches{};   // both matched
+    std::array<u64, NUM_TABLES> tag_matches{};
+    std::array<u64, NUM_TABLES> sec_matches{};
+    std::array<u64, NUM_TABLES> full_matches{};
 
     // Allocation
     u64 alloc_attempts = 0;
     u64 alloc_success = 0;
-    u64 alloc_fail = 0; // noalloc (mispredict but no u=0 slot)
+    u64 alloc_fail = 0;
+    u64 alloc_blocked = 0; // mispredict but bimodal was provider (no candidate)
     std::array<u64, NUM_TABLES> alloc_per_table{};
+    // Cascade: alloc_from_provider[i] = allocations when Ti was provider
+    std::array<u64, NUM_TABLES + 1> alloc_from_provider{};
+    std::array<std::array<u64, NUM_TABLES>, NUM_TABLES + 1> alloc_cascade{};
 
     // u-bit
     std::array<u64, NUM_TABLES> u_set_count{};
@@ -89,8 +97,14 @@ struct TAMonitor {
   u64 window_num = 0;
   bool header_printed = false;
 
+  // Table occupancy tracking
+  std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> tage_occupied{};
+  std::array<u64, NUM_TABLES> tage_unique_entries{};
+
+  // Unique branch PCs
+  std::unordered_set<u64> unique_branch_pcs;
+
   // Shadow state (set during resolution, consumed during training)
-  // Since TageAhead does resolution in update_cycle, we set + consume in same call
   std::array<u64, N> shadow_provider{};
   std::array<u64, N> shadow_alt{};
   std::array<bool, N> shadow_meta_overrode{};
@@ -110,7 +124,8 @@ struct TAMonitor {
     win.reuse_predict2_calls++;
   }
 
-  void record_block(u64 block_size, u64 num_branch, bool extra_cycle_fired) {
+  void record_block(u64 block_entry, u64 block_size, u64 num_branch,
+                     bool extra_cycle_fired) {
     auto record = [&](Counters &c) {
       c.blocks++;
       c.total_block_instr += block_size;
@@ -122,6 +137,11 @@ struct TAMonitor {
         c.block_instr_hist[MAX_BLOCK_INSTR - 1]++;
       if (num_branch < MAX_BLOCK_BR)
         c.block_br_hist[num_branch]++;
+      if (block_entry < 1024)
+        c.entry_point_hist[block_entry]++;
+      u64 exit_pt = block_entry + block_size;
+      if (exit_pt < 1024)
+        c.exit_point_hist[exit_pt]++;
     };
     record(cum);
     record(win);
@@ -196,6 +216,8 @@ struct TAMonitor {
     }
   }
 
+  void record_branch_pc(u64 pc) { unique_branch_pcs.insert(pc); }
+
   // Allocation
   void record_allocation(bool success, u64 allocate_mask) {
     auto record = [&](Counters &c) {
@@ -212,13 +234,47 @@ struct TAMonitor {
     record(win);
   }
 
-  // u-bit write
-  void record_u_write(u64 table, bool new_u) {
-    if (new_u) { cum.u_set_count[table]++; win.u_set_count[table]++; }
-    else { cum.u_clear_count[table]++; win.u_clear_count[table]++; }
+  void record_alloc_blocked() {
+    cum.alloc_blocked++;
+    win.alloc_blocked++;
   }
 
-  void record_decay_fire() { cum.decay_fire_count++; win.decay_fire_count++; }
+  void record_alloc_cascade(u64 provider_idx, u64 allocate_mask) {
+    auto record = [&](Counters &c) {
+      if (allocate_mask == 0) return;
+      c.alloc_from_provider[provider_idx]++;
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        if (allocate_mask & (u64(1) << i))
+          c.alloc_cascade[provider_idx][i]++;
+    };
+    record(cum);
+    record(win);
+  }
+
+  // Table occupancy — called on allocation writes
+  void record_tage_write(u64 table, u64 index) {
+    if (table < NUM_TABLES && index < MAX_TABLE_ENTRIES &&
+        !tage_occupied[table].test(index)) {
+      tage_occupied[table].set(index);
+      tage_unique_entries[table]++;
+    }
+  }
+
+  // u-bit write
+  void record_u_write(u64 table, bool new_u) {
+    if (new_u) {
+      cum.u_set_count[table]++;
+      win.u_set_count[table]++;
+    } else {
+      cum.u_clear_count[table]++;
+      win.u_clear_count[table]++;
+    }
+  }
+
+  void record_decay_fire() {
+    cum.decay_fire_count++;
+    win.decay_fire_count++;
+  }
   void record_epoch_reset() {
     cum.epoch_reset_count++;
     win.epoch_reset_count++;
@@ -251,18 +307,22 @@ struct TAMonitor {
 
   void print_window(std::ostream &os) {
     if (!header_printed) {
-      os << "# win,br,misp%,extra%,i/blk,br/blk,true_blk%,";
+      os << "# win,br,misp%,MPKI,extra%,i/blk,br/blk,true_blk%,";
       os << "bim%,";
-      for (u64 i = 0; i < NUM_TABLES; i++) os << "T" << i << "%,";
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        os << "T" << i << "%,";
       os << "alloc_ok%,acc_avg,alloc_avg";
       os << "\n";
       header_printed = true;
     }
     auto &w = win;
+    double win_mpki = w.total_block_instr > 0
+                          ? 1000.0 * w.mispredictions / w.total_block_instr
+                          : 0.0;
     os << std::fixed << std::setprecision(1);
-    os << window_num << ","
-       << w.branches << ","
+    os << window_num << "," << w.branches << ","
        << pct(w.mispredictions, w.branches) << ","
+       << std::setprecision(3) << win_mpki << "," << std::setprecision(1)
        << pct(w.extra_cycles, w.blocks) << ","
        << (w.blocks > 0 ? double(w.total_block_instr) / w.blocks : 0) << ","
        << (w.blocks > 0 ? double(w.total_block_branches) / w.blocks : 0) << ","
@@ -288,40 +348,58 @@ struct TAMonitor {
     const auto &c = cum;
 
     os << "\n=== TageAhead Monitor Summary ===\n";
-    os << "Branches: " << c.branches
+    double mpki = c.total_block_instr > 0
+                      ? 1000.0 * c.mispredictions / c.total_block_instr
+                      : 0.0;
+    os << "Instructions: " << c.total_block_instr
+       << "  Branches: " << c.branches
        << "  Mispredictions: " << c.mispredictions << " ("
        << std::fixed << std::setprecision(2)
-       << pct(c.mispredictions, c.branches) << "%)\n";
+       << pct(c.mispredictions, c.branches) << "%)"
+       << "  MPKI: " << std::setprecision(3) << mpki << "\n";
     os << "Blocks: " << c.blocks
-       << "  Extra cycles: " << c.extra_cycles
-       << " (" << pct(c.extra_cycles, c.blocks) << "%)\n";
-    os << "True blocks: " << c.true_block_count
-       << " (" << pct(c.true_block_count, c.blocks) << "%)\n";
+       << "  Extra cycles: " << c.extra_cycles << " ("
+       << std::setprecision(2) << pct(c.extra_cycles, c.blocks) << "%)\n";
+    os << "True blocks: " << c.true_block_count << " ("
+       << pct(c.true_block_count, c.blocks) << "%)\n";
     os << "Train skips (first cycle): " << c.train_skip_count << "\n";
 
     // Pipeline calls
     os << "\nPipeline Calls:\n";
+    u64 total_p1 = c.predict1_calls + c.reuse_predict1_calls;
     os << "  predict1: " << c.predict1_calls
-       << "  reuse: " << c.reuse_predict1_calls
-       << "  (reuse: "
-       << pct(c.reuse_predict1_calls,
-              c.predict1_calls + c.reuse_predict1_calls)
-       << "%)\n";
+       << "  reuse: " << c.reuse_predict1_calls << "  (reuse: "
+       << pct(c.reuse_predict1_calls, total_p1) << "%)\n";
     os << "  predict2: " << c.predict2_calls
        << "  reuse: " << c.reuse_predict2_calls << "\n";
+    os << "  Avg instr/block (from P1): "
+       << (c.predict1_calls > 0 ? double(total_p1) / c.predict1_calls : 0)
+       << "\n";
 
     // Block structure
     os << "\nBlock Structure:\n";
-    os << "  Avg instr/block: " << std::setprecision(1)
+    os << std::setprecision(1);
+    os << "  Avg instr/block: "
        << (c.blocks > 0 ? double(c.total_block_instr) / c.blocks : 0) << "\n";
     os << "  Avg branches/block: "
        << (c.blocks > 0 ? double(c.total_block_branches) / c.blocks : 0)
        << "\n";
+    os << "  Instr/block histogram: ";
+    for (u64 i = 1; i < MAX_BLOCK_INSTR && i <= 16; i++) {
+      if (c.block_instr_hist[i] > 0)
+        os << i << ":" << c.block_instr_hist[i] << " ";
+    }
+    os << "\n";
     os << "  Branches/block histogram: ";
     for (u64 i = 0; i < MAX_BLOCK_BR; i++) {
       if (c.block_br_hist[i] > 0)
         os << i << ":" << c.block_br_hist[i] << " ";
     }
+    os << "\n";
+    os << "  Entry point top-5: ";
+    print_top_n(os, c.entry_point_hist, 5);
+    os << "\n  Exit point top-5: ";
+    print_top_n(os, c.exit_point_hist, 5);
     os << "\n";
 
     // Provider distribution
@@ -348,6 +426,28 @@ struct TAMonitor {
          << pct(c.full_matches[i], c.tag_lookups[i]) << "%\n";
     }
 
+    // TAGE-only provider/alt distribution
+    u64 tage_total = 0, tage_correct = 0;
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      tage_total += c.provider_count[i];
+      tage_correct += c.provider_correct[i];
+    }
+    os << "\nTAGE-only (" << tage_total << " branches, "
+       << pct(tage_total, c.branches) << "% of all):\n";
+    if (tage_total > 0) {
+      os << "  Table  | Prov%  | Alt%   | ProvAcc\n";
+      os << "  -------+--------+--------+--------\n";
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
+           << std::setw(6) << pct(c.provider_count[i], tage_total) << "%"
+           << " |" << std::setw(6) << pct(c.alt_count[i], tage_total) << "%"
+           << " |" << std::setw(6)
+           << pct(c.provider_correct[i], c.provider_count[i]) << "%\n";
+      }
+      os << "  Overall TAGE accuracy: " << pct(tage_correct, tage_total)
+         << "%\n";
+    }
+
     // Meta
     os << "\nMeta Override:\n";
     os << "  Total: " << c.meta_override_count
@@ -365,11 +465,48 @@ struct TAMonitor {
     os << "  Attempts: " << c.alloc_attempts
        << "  Success: " << c.alloc_success << " ("
        << pct(c.alloc_success, c.alloc_attempts) << "%)"
-       << "  Fail: " << c.alloc_fail << "\n";
+       << "  Fail: " << c.alloc_fail
+       << "  Blocked: " << c.alloc_blocked << "\n";
     os << "  Per table:";
     for (u64 i = 0; i < NUM_TABLES; i++)
       os << " T" << i << "=" << c.alloc_per_table[i];
     os << "\n";
+    os << "  Unique branch PCs: " << unique_branch_pcs.size() << "\n";
+
+    // Allocation cascade
+    os << "\nAllocation Cascade (provider -> target):\n";
+    os << "  Provider  | Allocs  |";
+    for (u64 i = 0; i < NUM_TABLES; i++)
+      os << std::setw(7) << "T" + std::to_string(i);
+    os << "\n  ----------+---------+";
+    for (u64 i = 0; i < NUM_TABLES; i++)
+      os << "-------";
+    os << "\n";
+    for (u64 p = 0; p <= NUM_TABLES; p++) {
+      if (c.alloc_from_provider[p] == 0) continue;
+      if (p == NUM_TABLES)
+        os << "  Bimodal   |";
+      else
+        os << "  T" << p << std::setw(8 - (p >= 10 ? 2 : 1)) << "" << "|";
+      os << std::setw(8) << c.alloc_from_provider[p] << " |";
+      for (u64 t = 0; t < NUM_TABLES; t++)
+        os << std::setw(7) << c.alloc_cascade[p][t];
+      os << "\n";
+    }
+
+    // Table occupancy
+    os << "\nTAGE Table Occupancy:\n";
+    os << "  Table  | Size  | Occupied |  Occ% | Accuracy | Allocs\n";
+    os << "  -------+-------+----------+-------+----------+-------\n";
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
+         << std::setw(6) << MAX_TABLE_ENTRIES << " |" << std::setw(9)
+         << tage_unique_entries[i] << " |" << std::setw(5)
+         << pct(tage_unique_entries[i], MAX_TABLE_ENTRIES) << "%"
+         << " |" << std::setw(7)
+         << pct(c.provider_correct[i], c.provider_count[i]) << "%"
+         << " |" << std::setw(7) << c.alloc_per_table[i] << "\n";
+    }
 
     // u-bit
     os << "\nU-bit:\n";
@@ -394,6 +531,23 @@ struct TAMonitor {
          << double(c.alloc_ctr_sum) / c.pressure_samples << "\n";
     }
 
-    os << "\n";
+    os << "\n=== End TageAhead Monitor ===\n\n";
+  }
+
+private:
+  template <size_t SZ>
+  static void print_top_n(std::ostream &os,
+                           const std::array<u64, SZ> &hist, u64 n) {
+    std::array<std::pair<u64, u64>, 64> top{};
+    u64 found = 0;
+    for (u64 i = 0; i < SZ && found < 64; i++) {
+      if (hist[i] > 0) top[found++] = {hist[i], i};
+    }
+    for (u64 i = 0; i < std::min(n, found); i++) {
+      for (u64 j = i + 1; j < found; j++) {
+        if (top[j].first > top[i].first) std::swap(top[i], top[j]);
+      }
+      os << top[i].second << ":" << top[i].first << " ";
+    }
   }
 };

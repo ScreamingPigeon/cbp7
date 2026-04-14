@@ -238,6 +238,28 @@ struct TageAhead : predictor {
   reg<1> dbg_gh_fanout;     // gh after fanout in update_cycle
   reg<1> dbg_fold_compute;  // compute_update result timing
   reg<1> dbg_fold_apply;    // after apply_update (fold write)
+  // Resolution gaps
+  reg<1> dbg_altdiff;        // provider_pred ^ alt_pred
+  reg<1> dbg_actual_dir;     // branch_dir scatter
+  reg<1> dbg_any_prov_wrong; // t_pp ^ actual_dir
+  // Allocation chain
+  reg<1> dbg_alloc_base;     // t_match1 - 1
+  reg<1> dbg_notumask;       // u_zero concat
+  reg<1> dbg_candallocmask;  // misp_alloc & notumask
+  reg<1> dbg_alloc_target;   // one_hot of candidates
+  reg<1> dbg_noalloc;        // candallocmask == 0
+  reg<1> dbg_uclearmask;     // u-clear fallback
+  // Train write chain (per-table)
+  reg<1> dbg_bim_write;      // bim_ctr.write gate
+  reg<1> dbg_meta_write;     // meta_ctr.write gate
+  reg<1> dbg_pred_write[NT]; // pred_ram.write gate per table
+  reg<1> dbg_hyst_write[NT]; // hyst_ram.write gate per table
+  reg<1> dbg_tag_write[NT];  // tag_ram.write gate per table
+  reg<1> dbg_u_write[NT];    // u_ram.write gate per table
+  // Decay (per-table)
+  reg<1> dbg_decay_fire[NT]; // decay_fire per table
+  reg<1> dbg_decay_merged[NT]; // merged u value per table
+  reg<1> dbg_epoch_fire;     // epoch trigger
 #endif
 
 #ifdef TAGE_MONITOR
@@ -342,6 +364,9 @@ struct TageAhead : predictor {
                      [[maybe_unused]] val<64> next_pc) {
     assert(num_branch < N);
     branch_dir[num_branch] = taken.fo1();
+#ifdef TAGE_MONITOR
+    mon.record_branch_pc(static_cast<u64>(branch_pc));
+#endif
     num_branch++;
     reuse_prediction(~line_end() & val<1>{num_branch < N});
   }
@@ -595,6 +620,9 @@ struct TageAhead : predictor {
     train_provider_pred = provider_pred;
     train_provider_weak = provider_weak;
     train_altdiff = altdiff;
+#ifdef TIMING_DEBUG
+    dbg_altdiff = val<1>{altdiff};
+#endif
 
     // Read train_valid BEFORE setting it to 1 (regs may be immediate-write)
     val<1> do_train = train_valid;
@@ -624,7 +652,8 @@ struct TageAhead : predictor {
     do_train.fanout(hard<4 * NT + 3>{}); // gates bim, meta, 4 writes per table
 
 #ifdef TAGE_MONITOR
-    mon.record_block(block_size, num_branch, static_cast<u64>(mispredict));
+    mon.record_block(static_cast<u64>(val<LOGLINEINST>{block_entry}),
+                     block_size, num_branch, static_cast<u64>(mispredict));
     for (u64 r = 0; r < num_branch; r++)
       mon.record_outcome(r, static_cast<u64>(branch_dir[r]),
                          r == num_branch - 1 && static_cast<u64>(mispredict));
@@ -645,6 +674,10 @@ struct TageAhead : predictor {
     actual_dir.fanout(hard<NT + 1>{});
     val<1> any_provider_wrong = (t_pp ^ actual_dir) != hard<0>{};
     any_provider_wrong.fanout(hard<3 * NT + 1>{});
+#ifdef TIMING_DEBUG
+    dbg_actual_dir = val<1>{actual_dir};
+    dbg_any_prov_wrong = any_provider_wrong;
+#endif
     t_pw.fanout(hard<NT + 1>{});
     t_m1.fanout(hard<6>{});
     t_ad.fanout(hard<NT + 1>{});
@@ -667,25 +700,49 @@ struct TageAhead : predictor {
     val<NT> uclearmask = misp_alloc & noalloc.replicate(hard<NT>{}).concat();
     arr<val<1>, NT> uclear = uclearmask.make_array(val<1>{});
     uclear.fanout(hard<2>{});
+#ifdef TIMING_DEBUG
+    dbg_alloc_base = val<1>{alloc_base};
+    dbg_notumask = val<1>{notumask};
+    dbg_candallocmask = val<1>{candallocmask};
+    dbg_alloc_target = val<1>{alloc_target};
+    dbg_noalloc = noalloc;
+    dbg_uclearmask = val<1>{uclearmask};
+#endif
 
 #ifdef TAGE_MONITOR
-    mon.record_allocation(static_cast<u64>(alloc_target) != 0,
-                          static_cast<u64>(alloc_target));
+    {
+      u64 at = static_cast<u64>(alloc_target);
+      mon.record_allocation(at != 0, at);
+      // Provider index for cascade tracking
+      u64 prov_idx = TAMonitor<NT, N, MAX_TABLE_SIZE>::decode_provider(
+          static_cast<u64>(t_match1));
+      if (static_cast<u64>(mispredict)) {
+        if (static_cast<u64>(misp_alloc) == 0)
+          mon.record_alloc_blocked(); // bimodal was provider, no candidates
+        mon.record_alloc_cascade(prov_idx, at);
+      }
+    }
 #endif
 
     // ---- Step 4: Bimodal update (mispredict + bimodal is provider only) ----
     val<1> bim_changed = actual_dir != val<PRED_BITS>{train_bim};
-    execute_if(do_train & t_m1[NT] & mispredict & bim_changed, [&]() {
+    val<1> bim_gate = do_train & t_m1[NT] & mispredict & bim_changed;
+    execute_if(bim_gate, [&]() {
       bim_ctr.write(val<BIM_IDX_BITS>{train_bim_idx}, actual_dir);
     });
 
     // ---- Step 5: Meta counter update ----
     auto old_meta = val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]};
     auto new_meta = ta_update_ctr(old_meta, any_provider_wrong);
-    execute_if(do_train & t_pw & t_ad & (new_meta != old_meta), [&]() {
+    val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
+    execute_if(meta_gate, [&]() {
       meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1]}, new_meta,
                      hard<0>{});
     });
+#ifdef TIMING_DEBUG
+    dbg_bim_write = bim_gate;
+    dbg_meta_write = meta_gate;
+#endif
 
     // ---- Merged per-table writes (one write per RAM per table) ----
     // For each table: alloc takes priority over update. Mux selects data.
@@ -720,6 +777,10 @@ struct TageAhead : predictor {
           t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
                           val<SEC_TAG_BITS>{curr_sec_tag});
       });
+#ifdef TAGE_MONITOR
+      if (static_cast<u64>(do_train & do_alloc))
+        mon.record_tage_write(I, static_cast<u64>(val<t.IDX_BITS>{train_idx[I]}));
+#endif
 
       // u_ram: combined provider update + allocation + uclear + decay
       val<U_WIDTH> base_newu = val<U_WIDTH>{~any_provider_wrong} &
@@ -746,8 +807,9 @@ struct TageAhead : predictor {
                 return sec_missed;
               else if constexpr (DECAY_MISS == DecayMiss::TAG_OR_SEC)
                 return tag_missed | sec_missed;
-            else
-              return tag_missed & sec_missed;
+              else
+                return tag_missed & sec_missed;
+            }
           }();
 
           // Threshold from global counters
@@ -792,6 +854,16 @@ struct TageAhead : predictor {
           mon.record_decay_fire();
       }
 #endif
+#ifdef TIMING_DEBUG
+      dbg_pred_write[I] = do_train & (do_alloc | do_pred_update);
+      dbg_hyst_write[I] = do_train & (do_alloc | do_hyst_update);
+      dbg_tag_write[I] = do_train & do_alloc;
+      dbg_u_write[I] = do_train & u_write;
+      if constexpr (DECAY_ENABLE) {
+        dbg_decay_fire[I] = u_write & ~base_u_write;
+        dbg_decay_merged[I] = val<1>{newu};
+      }
+#endif
     });
 
     // ---- Global pressure counter updates ----
@@ -811,6 +883,9 @@ struct TageAhead : predictor {
         execute_if(epoch_fire, [&]() {
           static_loop<NT>([&]<u64 I>() { std::get<I>(tables).u_ram.reset(); });
         });
+#ifdef TIMING_DEBUG
+        dbg_epoch_fire = epoch_fire;
+#endif
 #ifdef TAGE_MONITOR
         if (static_cast<u64>(epoch_fire))
           mon.record_epoch_reset();

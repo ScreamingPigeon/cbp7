@@ -32,7 +32,7 @@ REGION_SHIFT ?= 12
 PRED_HASH := $(shell echo '$(PREDICTOR_TYPE)|$(EXTRA_COMMON_FLAGS)|$(EXTRA_CBP_FLAGS)' | md5sum | cut -c1-8)
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report timing-probe run-timing-probe save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -48,6 +48,8 @@ help:
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
 	@echo "  make cbp-monitor                Build+run with TAGE monitor (output to MONITOR_OUT)"
+	@echo "  make timing-probe               Build timing probe (TIMING_DEBUG datapath delays)"
+	@echo "  make run-timing-probe           Build+run timing probe (TIMING_MEASURE=4000)"
 	@echo "  make quick-eval                 Run current predictor on 20 representative traces"
 	@echo "  make quick-eval-all             Compare PRED_A vs PRED_B on representative traces"
 	@echo "  make trace-analyze              Build trace analysis tool"
@@ -179,6 +181,18 @@ endif
 monitor-vis:
 	python3 scripts/monitor_vis.py out/monitor_csv.txt
 
+# Timing probe: datapath delay breakdown with TIMING_DEBUG
+TIMING_FLAGS := -DTIMING_DEBUG
+TIMING_MEASURE ?= 4000
+
+$(BUILD_DIR)/timing-probe-$(PRED_HASH): predictors/custom/timing_probe.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(TIMING_FLAGS) -I. -Itrace_files -o $@ $< -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
+
+timing-probe: $(BUILD_DIR)/timing-probe-$(PRED_HASH)
+
+run-timing-probe: $(BUILD_DIR)/timing-probe-$(PRED_HASH)
+	./$(BUILD_DIR)/timing-probe-$(PRED_HASH) $(TRACE) $(TRACE_NAME) $(WARMUP) $(TIMING_MEASURE) 2>&1 | head -60
+
 # Compare two predictors side-by-side.
 # Single trace:  make compare TRACE=path/to/trace.gz
 # All traces:    make compare-all TRACE_DIR=path/to/traces/
@@ -276,6 +290,7 @@ clean:
 	rm -f $(BUILD_DIR)/cbp-* $(BUILD_DIR)/reference $(BUILD_DIR)/trace-analyze
 	rm -f $(BUILD_DIR)/block-analyze $(BUILD_DIR)/ahead-block-analyze
 	rm -f $(BUILD_DIR)/test-tage-compile $(BUILD_DIR)/quick_a $(BUILD_DIR)/quick_b
+	rm -f $(BUILD_DIR)/timing-probe-*
 	rm -f $(PREDICTOR_MK)
 	rm -rf out/*
 
