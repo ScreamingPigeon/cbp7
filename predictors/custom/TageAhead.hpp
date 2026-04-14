@@ -13,7 +13,7 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 6, u64 SIZE = 2048, u64 TAG = 11, u64 MINH = 4,
+template <u64 N = 8, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 4,
           u64 MAXH = 100, u64 SIZE_RATIO = 1,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::GradedTag<TAG, TAG - 1>,
@@ -243,12 +243,12 @@ struct TageAhead : predictor {
   reg<1> dbg_actual_dir;     // branch_dir scatter
   reg<1> dbg_any_prov_wrong; // t_pp ^ actual_dir
   // Allocation chain
-  reg<1> dbg_alloc_base;     // t_match1 - 1
-  reg<1> dbg_notumask;       // u_zero concat
-  reg<1> dbg_candallocmask;  // misp_alloc & notumask
-  reg<1> dbg_alloc_target;   // one_hot of candidates
-  reg<1> dbg_noalloc;        // candallocmask == 0
-  reg<1> dbg_uclearmask;     // u-clear fallback
+  reg<1> dbg_alloc_base;    // t_match1 - 1
+  reg<1> dbg_notumask;      // u_zero concat
+  reg<1> dbg_candallocmask; // misp_alloc & notumask
+  reg<1> dbg_alloc_target;  // one_hot of candidates
+  reg<1> dbg_noalloc;       // candallocmask == 0
+  reg<1> dbg_uclearmask;    // u-clear fallback
   // Train write chain (per-table)
   reg<1> dbg_bim_write;      // bim_ctr.write gate
   reg<1> dbg_meta_write;     // meta_ctr.write gate
@@ -257,9 +257,9 @@ struct TageAhead : predictor {
   reg<1> dbg_tag_write[NT];  // tag_ram.write gate per table
   reg<1> dbg_u_write[NT];    // u_ram.write gate per table
   // Decay (per-table)
-  reg<1> dbg_decay_fire[NT]; // decay_fire per table
+  reg<1> dbg_decay_fire[NT];   // decay_fire per table
   reg<1> dbg_decay_merged[NT]; // merged u value per table
-  reg<1> dbg_epoch_fire;     // epoch trigger
+  reg<1> dbg_epoch_fire;       // epoch trigger
 #endif
 
 #ifdef TAGE_MONITOR
@@ -288,41 +288,56 @@ struct TageAhead : predictor {
     dbg_inst_pc = val<1>{inst_pc};
 #endif
 
-    // Ahead reads for next block (off crit path, needs inst_pc)
-    execute_if(true_block, [&]() {
-      static_loop<NT>([&]<u64 I>() {
-        auto &t = std::get<I>(tables);
-        auto idx = t.fold_idx.get() ^ val<t.IDX_BITS>{inst_pc >> 2};
-        idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
-        auto computed_tag = t.fold_tag.get() ^ val<t.tag_width>{inst_pc >> 4};
+    // Ahead reads for next block — run unconditionally (no true_block gate).
+    //
+    // Why no execute_if(true_block)?
+    //   true_block is computed in update_cycle at +90ps (depends on mispredict,
+    //   branch_dir, and line_end). Gating the RAM reads on it would delay the
+    //   entire prefetch path: RAM addresses (fold_idx at -74, inst_pc at -255)
+    //   are ready long before true_block, but execute_if holds the reads until
+    //   the gate resolves. This adds ~165ps to pipe_shift, pushing the
+    //   downstream resolution chain (one_hot → fold_or → select → scatter)
+    //   well past the 1-cycle target.
+    //
+    // Why is this safe?
+    //   When true_block=0 (mispredicted taken branch mid-line), the framework
+    //   fires extra_cycle, which re-invokes predict1 with the corrected PC.
+    //   The prefetch regs from the spurious read are unconditionally
+    //   overwritten in that corrected predict1 call before they ever shift into
+    //   current_*. In hardware, the RAM reads happen regardless — execute_if
+    //   only gates the output latch, so removing it has zero area/power impact.
+    static_loop<NT>([&]<u64 I>() {
+      auto &t = std::get<I>(tables);
+      auto idx = t.fold_idx.get() ^ val<t.IDX_BITS>{inst_pc >> 2};
+      idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
+      auto computed_tag = t.fold_tag.get() ^ val<t.tag_width>{inst_pc >> 4};
 
 #ifdef TIMING_DEBUG
-        if constexpr (I == 0) {
-          dbg_fold_idx = val<1>{t.fold_idx.get()};
-          dbg_fold_tag = val<1>{t.fold_tag.get()};
-        }
+      if constexpr (I == 0) {
+        dbg_fold_idx = val<1>{t.fold_idx.get()};
+        dbg_fold_tag = val<1>{t.fold_tag.get()};
+      }
 #endif
 
-        auto stored_tag = t.tag_ram.read(idx);
-        stored_tag.fanout(hard<2>{});
-        prefetch_tag[I] = stored_tag;
-        prefetch_tag_hit[I] =
-            val<MAX_TAG_WIDTH>{stored_tag} == val<MAX_TAG_WIDTH>{computed_tag};
-        prefetch_ctag[I] = computed_tag;
-        prefetch_pred[I] = t.pred_ram.read(idx);
-        if constexpr (USE_SEC_TAG)
-          prefetch_sec[I] = t.sec_ram.read(idx);
-        prefetch_idx[I] = idx;
-        prefetch_hyst[I] = t.hyst_ram.read(val<t.HYST_IDX_BITS>{idx});
-        prefetch_u[I] = t.u_ram.read(idx);
-      });
-
-      // Bimodal ahead read (direct-mapped, no tag match needed)
-      auto bim_idx = val<BIM_IDX_BITS>{inst_pc >> 2};
-      prefetch_bim_idx = bim_idx;
-      prefetch_bim = bim_ctr.read(bim_idx);
-      prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
+      auto stored_tag = t.tag_ram.read(idx);
+      stored_tag.fanout(hard<2>{});
+      prefetch_tag[I] = stored_tag;
+      prefetch_tag_hit[I] =
+          val<MAX_TAG_WIDTH>{stored_tag} == val<MAX_TAG_WIDTH>{computed_tag};
+      prefetch_ctag[I] = computed_tag;
+      prefetch_pred[I] = t.pred_ram.read(idx);
+      if constexpr (USE_SEC_TAG)
+        prefetch_sec[I] = t.sec_ram.read(idx);
+      prefetch_idx[I] = idx;
+      prefetch_hyst[I] = t.hyst_ram.read(val<t.HYST_IDX_BITS>{idx});
+      prefetch_u[I] = t.u_ram.read(idx);
     });
+
+    // Bimodal ahead read (direct-mapped, no tag match needed)
+    auto bim_idx = val<BIM_IDX_BITS>{inst_pc >> 2};
+    prefetch_bim_idx = bim_idx;
+    prefetch_bim = bim_ctr.read(bim_idx);
+    prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
 
     // Crit path: just read precomputed prediction from reg
     block_entry.fanout(hard<2 * LINEINST>{}); // read in line_end() across
@@ -414,8 +429,7 @@ struct TageAhead : predictor {
           hard<3>{}); // curr_sec_tag + meta_idx + hist path_bits
       curr_sec_tag = val<SEC_TAG_BITS>{block_end_info.next_pc >> 2};
     } else {
-      block_end_info.next_pc.fanout(
-          hard<2>{}); // meta_idx + hist path_bits
+      block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     }
 
     // ================================================================
@@ -779,7 +793,8 @@ struct TageAhead : predictor {
       });
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_train & do_alloc))
-        mon.record_tage_write(I, static_cast<u64>(val<t.IDX_BITS>{train_idx[I]}));
+        mon.record_tage_write(I,
+                              static_cast<u64>(val<t.IDX_BITS>{train_idx[I]}));
 #endif
 
       // u_ram: combined provider update + allocation + uclear + decay
@@ -928,7 +943,9 @@ struct TageAhead : predictor {
     // true_block uses framework's mispredict signal (not our computed
     // correct_pred) to avoid timing bleed from old_pred reg reads
     true_block = ~mispredict | val<1>{branch_dir[num_branch - 1]} | line_end();
-    true_block.fanout(hard<NT * 2 + 3>{});
+    true_block.fanout(
+        hard<NT * 2 + 2>{}); // NT fold_idx + NT fold_tag apply_update muxes +
+                             // gh.update + monitor
 
 #ifdef TAGE_MONITOR
     if (static_cast<u64>(true_block))
