@@ -12,8 +12,12 @@
 
 using u64 = uint64_t;
 
-template <u64 NUM_TABLES, u64 N, u64 MAX_TABLE_ENTRIES = 2048>
+template <u64 NUM_TABLES, u64 N, u64 MAX_TABLE_ENTRIES = 2048,
+          bool USE_GSHARE = false, u64 FB_CAPACITY = 8192>
 struct TAMonitor {
+
+  static constexpr const char *FB_NAME = USE_GSHARE ? "Gshare" : "Bimodal";
+  static constexpr const char *FB_NAME_PAD = USE_GSHARE ? "Gshare  " : "Bimodal ";
 
   static constexpr u64 WINDOW_SIZE = 100000; // branches per window
 
@@ -47,7 +51,7 @@ struct TAMonitor {
     // Train valid skip (first-cycle guard)
     u64 train_skip_count = 0;
 
-    // Provider distribution: 0..NUM_TABLES-1 = TAGE, NUM_TABLES = bimodal
+    // Provider distribution: 0..NUM_TABLES-1 = TAGE, NUM_TABLES = fallback
     std::array<u64, NUM_TABLES + 1> provider_count{};
     std::array<u64, NUM_TABLES + 1> provider_correct{};
 
@@ -72,7 +76,7 @@ struct TAMonitor {
     u64 alloc_attempts = 0;
     u64 alloc_success = 0;
     u64 alloc_fail = 0;
-    u64 alloc_blocked = 0; // mispredict but bimodal was provider (no candidate)
+    u64 alloc_blocked = 0; // mispredict but fallback was provider (no candidate)
     std::array<u64, NUM_TABLES> alloc_per_table{};
     // Cascade: alloc_from_provider[i] = allocations when Ti was provider
     std::array<u64, NUM_TABLES + 1> alloc_from_provider{};
@@ -100,6 +104,11 @@ struct TAMonitor {
   // Table occupancy tracking
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> tage_occupied{};
   std::array<u64, NUM_TABLES> tage_unique_entries{};
+
+  // Fallback occupancy (gshare mode only)
+  std::bitset<FB_CAPACITY> fb_occupied{};
+  u64 fb_unique_entries = 0;
+  u64 fb_writes = 0;
 
   // Unique branch PCs
   std::unordered_set<u64> unique_branch_pcs;
@@ -260,6 +269,15 @@ struct TAMonitor {
     }
   }
 
+  // Fallback write — track occupancy
+  void record_fb_write(u64 index) {
+    fb_writes++;
+    if (index < FB_CAPACITY && !fb_occupied.test(index)) {
+      fb_occupied.set(index);
+      fb_unique_entries++;
+    }
+  }
+
   // u-bit write
   void record_u_write(u64 table, bool new_u) {
     if (new_u) {
@@ -293,7 +311,7 @@ struct TAMonitor {
   // ======== Helpers ========
 
   static u64 decode_provider(u64 one_hot) {
-    if (one_hot == 0) return NUM_TABLES; // bimodal fallback
+    if (one_hot == 0) return NUM_TABLES; // fallback (bimodal or gshare)
     for (u64 i = 0; i <= NUM_TABLES; i++)
       if (one_hot & (u64(1) << i)) return i;
     return NUM_TABLES;
@@ -308,7 +326,7 @@ struct TAMonitor {
   void print_window(std::ostream &os) {
     if (!header_printed) {
       os << "# win,br,misp%,MPKI,extra%,i/blk,br/blk,true_blk%,";
-      os << "bim%,";
+      os << (USE_GSHARE ? "gs%," : "bim%,");
       for (u64 i = 0; i < NUM_TABLES; i++)
         os << "T" << i << "%,";
       os << "alloc_ok%,acc_avg,alloc_avg";
@@ -408,7 +426,7 @@ struct TAMonitor {
           "| SecMatch% | FullMatch%\n";
     os << "  ----------+-----------+-----------+----------+-----------"
           "+-----------+-----------\n";
-    os << "  Bimodal   |" << std::setw(10) << c.provider_count[NUM_TABLES]
+    os << "  " << FB_NAME_PAD << "  |" << std::setw(10) << c.provider_count[NUM_TABLES]
        << " |" << std::setw(10) << c.provider_correct[NUM_TABLES] << " |"
        << std::setw(7)
        << pct(c.provider_correct[NUM_TABLES], c.provider_count[NUM_TABLES])
@@ -485,7 +503,7 @@ struct TAMonitor {
     for (u64 p = 0; p <= NUM_TABLES; p++) {
       if (c.alloc_from_provider[p] == 0) continue;
       if (p == NUM_TABLES)
-        os << "  Bimodal   |";
+        os << "  " << FB_NAME_PAD << "  |";
       else
         os << "  T" << p << std::setw(8 - (p >= 10 ? 2 : 1)) << "" << "|";
       os << std::setw(8) << c.alloc_from_provider[p] << " |";
@@ -507,6 +525,15 @@ struct TAMonitor {
          << pct(c.provider_correct[i], c.provider_count[i]) << "%"
          << " |" << std::setw(7) << c.alloc_per_table[i] << "\n";
     }
+
+    // Fallback occupancy
+    os << "\n" << FB_NAME << " Fallback (" << FB_CAPACITY << " entries):\n";
+    os << "  Writes: " << fb_writes
+       << "  Occupied: " << fb_unique_entries
+       << " (" << pct(fb_unique_entries, FB_CAPACITY) << "%)\n";
+    os << "  Accuracy: " << c.provider_correct[NUM_TABLES] << "/"
+       << c.provider_count[NUM_TABLES] << " ("
+       << pct(c.provider_correct[NUM_TABLES], c.provider_count[NUM_TABLES]) << "%)\n";
 
     // u-bit
     os << "\nU-bit:\n";

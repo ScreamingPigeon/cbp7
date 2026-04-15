@@ -32,7 +32,7 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
 
     // Resolution chain
     d("full_hits", pp.dbg_full_hits.time());
-    d("bim_pred", pp.dbg_bim_pred.time());
+    d("fb_pred", pp.dbg_fb_pred.time());
     d("match (concat)", pp.dbg_match.time());
     d("match1 (one_hot)", pp.dbg_match1.time());
     d("match2 (one_hot)", pp.dbg_match2.time());
@@ -58,7 +58,7 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
     d("uclearmask", pp.dbg_uclearmask.time());
 
     // Train write gates (worst across tables)
-    d("bim_write (gate)", pp.dbg_bim_write.time());
+    d("fb_write (gate)", pp.dbg_fb_write.time());
     d("meta_write (gate)", pp.dbg_meta_write.time());
     {
         uint64_t wp = 0, wh = 0, wt = 0, wu = 0, wdf = 0, wdm = 0;

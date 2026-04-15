@@ -42,7 +42,7 @@ struct TATableConfig {
 // P1 = P2: both return the same reg-based prediction (P2 < 1 cycle).
 // predict1 reads TAGE tables for the NEXT block (ahead pipeline).
 // predict2/predict1 return prediction from regs written in previous predict1.
-// Fallback on secondary tag miss: bimodal (ahead-pipelined).
+// Fallback on secondary tag miss: bimodal or gshare (ahead-pipelined).
 //
 // Self-contained: no dependency on common.hpp or TageTable.hpp.
 // Follows gshareN_ahead_best pipeline pattern.
@@ -57,7 +57,9 @@ template <
     u64 CTR_WIDTH = 1,           // prediction counter width per lane
     u64 HYST_WIDTH = 2,          // hysteresis width (separate from ctr)
     u64 U_WIDTH = 1,             // usefulness counter width
-    u64 BIMODAL_CAPACITY = 8192, // bimodal fallback table size
+    u64 FB_CAPACITY = 8192, // fallback table size (bimodal or gshare)
+    bool USE_GSHARE = false,     // use gshare base (PC^history) vs bimodal (PC)
+    u64 GS_HIST = 16,           // gshare history length (only when USE_GSHARE)
     u64 META_WIDTH = 4,          // meta counter width (provider vs alt)
     u64 META_CAPACITY = 256,     // meta table entries
     u64 META_PIPE = 2,           // meta pipeline depth
@@ -92,11 +94,15 @@ struct TageAhead : predictor {
   static constexpr u64 MAX_TABLE_SIZE = ta::array_max(TableCfg::TABLE_SIZE);
   static constexpr u64 MAX_IDX_BITS = ta::clog2(MAX_TABLE_SIZE);
 
-  static constexpr u64 MATCH_BITS = NT + 1; // NT tables + bimodal
+  static constexpr u64 MATCH_BITS = NT + 1; // NT tables + fallback
 
   // Per-bit gh fanout: only fanout bits each table actually reads
-  static constexpr auto GH_FANOUT =
-      ta::gh_per_bit_fanout<MAXHIST, NT, TableCfg::HIST_LEN>();
+  static constexpr auto GH_FANOUT = []() {
+    auto fo = ta::gh_per_bit_fanout<MAXHIST, NT, TableCfg::HIST_LEN>();
+    if constexpr (USE_GSHARE)
+      fo[GS_HIST - 1] += 1; // fb_fold reads gh[GS_HIST-1]
+    return fo;
+  }();
 
   // Prediction bits per entry: one CTR_WIDTH counter per branch
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -109,7 +115,7 @@ struct TageAhead : predictor {
                                            U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
                                            std::make_index_sequence<NT>>::type;
   Tables tables;
-  hcm::ram<val<N>, BIMODAL_CAPACITY> bim_ctr{"bim"};
+  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
   ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
 
   // ======================================================================
@@ -118,12 +124,19 @@ struct TageAhead : predictor {
   // ---- Global History (shared, folds live in per-table TATable) ----
   ta_global_history<MAXHIST> gh;
 
-  // ---- Bimodal Fallback (ahead-pipelined) ----
-  reg<PRED_BITS> prefetch_bim;
-  reg<PRED_BITS> current_bim;
-  static constexpr u64 BIM_IDX_BITS = ta::clog2(BIMODAL_CAPACITY);
-  reg<BIM_IDX_BITS> prefetch_bim_idx;
-  reg<BIM_IDX_BITS> current_bim_idx;
+  // ---- Fallback Predictor (ahead-pipelined) ----
+  // USE_GSHARE=false: bimodal (PC-indexed)
+  // USE_GSHARE=true:  gshare (PC ^ folded_history indexed)
+  reg<PRED_BITS> prefetch_fb;
+  reg<PRED_BITS> current_fb;
+  static constexpr u64 FB_IDX_BITS = ta::clog2(FB_CAPACITY);
+  reg<FB_IDX_BITS> prefetch_fb_idx;
+  reg<FB_IDX_BITS> current_fb_idx;
+
+  // Gshare fold register — folds GS_HIST bits of global history into
+  // FB_IDX_BITS for the fallback index. Zero cost when USE_GSHARE=false
+  // (constexpr-gated, no reads/writes occur).
+  ta_folded_gh<FB_IDX_BITS> fb_fold;
 
   // Piped PC for allocation tag recomputation (stores inst_pc >> 2)
   static constexpr u64 ALLOC_PC_BITS = MAX_TAG_WIDTH + 2;
@@ -176,8 +189,8 @@ struct TageAhead : predictor {
   reg<MAX_IDX_BITS> train_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT];
   reg<U_WIDTH> train_u[NT];
-  reg<PRED_BITS> train_bim;
-  reg<BIM_IDX_BITS> train_bim_idx;
+  reg<PRED_BITS> train_fb;
+  reg<FB_IDX_BITS> train_fb_idx;
   reg<ALLOC_PC_BITS> train_pc;
   reg<MAX_TAG_WIDTH> train_ctag[NT]; // piped computed tag for allocation
 
@@ -217,7 +230,7 @@ struct TageAhead : predictor {
 // ---- Timing debug taps (zero cost in normal builds) ----
 #ifdef TIMING_DEBUG
   reg<1> dbg_full_hits;     // after per-table hit computation
-  reg<1> dbg_bim_pred;      // after bimodal read
+  reg<1> dbg_fb_pred;      // after fallback read
   reg<1> dbg_match;         // after concat into match bitmask
   reg<1> dbg_match1;        // after one_hot (provider)
   reg<1> dbg_match2;        // after one_hot (alt)
@@ -250,7 +263,7 @@ struct TageAhead : predictor {
   reg<1> dbg_noalloc;       // candallocmask == 0
   reg<1> dbg_uclearmask;    // u-clear fallback
   // Train write chain (per-table)
-  reg<1> dbg_bim_write;      // bim_ctr.write gate
+  reg<1> dbg_fb_write;      // fb_ctr.write gate
   reg<1> dbg_meta_write;     // meta_ctr.write gate
   reg<1> dbg_pred_write[NT]; // pred_ram.write gate per table
   reg<1> dbg_hyst_write[NT]; // hyst_ram.write gate per table
@@ -263,7 +276,7 @@ struct TageAhead : predictor {
 #endif
 
 #ifdef TAGE_MONITOR
-  TAMonitor<NT, N, MAX_TABLE_SIZE> mon;
+  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY> mon;
   ~TageAhead() { mon.print_summary(); }
 #endif
 
@@ -282,7 +295,7 @@ struct TageAhead : predictor {
     mon.record_predict1();
 #endif
     inst_pc.fanout(
-        hard<2 * NT + 1>{}); // 2 reads per table (>>2, >>4) + bimodal (>>2)
+        hard<2 * NT + 1>{}); // 2 reads per table (>>2, >>4) + fb (>>2)
 
 #ifdef TIMING_DEBUG
     dbg_inst_pc = val<1>{inst_pc};
@@ -333,10 +346,16 @@ struct TageAhead : predictor {
       prefetch_u[I] = t.u_ram.read(idx);
     });
 
-    // Bimodal ahead read (direct-mapped, no tag match needed)
-    auto bim_idx = val<BIM_IDX_BITS>{inst_pc >> 2};
-    prefetch_bim_idx = bim_idx;
-    prefetch_bim = bim_ctr.read(bim_idx);
+    // Fallback ahead read (direct-mapped, no tag match needed)
+    // USE_GSHARE: index = PC ^ folded_history; bimodal: index = PC
+    auto fb_idx = [&]() {
+      if constexpr (USE_GSHARE)
+        return val<FB_IDX_BITS>{inst_pc >> 2} ^ fb_fold.get();
+      else
+        return val<FB_IDX_BITS>{inst_pc >> 2};
+    }();
+    prefetch_fb_idx = fb_idx;
+    prefetch_fb = fb_ctr.read(fb_idx);
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
 
     // Crit path: just read precomputed prediction from reg
@@ -404,8 +423,8 @@ struct TageAhead : predictor {
         train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I]} ==
                             val<SEC_TAG_BITS>{curr_sec_tag});
     });
-    train_bim = current_bim;
-    train_bim_idx = current_bim_idx;
+    train_fb = current_fb;
+    train_fb_idx = current_fb_idx;
     train_pc = current_pc;
 
     static_loop<NT>([&]<u64 I>() {
@@ -419,8 +438,8 @@ struct TageAhead : predictor {
       current_u[I] = prefetch_u[I];
       current_ctag[I] = prefetch_ctag[I];
     });
-    current_bim = prefetch_bim;
-    current_bim_idx = prefetch_bim_idx;
+    current_fb = prefetch_fb;
+    current_fb_idx = prefetch_fb_idx;
     current_pc = prefetch_pc;
 
     // Precompute secondary tag for next block
@@ -438,7 +457,7 @@ struct TageAhead : predictor {
     // We cannot reassign val<N> (private operator=), so we avoid
     // accumulation loops. Instead:
     //   1. Compute per-table hit bits → arr<val<1>, NT>
-    //   2. Concat into val<NT+1> with bimodal as MSB always-hit
+    //   2. Concat into val<NT+1> with fallback as MSB always-hit
     //   3. one_hot() → lowest set bit = longest-history hit = provider
     //   4. one_hot() on remainder → alt
     //   5. Replicate one-hot bits to PRED_BITS width, AND with each
@@ -476,18 +495,18 @@ struct TageAhead : predictor {
     dbg_full_hits = full_hits[0];
 #endif
 
-    // 3. Bimodal — ahead-pipelined, already in current_bim from pipe shift.
-    val<PRED_BITS> bim_pred = val<PRED_BITS>{current_bim};
+    // 3. Fallback — ahead-pipelined, already in current_fb from pipe shift.
+    val<PRED_BITS> fb_pred = val<PRED_BITS>{current_fb};
 
 #ifdef TIMING_DEBUG
-    dbg_bim_pred = val<1>{bim_pred};
+    dbg_fb_pred = val<1>{fb_pred};
 #endif
 
     // 4. Build match bitmask.
     //    Bit layout of val<NT+1>:
     //      bit 0     = table 0 (longest history)
     //      bit NT-1  = table NT-1 (shortest history)
-    //      bit NT    = bimodal (always 1 — fallback)
+    //      bit NT    = fallback (always 1)
     //    one_hot() returns lowest set bit → longest-history hit = provider.
     //    Second one_hot() on (match ^ match1) → alt provider.
     val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
@@ -503,12 +522,12 @@ struct TageAhead : predictor {
     dbg_match2 = val<1>{match2};
 #endif
 
-    // 5. Prediction array: one PRED_BITS-wide entry per table + bimodal.
-    //    table_preds[0..NT-1] = TAGE tables, table_preds[NT] = bimodal.
+    // 5. Prediction array: one PRED_BITS-wide entry per table + fallback.
+    //    table_preds[0..NT-1] = TAGE tables, table_preds[NT] = fallback.
     arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
       if (i < NT)
         return val<PRED_BITS>{current_pred[i]};
-      return val<PRED_BITS>{bim_pred};
+      return val<PRED_BITS>{fb_pred};
     };
 
     // 6. Extract provider and alt predictions.
@@ -535,7 +554,7 @@ struct TageAhead : predictor {
 #endif
 
     // 7. Provider weakness: newly allocated entry = hyst==0 AND u==0.
-    //    Only check the provider table (mask by match1 bit). Bimodal
+    //    Only check the provider table (mask by match1 bit). Fallback
     //    (index NT) is never considered "weak".
     arr<val<1>, NT + 1> weak_arr = [&](u64 i) -> val<1> {
       if (i < NT)
@@ -547,8 +566,8 @@ struct TageAhead : predictor {
     };
     val<1> provider_weak = weak_arr.fold_or();
 
-    // 8. has_alt: does the alt match point to a TAGE table (not bimodal)?
-    //    Mask out the bimodal bit (MSB) and check if anything remains.
+    // 8. has_alt: does the alt match point to a TAGE table (not fallback)?
+    //    Mask out the fallback bit (MSB) and check if anything remains.
     val<1> has_alt =
         (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
 
@@ -576,9 +595,9 @@ struct TageAhead : predictor {
 
     // 10. Final prediction mux.
     //     If provider is newly allocated AND meta says use alt AND
-    //     alt is a real TAGE hit (not just bimodal) → use alt_pred.
-    //     Otherwise → provider_pred (which is bimodal if no TAGE hit,
-    //     since match1 falls through to the bimodal bit).
+    //     alt is a real TAGE hit (not just fallback) → use alt_pred.
+    //     Otherwise → provider_pred (which is fallback if no TAGE hit,
+    //     since match1 falls through to the fallback bit).
     val<1> use_alt = provider_weak & meta_use_alt & has_alt;
     val<PRED_BITS> final_pred = select(use_alt, alt_pred, provider_pred);
 
@@ -645,13 +664,15 @@ struct TageAhead : predictor {
     // ---- No conditional branches: update history, skip training ----
     if (num_branch == 0) {
       val<PATHBITS> path_bits = val<PATHBITS>{block_end_info.next_pc >> 2};
-      path_bits.fanout(hard<NT * 2 + 1>{});
+      path_bits.fanout(hard<NT * 2 + 1 + (USE_GSHARE ? 1 : 0)>{});
       gh.template fanout_per_bit<GH_FANOUT>();
       static_loop<NT>([&]<u64 I>() {
         auto &t = std::get<I>(tables);
         t.fold_idx.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
         t.fold_tag.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
       });
+      if constexpr (USE_GSHARE)
+        fb_fold.update(gh, hard<GS_HIST>{}, path_bits);
       gh.update(path_bits);
       last_condbr_dir = 0;
       true_block = 1;
@@ -728,22 +749,26 @@ struct TageAhead : predictor {
       u64 at = static_cast<u64>(alloc_target);
       mon.record_allocation(at != 0, at);
       // Provider index for cascade tracking
-      u64 prov_idx = TAMonitor<NT, N, MAX_TABLE_SIZE>::decode_provider(
+      u64 prov_idx = TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY>::decode_provider(
           static_cast<u64>(t_match1));
       if (static_cast<u64>(mispredict)) {
         if (static_cast<u64>(misp_alloc) == 0)
-          mon.record_alloc_blocked(); // bimodal was provider, no candidates
+          mon.record_alloc_blocked(); // fallback was provider, no candidates
         mon.record_alloc_cascade(prov_idx, at);
       }
     }
 #endif
 
-    // ---- Step 4: Bimodal update (mispredict + bimodal is provider only) ----
-    val<1> bim_changed = actual_dir != val<PRED_BITS>{train_bim};
-    val<1> bim_gate = do_train & t_m1[NT] & mispredict & bim_changed;
-    execute_if(bim_gate, [&]() {
-      bim_ctr.write(val<BIM_IDX_BITS>{train_bim_idx}, actual_dir);
+    // ---- Step 4: Fallback update (mispredict + fallback is provider only) ----
+    val<1> fb_changed = actual_dir != val<PRED_BITS>{train_fb};
+    val<1> fb_gate = do_train & t_m1[NT] & mispredict & fb_changed;
+    execute_if(fb_gate, [&]() {
+      fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir);
     });
+#ifdef TAGE_MONITOR
+    if (static_cast<u64>(fb_gate))
+      mon.record_fb_write(static_cast<u64>(val<FB_IDX_BITS>{train_fb_idx}));
+#endif
 
     // ---- Step 5: Meta counter update ----
     auto old_meta = val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]};
@@ -754,7 +779,7 @@ struct TageAhead : predictor {
                      hard<0>{});
     });
 #ifdef TIMING_DEBUG
-    dbg_bim_write = bim_gate;
+    dbg_fb_write = fb_gate;
     dbg_meta_write = meta_gate;
 #endif
 
@@ -944,8 +969,8 @@ struct TageAhead : predictor {
     // correct_pred) to avoid timing bleed from old_pred reg reads
     true_block = ~mispredict | val<1>{branch_dir[num_branch - 1]} | line_end();
     true_block.fanout(
-        hard<NT * 2 + 2>{}); // NT fold_idx + NT fold_tag apply_update muxes +
-                             // gh.update + monitor
+        hard<NT * 2 + 2 + (USE_GSHARE ? 1 : 0)>{}); // NT fold_idx + NT fold_tag apply_update muxes +
+                             // gh.update + monitor + (fb_fold if gshare)
 
 #ifdef TAGE_MONITOR
     if (static_cast<u64>(true_block))
@@ -970,7 +995,7 @@ struct TageAhead : predictor {
                       val<PATHBITS>{block_end_info.next_pc >> 2});
     }();
 
-    hist_input.fanout(hard<NT * 2 + 1>{});
+    hist_input.fanout(hard<NT * 2 + 1 + (USE_GSHARE ? 1 : 0)>{});
     gh.template fanout_per_bit<GH_FANOUT>();
 
 #ifdef TIMING_DEBUG
@@ -1000,6 +1025,10 @@ struct TageAhead : predictor {
       }
 #endif
     });
+    if constexpr (USE_GSHARE) {
+      auto new_fb = fb_fold.compute_update(gh, hard<GS_HIST>{}, hist_input);
+      fb_fold.apply_update(new_fb, true_block);
+    }
     gh.update(hist_input, true_block);
     // std::cerr << "=== EXIT update_cycle ===\n";
   }
