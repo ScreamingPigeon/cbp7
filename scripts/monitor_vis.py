@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Visualize TDMonitor windowed CSV output as line graphs."""
+"""Visualize TAMonitor windowed CSV output as line graphs and histograms."""
 
 import sys
 import csv
 import matplotlib.pyplot as plt
+import numpy as np
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "out/monitor_csv.txt"
@@ -21,6 +22,9 @@ def main():
                 continue
             if line.startswith("#"):
                 continue
+            # Stop at non-CSV summary section
+            if line.startswith("=") or line.startswith("Instructions"):
+                break
             rows.append(line.split(","))
 
     if not headers or not rows:
@@ -28,7 +32,6 @@ def main():
         return
 
     # Parse into columns
-    ncols = len(headers)
     data = {h: [] for h in headers}
     for row in rows:
         for i, h in enumerate(headers):
@@ -38,40 +41,188 @@ def main():
                 data[h].append(0.0)
 
     wins = data.get("win", list(range(len(rows))))
+    nwin = len(wins)
 
-    # Group columns for subplots
-    groups = [
-        ("Misprediction Rate", [h for h in headers if h == "misp%"]),
-        ("Extra Cycle Rate", [h for h in headers if h == "extra%"]),
-        ("Block Structure", [h for h in headers if h in ("i/blk", "br/blk")]),
-        ("Provider Distribution", [h for h in headers if h.endswith("%") and
-                                    (h.startswith("T") or h.startswith("p1%"))
-                                    and h not in ("misp%", "extra%", "p1acc%", "p1p2dis%")]),
-        ("P1 Accuracy & Disagree", [h for h in headers if h in ("p1acc%", "p1p2dis%")]),
-        ("Allocation", [h for h in headers if h == "alloc_ok%"]),
-    ]
+    # Detect table columns (T0%, T1%, ... or gs%/bim%)
+    table_cols = [h for h in headers if
+                  (h.startswith("T") and h.endswith("%") and
+                   h not in ("true_blk%",) and
+                   not h.startswith("Tlast"))]
+    fb_col = next((h for h in headers if h in ("gs%", "bim%")), None)
 
-    # Filter out empty groups
-    groups = [(name, cols) for name, cols in groups if cols]
+    # ---- Build figure layout ----
+    # Row 1: MPKI + misp% (dual axis) | Provider distribution stacked area
+    # Row 2: Allocation + pressure     | Entry table health (lifetime)
+    # Row 3: Collision + utilization   | Per-window stuck/hard PCs
+    # Row 4: Histograms — MPKI distribution, provider share pie
 
-    fig, axes = plt.subplots(len(groups), 1, figsize=(12, 3 * len(groups)),
-                              sharex=True)
-    if len(groups) == 1:
-        axes = [axes]
+    fig = plt.figure(figsize=(16, 18))
+    gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.3)
 
-    for ax, (name, cols) in zip(axes, groups):
-        for col in cols:
-            ax.plot(wins, data[col], label=col, linewidth=0.8)
-        ax.set_ylabel(name)
-        ax.legend(loc="upper right", fontsize=7)
-        ax.grid(True, alpha=0.3)
+    # ================================================================
+    # (0,0) MPKI & Misprediction Rate
+    # ================================================================
+    ax1 = fig.add_subplot(gs[0, 0])
+    if "MPKI" in data:
+        ax1.plot(wins, data["MPKI"], color="#d62728", linewidth=1.2, label="MPKI")
+        ax1.set_ylabel("MPKI", color="#d62728")
+        ax1.tick_params(axis="y", labelcolor="#d62728")
+    if "misp%" in data:
+        ax1b = ax1.twinx()
+        ax1b.plot(wins, data["misp%"], color="#1f77b4", linewidth=1.0,
+                  alpha=0.7, label="misp%")
+        ax1b.set_ylabel("Misprediction %", color="#1f77b4")
+        ax1b.tick_params(axis="y", labelcolor="#1f77b4")
+    ax1.set_title("Prediction Quality")
+    ax1.grid(True, alpha=0.2)
 
-    axes[-1].set_xlabel("Window")
-    fig.suptitle(f"TDMonitor — {path}", fontsize=11)
-    fig.tight_layout()
+    # ================================================================
+    # (0,1) Provider Distribution — stacked area
+    # ================================================================
+    ax2 = fig.add_subplot(gs[0, 1])
+    prov_cols = []
+    if fb_col and fb_col in data:
+        prov_cols.append(fb_col)
+    # Add table cols in reverse order (longest history first)
+    prov_cols.extend(reversed(table_cols))
+    if prov_cols:
+        stack_data = np.array([data[c] for c in prov_cols])
+        colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(prov_cols)))
+        ax2.stackplot(wins, stack_data, labels=prov_cols, colors=colors, alpha=0.8)
+        ax2.set_ylabel("Provider Share %")
+        ax2.set_title("Provider Distribution")
+        ax2.legend(loc="upper right", fontsize=6, ncol=3)
+        ax2.set_ylim(0, 105)
+    ax2.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (1,0) Allocation Success + Pressure Counters
+    # ================================================================
+    ax3 = fig.add_subplot(gs[1, 0])
+    if "alloc_ok%" in data:
+        ax3.plot(wins, data["alloc_ok%"], color="#2ca02c", linewidth=1.2,
+                 label="alloc_ok%")
+    ax3.set_ylabel("Allocation Success %", color="#2ca02c")
+    ax3.tick_params(axis="y", labelcolor="#2ca02c")
+    ax3.set_title("Allocation & Pressure")
+    ax3b = ax3.twinx()
+    if "acc_avg" in data:
+        ax3b.plot(wins, data["acc_avg"], color="#ff7f0e", linewidth=0.8,
+                  alpha=0.7, label="acc_avg", linestyle="--")
+    if "alloc_avg" in data:
+        ax3b.plot(wins, data["alloc_avg"], color="#9467bd", linewidth=0.8,
+                  alpha=0.7, label="alloc_avg", linestyle="--")
+    ax3b.set_ylabel("Counter Avg")
+    lines3a = ax3.get_legend_handles_labels()
+    lines3b = ax3b.get_legend_handles_labels()
+    ax3.legend(lines3a[0] + lines3b[0], lines3a[1] + lines3b[1],
+               loc="upper right", fontsize=7)
+    ax3.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (1,1) Entry Table Health — lifetime metrics
+    # ================================================================
+    ax4 = fig.add_subplot(gs[1, 1])
+    has_lifetime = any(k in data for k in ("Tlast_zu%", "Tlast_avgp", "Tlast_evict"))
+    if "Tlast_zu%" in data:
+        ax4.plot(wins, data["Tlast_zu%"], color="#d62728", linewidth=1.2,
+                 label="Zero-Use Eviction %")
+    if "Tlast_evict" in data:
+        ax4_b = ax4.twinx()
+        ax4_b.plot(wins, data["Tlast_evict"], color="#1f77b4", linewidth=0.8,
+                   alpha=0.6, label="Evictions")
+        if "Tlast_avgp" in data:
+            ax4_b.plot(wins, data["Tlast_avgp"], color="#2ca02c", linewidth=0.8,
+                       alpha=0.6, label="Avg Preds/Entry")
+        ax4_b.set_ylabel("Count")
+        lines4a = ax4.get_legend_handles_labels()
+        lines4b = ax4_b.get_legend_handles_labels()
+        ax4.legend(lines4a[0] + lines4b[0], lines4a[1] + lines4b[1],
+                   loc="upper right", fontsize=7)
+    ax4.set_ylabel("Zero-Use %")
+    ax4.set_title("Entry Table (Tlast) Health")
+    ax4.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (2,0) Collision Rate + Entry Utilization
+    # ================================================================
+    ax5 = fig.add_subplot(gs[2, 0])
+    if "coll%" in data:
+        ax5.plot(wins, data["coll%"], color="#e377c2", linewidth=1.2,
+                 label="Collision %")
+        ax5.set_ylabel("Collision %", color="#e377c2")
+    if "Tlast_used" in data:
+        ax5b = ax5.twinx()
+        ax5b.plot(wins, data["Tlast_used"], color="#17becf", linewidth=1.0,
+                  label="Entries Used")
+        ax5b.set_ylabel("Entries w/ Tag Match")
+        lines5a = ax5.get_legend_handles_labels()
+        lines5b = ax5b.get_legend_handles_labels()
+        ax5.legend(lines5a[0] + lines5b[0], lines5a[1] + lines5b[1],
+                   loc="upper right", fontsize=7)
+    ax5.set_title("Collision Rate & Entry Utilization")
+    ax5.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (2,1) Per-Window Stuck & Hard PCs
+    # ================================================================
+    ax6 = fig.add_subplot(gs[2, 1])
+    if "win_stuck" in data:
+        ax6.bar(wins, data["win_stuck"], width=0.8, alpha=0.7,
+                color="#d62728", label="Stuck PCs (no alloc, has misp)")
+    if "win_hard" in data:
+        ax6.bar(wins, data["win_hard"], width=0.4, alpha=0.7,
+                color="#ff7f0e", label="Hard PCs (<60% bias)")
+    ax6.set_ylabel("PC Count")
+    ax6.set_title("Per-Window Problem Branches")
+    ax6.legend(loc="upper right", fontsize=7)
+    ax6.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (3,0) MPKI Histogram
+    # ================================================================
+    ax7 = fig.add_subplot(gs[3, 0])
+    if "MPKI" in data:
+        mpki_vals = data["MPKI"]
+        ax7.hist(mpki_vals, bins=30, color="#1f77b4", alpha=0.7, edgecolor="black",
+                 linewidth=0.5)
+        ax7.axvline(np.mean(mpki_vals), color="#d62728", linestyle="--",
+                    linewidth=1.5, label=f"Mean: {np.mean(mpki_vals):.1f}")
+        ax7.axvline(np.median(mpki_vals), color="#2ca02c", linestyle="--",
+                    linewidth=1.5, label=f"Median: {np.median(mpki_vals):.1f}")
+        ax7.set_xlabel("MPKI")
+        ax7.set_ylabel("Window Count")
+        ax7.set_title("MPKI Distribution Across Windows")
+        ax7.legend(fontsize=8)
+    ax7.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (3,1) Average Provider Share — horizontal bar
+    # ================================================================
+    ax8 = fig.add_subplot(gs[3, 1])
+    if prov_cols:
+        avg_shares = [np.mean(data[c]) for c in prov_cols]
+        colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(prov_cols)))
+        y_pos = np.arange(len(prov_cols))
+        ax8.barh(y_pos, avg_shares, color=colors, alpha=0.8, edgecolor="black",
+                 linewidth=0.3)
+        ax8.set_yticks(y_pos)
+        ax8.set_yticklabels(prov_cols, fontsize=8)
+        ax8.set_xlabel("Average Provider Share %")
+        ax8.set_title("Mean Provider Distribution")
+        for i, v in enumerate(avg_shares):
+            if v > 1.0:
+                ax8.text(v + 0.3, i, f"{v:.1f}%", va="center", fontsize=7)
+    ax8.grid(True, alpha=0.2, axis="x")
+
+    # ---- Common x-label ----
+    for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
+        ax.set_xlabel("Window", fontsize=8)
+
+    fig.suptitle(f"TAMonitor Dashboard — {path}", fontsize=13, fontweight="bold")
 
     out = path.rsplit(".", 1)[0] + ".png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     print(f"Saved to {out}")
     plt.show()
 

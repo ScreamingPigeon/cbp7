@@ -32,7 +32,7 @@ REGION_SHIFT ?= 12
 PRED_HASH := $(shell echo '$(PREDICTOR_TYPE)|$(EXTRA_COMMON_FLAGS)|$(EXTRA_CBP_FLAGS)' | md5sum | cut -c1-8)
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report timing-probe run-timing-probe save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report timing-probe run-timing-probe psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -179,7 +179,7 @@ endif
 	@echo "Files: $(MONITOR_OUT), out/monitor_csv.txt"
 
 monitor-vis:
-	python3 scripts/monitor_vis.py out/monitor_csv.txt
+	python3 scripts/monitor_vis.py $(MONITOR_OUT)
 
 # Timing probe: datapath delay breakdown with TIMING_DEBUG
 TIMING_FLAGS := -DTIMING_DEBUG
@@ -272,6 +272,32 @@ gradient:
 
 gradient-report:
 	$(PYTHON) scripts/gradient_ascent.py --report out/gradient/results.csv --top 20
+
+# TageAhead iterative parameter sweep (ALWAYS x PERTURBED, two-phase timing+eval)
+PSWEEP_CONFIG ?= sweep_config.json
+PSWEEP_JOBS ?= $(shell nproc)
+PSWEEP_TOP ?= 20
+
+psweep-init:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --init
+
+psweep-generate:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --generate -j $(PSWEEP_JOBS)
+
+psweep-timing:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --timing -j $(PSWEEP_JOBS)
+
+psweep-eval:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --eval -j $(PSWEEP_JOBS)
+
+psweep-run:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --run -j $(PSWEEP_JOBS)
+
+psweep-resume:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --resume -j $(PSWEEP_JOBS)
+
+psweep-report:
+	$(PYTHON) scripts/param_sweep.py --config $(PSWEEP_CONFIG) --report --top $(PSWEEP_TOP)
 
 SAVE_DIR := $(BUILD_DIR)/saved
 SAVE_NAME ?= $(shell date +%Y%m%d_%H%M%S)

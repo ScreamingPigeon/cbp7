@@ -13,7 +13,7 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 12, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 8,
+template <u64 N = 8, u64 SIZE = 1024, u64 TAG = 10, u64 MINH = 10,
           u64 MAXH = 100, u64 SIZE_RATIO = 1,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::GradedTag<TAG, TAG - 1>,
@@ -60,7 +60,7 @@ template <
     u64 FB_CAPACITY = 8192,  // fallback table size (bimodal or gshare)
     bool USE_GSHARE = true,  // use gshare base (PC^history) vs bimodal (PC)
     u64 GS_HIST = 6,         // gshare history length (only when USE_GSHARE)
-    u64 META_WIDTH = 4,      // meta counter width (provider vs alt)
+    u64 META_WIDTH = 5,      // meta counter width (provider vs alt)
     u64 META_CAPACITY = 256, // meta table entries
     u64 META_PIPE = 2,       // meta pipeline depth
     u64 LINEINST = 1024,     // line size in instructions
@@ -299,6 +299,7 @@ struct TageAhead : predictor {
   val<1> predict1([[maybe_unused]] val<64> inst_pc) {
 #ifdef TAGE_MONITOR
     mon.record_predict1();
+    mon.shadow_block_pc = static_cast<u64>(inst_pc);
 #endif
     inst_pc.fanout(
         hard<2 * NT + 1>{}); // 2 reads per table (>>2, >>4) + fb (>>2)
@@ -405,7 +406,8 @@ struct TageAhead : predictor {
     assert(num_branch < N);
     branch_dir[num_branch] = taken.fo1();
 #ifdef TAGE_MONITOR
-    mon.record_branch_pc(static_cast<u64>(branch_pc));
+    mon.record_branch_info(num_branch, static_cast<u64>(branch_pc),
+                           static_cast<u64>(taken));
 #endif
     num_branch++;
     reuse_prediction(~line_end() & val<1>{num_branch < N});
@@ -447,6 +449,10 @@ struct TageAhead : predictor {
     current_fb = prefetch_fb;
     current_fb_idx = prefetch_fb_idx;
     current_pc = prefetch_pc;
+
+#ifdef TAGE_MONITOR
+    mon.shift_block_pc();
+#endif
 
     // Precompute secondary tag for next block
     if constexpr (USE_SEC_TAG) {
@@ -494,6 +500,10 @@ struct TageAhead : predictor {
       } else {
         mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
       }
+      // Feature 7: tag collision check
+      mon.record_collision_check(
+          i, static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]}),
+          static_cast<u64>(current_tag_hit[i]));
     }
 #endif
 
@@ -631,6 +641,20 @@ struct TageAhead : predictor {
       mon.record_prediction(r, static_cast<u64>(match1),
                             static_cast<u64>(match2), meta_overrode, meta_chose,
                             pred_taken);
+    }
+    // Feature 5: Record provider entry usage for lifetime tracking
+    {
+      u64 m1v = static_cast<u64>(match1);
+      u64 prov = decltype(mon)::decode_provider(m1v);
+      if (prov < NT) {
+        u64 prov_index = static_cast<u64>(val<MAX_IDX_BITS>{current_idx[prov]});
+        u64 fp = static_cast<u64>(final_pred);
+        u64 nc = 0;
+        for (u64 r = 0; r < num_branch; r++)
+          if (((fp >> r) & 1) == static_cast<u64>(branch_dir[r]))
+            nc++;
+        mon.record_provider_entry(prov, prov_index, num_branch, nc);
+      }
     }
 #endif
 
@@ -894,9 +918,11 @@ struct TageAhead : predictor {
                           val<SEC_TAG_BITS>{curr_sec_tag});
       });
 #ifdef TAGE_MONITOR
-      if (static_cast<u64>(do_train & do_alloc))
-        mon.record_tage_write(I,
-                              static_cast<u64>(val<t.IDX_BITS>{train_idx[I]}));
+      if (static_cast<u64>(do_train & do_alloc)) {
+        u64 tidx = static_cast<u64>(val<t.IDX_BITS>{train_idx[I]});
+        mon.record_tage_write(I, tidx);
+        mon.record_entry_alloc_diag(I, tidx);
+      }
 #endif
 
       // u_ram: combined provider update + allocation + uclear + decay

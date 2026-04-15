@@ -3,12 +3,15 @@
 // Gated by -DTAGE_MONITOR at compile time.
 // All counters are plain C++ types (zero HARCOM cost).
 
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using u64 = uint64_t;
 
@@ -23,6 +26,26 @@ struct TAMonitor {
 
   static constexpr u64 MAX_BLOCK_INSTR = 64;
   static constexpr u64 MAX_BLOCK_BR = N + 1;
+
+  // Feature 5: Lifetime stats (defined before Counters so it can be embedded)
+  struct LifetimeStats {
+    u64 evictions = 0;
+    u64 total_preds = 0;
+    u64 total_correct = 0;
+    u64 zero_use = 0; // evicted before serving any prediction
+  };
+
+  // Feature 1+2+3+8: Per-PC diagnostics
+  struct PCDiag {
+    u64 total = 0;
+    u64 misp = 0;
+    u64 taken = 0;         // bias tracking (feature 2)
+    u64 tage_prov = 0;     // TAGE was provider (feature 3)
+    u64 tage_correct = 0;
+    u64 fb_prov = 0;       // fallback was provider
+    u64 fb_correct = 0;
+    u64 alloc_count = 0;   // allocated to TAGE (feature 8)
+  };
 
   // ======== Counters (cumulative + per-window) ========
   struct Counters {
@@ -93,6 +116,15 @@ struct TAMonitor {
     u64 alloc_ctr_sum = 0;
     u64 pressure_samples = 0;
 
+    // Feature 5: Lifetime stats per table
+    std::array<LifetimeStats, NUM_TABLES> lifetime_stats{};
+
+    // Feature 7: Tag collision tracking
+    u64 collision_checks = 0;
+    u64 collision_hits = 0;
+    std::array<u64, NUM_TABLES> per_table_coll_checks{};
+    std::array<u64, NUM_TABLES> per_table_coll_hits{};
+
     void reset() { *this = Counters{}; }
   };
 
@@ -101,7 +133,7 @@ struct TAMonitor {
   u64 window_num = 0;
   bool header_printed = false;
 
-  // Table occupancy tracking
+  // Table occupancy tracking (cumulative only — snapshots)
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> tage_occupied{};
   std::array<u64, NUM_TABLES> tage_unique_entries{};
 
@@ -119,6 +151,31 @@ struct TAMonitor {
   std::array<bool, N> shadow_meta_overrode{};
   std::array<bool, N> shadow_meta_chose_alt{};
   std::array<bool, N> shadow_pred{};
+  std::array<u64, N> shadow_pc{};
+
+  // Per-PC diagnostics (cumulative + per-window)
+  std::unordered_map<u64, PCDiag> pc_diag;
+  std::unordered_map<u64, PCDiag> win_pc_diag;
+
+  // Feature 5: Entry lifetime state (per-entry, not windowed)
+  struct EntryLife {
+    u64 alloc_time = 0;
+    u64 pred_count = 0;
+    u64 correct_count = 0;
+    u64 stored_pc = 0; // full PC for collision detection (feature 7)
+    bool valid = false;
+  };
+  std::array<std::array<EntryLife, MAX_TABLE_ENTRIES>, NUM_TABLES> entry_life{};
+  u64 global_branch_count = 0;
+
+  // Feature 9: Entry utilization (cumulative + per-window)
+  std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> entry_ever_hit{};
+  std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> win_entry_ever_hit{};
+
+  // Block PC pipeline (for collision/lifetime tracking)
+  u64 shadow_block_pc = 0;   // set in predict1
+  u64 current_block_pc = 0;  // shifted in update_cycle
+  u64 train_block_pc = 0;    // shifted in update_cycle
 
   // ======== Recording methods ========
 
@@ -218,14 +275,41 @@ struct TAMonitor {
     record(cum);
     record(win);
 
+    // Per-PC diagnostics (both cumulative and window)
+    u64 pc = shadow_pc[rank];
+    u64 prov = shadow_provider[rank];
+    auto update_pc_diag = [&](PCDiag &d) {
+      d.total++;
+      if (mispredict) d.misp++;
+      if (actual_taken) d.taken++;
+      if (prov < NUM_TABLES) {
+        d.tage_prov++;
+        if (correct) d.tage_correct++;
+      } else {
+        d.fb_prov++;
+        if (correct) d.fb_correct++;
+      }
+    };
+    update_pc_diag(pc_diag[pc]);
+    update_pc_diag(win_pc_diag[pc]);
+    global_branch_count++;
+
     if (win.branches >= WINDOW_SIZE) {
       print_window(std::cerr);
       win.reset();
+      win_pc_diag.clear();
+      for (auto &b : win_entry_ever_hit) b.reset();
       window_num++;
     }
   }
 
   void record_branch_pc(u64 pc) { unique_branch_pcs.insert(pc); }
+
+  // Enhanced: save PC per rank for per-PC diagnostics
+  void record_branch_info(u64 rank, u64 pc, [[maybe_unused]] bool taken) {
+    shadow_pc[rank] = pc;
+    unique_branch_pcs.insert(pc);
+  }
 
   // Allocation
   void record_allocation(bool success, u64 allocate_mask) {
@@ -276,6 +360,69 @@ struct TAMonitor {
       fb_occupied.set(index);
       fb_unique_entries++;
     }
+  }
+
+  // Block PC pipeline shift (call at start of update_cycle)
+  void shift_block_pc() {
+    train_block_pc = current_block_pc;
+    current_block_pc = shadow_block_pc;
+  }
+
+  // Feature 5: Record provider entry usage (call once per block during resolution)
+  void record_provider_entry(u64 table, u64 index, u64 num_branches,
+                              u64 num_correct) {
+    if (table < NUM_TABLES && index < MAX_TABLE_ENTRIES) {
+      auto &e = entry_life[table][index];
+      if (e.valid) {
+        e.pred_count += num_branches;
+        e.correct_count += num_correct;
+      }
+    }
+  }
+
+  // Feature 7+9: Tag collision check (call per table during resolution)
+  void record_collision_check(u64 table, u64 index, bool tag_hit) {
+    if (!tag_hit || index >= MAX_TABLE_ENTRIES) return;
+    entry_ever_hit[table].set(index);
+    win_entry_ever_hit[table].set(index);
+    auto record_coll = [&](Counters &c) {
+      c.per_table_coll_checks[table]++;
+      c.collision_checks++;
+      auto &e = entry_life[table][index];
+      if (e.valid && e.stored_pc != 0 && e.stored_pc != current_block_pc) {
+        c.per_table_coll_hits[table]++;
+        c.collision_hits++;
+      }
+    };
+    record_coll(cum);
+    record_coll(win);
+  }
+
+  // Feature 5+7+8: Record allocation (call per table on allocation write)
+  void record_entry_alloc_diag(u64 table, u64 index) {
+    if (index >= MAX_TABLE_ENTRIES) return;
+    auto &e = entry_life[table][index];
+    // Eviction stats for old entry
+    if (e.valid) {
+      auto record_evict = [&](Counters &c) {
+        auto &ls = c.lifetime_stats[table];
+        ls.evictions++;
+        ls.total_preds += e.pred_count;
+        ls.total_correct += e.correct_count;
+        if (e.pred_count == 0) ls.zero_use++;
+      };
+      record_evict(cum);
+      record_evict(win);
+    }
+    // Initialize new entry
+    e.alloc_time = global_branch_count;
+    e.pred_count = 0;
+    e.correct_count = 0;
+    e.stored_pc = train_block_pc;
+    e.valid = true;
+    // Feature 8: per-PC alloc tracking (both cumulative and window)
+    pc_diag[train_block_pc].alloc_count++;
+    win_pc_diag[train_block_pc].alloc_count++;
   }
 
   // u-bit write
@@ -329,7 +476,15 @@ struct TAMonitor {
       os << (USE_GSHARE ? "gs%," : "bim%,");
       for (u64 i = 0; i < NUM_TABLES; i++)
         os << "T" << i << "%,";
-      os << "alloc_ok%,acc_avg,alloc_avg";
+      os << "alloc_ok%,acc_avg,alloc_avg,";
+      // Feature 5: entry table lifetime
+      os << "Tlast_evict,Tlast_zu%,Tlast_avgp,";
+      // Feature 7: collision rate
+      os << "coll%,";
+      // Feature 9: entry table utilization
+      os << "Tlast_used,";
+      // Feature 8: never-allocated PCs (window)
+      os << "win_stuck,win_hard";
       os << "\n";
       header_printed = true;
     }
@@ -356,7 +511,33 @@ struct TAMonitor {
        << ","
        << (w.pressure_samples > 0
                ? double(w.alloc_ctr_sum) / w.pressure_samples
-               : 0);
+               : 0)
+       << ",";
+    // Feature 5: entry table (last table) lifetime
+    {
+      u64 last = NUM_TABLES - 1;
+      auto &ls = w.lifetime_stats[last];
+      double avg_p = ls.evictions > 0 ? double(ls.total_preds) / ls.evictions : 0;
+      os << ls.evictions << ","
+         << pct(ls.zero_use, ls.evictions) << ","
+         << std::setprecision(1) << avg_p << ",";
+    }
+    // Feature 7: collision rate
+    os << pct(w.collision_hits, w.collision_checks) << ",";
+    // Feature 9: entry table utilization
+    os << win_entry_ever_hit[NUM_TABLES - 1].count() << ",";
+    // Feature 8: window stuck + hard PCs
+    {
+      u64 win_stuck = 0, win_hard = 0;
+      for (auto &[pc, d] : win_pc_diag) {
+        if (d.total < 3) continue;
+        if (d.alloc_count == 0 && d.misp > 0) win_stuck++;
+        double bias = std::max(pct(d.taken, d.total),
+                               100.0 - pct(d.taken, d.total));
+        if (bias < 60.0) win_hard++;
+      }
+      os << win_stuck << "," << win_hard;
+    }
     os << "\n";
   }
 
@@ -514,13 +695,17 @@ struct TAMonitor {
 
     // Table occupancy
     os << "\nTAGE Table Occupancy:\n";
-    os << "  Table  | Size  | Occupied |  Occ% | Accuracy | Allocs\n";
-    os << "  -------+-------+----------+-------+----------+-------\n";
+    os << "  Table  | Size  | Occupied |  Occ% | EverHit | Used% | Accuracy | Allocs\n";
+    os << "  -------+-------+----------+-------+---------+-------+----------+-------\n";
     for (u64 i = 0; i < NUM_TABLES; i++) {
+      u64 ever_hit = entry_ever_hit[i].count();
       os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
          << std::setw(6) << MAX_TABLE_ENTRIES << " |" << std::setw(9)
          << tage_unique_entries[i] << " |" << std::setw(5)
          << pct(tage_unique_entries[i], MAX_TABLE_ENTRIES) << "%"
+         << " |" << std::setw(8) << ever_hit
+         << " |" << std::setw(5)
+         << pct(ever_hit, MAX_TABLE_ENTRIES) << "%"
          << " |" << std::setw(7)
          << pct(c.provider_correct[i], c.provider_count[i]) << "%"
          << " |" << std::setw(7) << c.alloc_per_table[i] << "\n";
@@ -556,6 +741,189 @@ struct TAMonitor {
          << double(c.acc_ctr_sum) / c.pressure_samples << "\n";
       os << "  Avg alloc_ctr: "
          << double(c.alloc_ctr_sum) / c.pressure_samples << "\n";
+    }
+
+    // ================================================================
+    // Diagnostic Features
+    // ================================================================
+
+    // Feature 1: Top mispredicted PCs
+    {
+      os << "\n--- Feature 1: Top Mispredicted PCs ---\n";
+      std::vector<std::pair<u64, const PCDiag *>> sorted;
+      sorted.reserve(pc_diag.size());
+      for (auto &[pc, d] : pc_diag)
+        sorted.push_back({pc, &d});
+      std::sort(sorted.begin(), sorted.end(),
+                [](auto &a, auto &b) { return a.second->misp > b.second->misp; });
+      os << "  PC               | Total   | Misp    | Misp%  | TAGE%  "
+            "| TageAcc | FB Acc  | Bias%  | Allocs\n";
+      os << "  -----------------+---------+---------+--------+--------"
+            "+---------+---------+--------+-------\n";
+      u64 cumul_misp = 0;
+      u64 shown = 0;
+      for (auto &[pc, d] : sorted) {
+        if (shown >= 20 || d->misp == 0) break;
+        cumul_misp += d->misp;
+        os << "  0x" << std::hex << std::setw(13) << std::left << pc
+           << std::dec << std::right
+           << " |" << std::setw(8) << d->total
+           << " |" << std::setw(8) << d->misp
+           << " |" << std::setw(6) << pct(d->misp, d->total) << "%"
+           << " |" << std::setw(6) << pct(d->tage_prov, d->total) << "%"
+           << " |" << std::setw(7) << pct(d->tage_correct, d->tage_prov) << "%"
+           << " |" << std::setw(7) << pct(d->fb_correct, d->fb_prov) << "%"
+           << " |" << std::setw(6) << pct(d->taken, d->total) << "%"
+           << " |" << std::setw(7) << d->alloc_count
+           << "  [cumul " << pct(cumul_misp, c.mispredictions) << "%]\n";
+        shown++;
+      }
+      os << "  Top-20 account for " << cumul_misp << "/"
+         << c.mispredictions << " (" << pct(cumul_misp, c.mispredictions)
+         << "%) of all mispredictions\n";
+    }
+
+    // Feature 2: Branch bias distribution
+    {
+      os << "\n--- Feature 2: Branch Bias Distribution ---\n";
+      constexpr u64 BINS = 10;
+      std::array<u64, BINS> bias_hist{};
+      u64 easy_count = 0, hard_count = 0; // >90% biased = easy
+      for (auto &[pc, d] : pc_diag) {
+        if (d.total < 5) continue; // skip rare branches
+        double bias = std::max(pct(d.taken, d.total),
+                               100.0 - pct(d.taken, d.total));
+        u64 bin = std::min(u64(bias / 10.0), BINS - 1);
+        bias_hist[bin]++;
+        if (bias >= 90.0) easy_count++;
+        else if (bias < 60.0) hard_count++;
+      }
+      os << "  Bias (max(T%,NT%)) | PCs\n";
+      os << "  -------------------+------\n";
+      for (u64 i = 0; i < BINS; i++)
+        os << "  " << std::setw(3) << i * 10 << "-" << std::setw(3)
+           << (i + 1) * 10 << "%            |" << std::setw(6) << bias_hist[i]
+           << "\n";
+      os << "  Easy (>=90% biased): " << easy_count
+         << "  Hard (<60% biased): " << hard_count << "\n";
+    }
+
+    // Feature 3: TAGE vs Fallback hit rate
+    {
+      os << "\n--- Feature 3: TAGE vs Fallback Per-PC ---\n";
+      u64 tage_dom = 0, fb_dominant = 0, mixed = 0;
+      u64 tage_dom_misp = 0, fb_dominant_misp = 0, mixed_misp = 0;
+      for (auto &[pc, d] : pc_diag) {
+        if (d.total < 5) continue;
+        double tage_frac = pct(d.tage_prov, d.total);
+        if (tage_frac >= 50.0) {
+          tage_dom++;
+          tage_dom_misp += d.misp;
+        } else if (tage_frac <= 10.0) {
+          fb_dominant++;
+          fb_dominant_misp += d.misp;
+        } else {
+          mixed++;
+          mixed_misp += d.misp;
+        }
+      }
+      os << "  Category           | PCs    | Mispredictions\n";
+      os << "  -------------------+--------+---------------\n";
+      os << "  TAGE dominant >50% |" << std::setw(7) << tage_dom
+         << " |" << std::setw(14) << tage_dom_misp << "\n";
+      os << "  Fallback dom <=10% |" << std::setw(7) << fb_dominant
+         << " |" << std::setw(14) << fb_dominant_misp << "\n";
+      os << "  Mixed 10-50%       |" << std::setw(7) << mixed
+         << " |" << std::setw(14) << mixed_misp << "\n";
+    }
+
+    // Feature 5: Entry lifetime
+    {
+      os << "\n--- Feature 5: Entry Lifetime ---\n";
+      os << "  Table  | Evictions | AvgPreds | AvgAcc%  | ZeroUse | ZeroUse%\n";
+      os << "  -------+-----------+----------+----------+---------+---------\n";
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        auto &ls = c.lifetime_stats[i];
+        double avg_preds = ls.evictions > 0
+                               ? double(ls.total_preds) / ls.evictions
+                               : 0;
+        double avg_acc = ls.total_preds > 0
+                             ? pct(ls.total_correct, ls.total_preds)
+                             : 0;
+        os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
+           << std::setw(10) << ls.evictions << " |" << std::setw(8)
+           << std::setprecision(1) << avg_preds << " |" << std::setw(7)
+           << std::setprecision(1) << avg_acc << "% |" << std::setw(8)
+           << ls.zero_use << " |" << std::setw(7)
+           << pct(ls.zero_use, ls.evictions) << "%\n";
+      }
+    }
+
+    // Feature 7: Tag collision rate
+    {
+      os << "\n--- Feature 7: Tag Collision Rate ---\n";
+      os << "  Total checks: " << c.collision_checks
+         << "  Collisions: " << c.collision_hits << " ("
+         << pct(c.collision_hits, c.collision_checks) << "%)\n";
+      os << "  Table  | Checks   | Collisions | Rate\n";
+      os << "  -------+----------+------------+------\n";
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
+           << std::setw(9) << c.per_table_coll_checks[i] << " |" << std::setw(11)
+           << c.per_table_coll_hits[i] << " |" << std::setw(5)
+           << pct(c.per_table_coll_hits[i], c.per_table_coll_checks[i]) << "%\n";
+      }
+    }
+
+    // Feature 8: Gshare-stuck branches
+    {
+      os << "\n--- Feature 8: Fallback-Stuck Branches ---\n";
+      u64 never_alloc = 0, alloc_but_fb = 0, alloc_and_tage = 0;
+      u64 never_alloc_misp = 0, alloc_but_fb_misp = 0, alloc_tage_misp = 0;
+      for (auto &[pc, d] : pc_diag) {
+        if (d.total < 5) continue;
+        if (d.alloc_count == 0) {
+          never_alloc++;
+          never_alloc_misp += d.misp;
+        } else if (d.tage_prov * 2 < d.total) {
+          alloc_but_fb++;
+          alloc_but_fb_misp += d.misp;
+        } else {
+          alloc_and_tage++;
+          alloc_tage_misp += d.misp;
+        }
+      }
+      os << "  Category                     | PCs    | Mispred  | AvgAlloc\n";
+      os << "  -----------------------------+--------+----------+---------\n";
+      os << "  Never allocated to TAGE      |" << std::setw(7) << never_alloc
+         << " |" << std::setw(9) << never_alloc_misp << " |      --\n";
+      os << "  Allocated but FB dominates   |" << std::setw(7) << alloc_but_fb
+         << " |" << std::setw(9) << alloc_but_fb_misp << " |";
+      {
+        u64 total_alloc = 0, count = 0;
+        for (auto &[pc, d] : pc_diag) {
+          if (d.total >= 5 && d.alloc_count > 0 && d.tage_prov * 2 < d.total) {
+            total_alloc += d.alloc_count;
+            count++;
+          }
+        }
+        os << std::setw(8) << (count > 0 ? double(total_alloc) / count : 0)
+           << "\n";
+      }
+      os << "  Allocated and TAGE provides  |" << std::setw(7)
+         << alloc_and_tage << " |" << std::setw(9) << alloc_tage_misp << " |";
+      {
+        u64 total_alloc = 0, count = 0;
+        for (auto &[pc, d] : pc_diag) {
+          if (d.total >= 5 && d.alloc_count > 0 &&
+              d.tage_prov * 2 >= d.total) {
+            total_alloc += d.alloc_count;
+            count++;
+          }
+        }
+        os << std::setw(8) << (count > 0 ? double(total_alloc) / count : 0)
+           << "\n";
+      }
     }
 
     os << "\n=== End TageAhead Monitor ===\n\n";
