@@ -13,7 +13,7 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 8, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 4,
+template <u64 N = 12, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 8,
           u64 MAXH = 100, u64 SIZE_RATIO = 1,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::GradedTag<TAG, TAG - 1>,
@@ -50,23 +50,25 @@ struct TATableConfig {
 
 template <
     typename TableCfg = TATableConfig<>,
-    u64 N = 8,                   // max conditional branches per block
-    u64 PATHBITS = 6,            // bits of next_pc injected into history
-    u64 SEC_TAG_BITS = 3,        // secondary tag width (ahead ambiguity)
-    bool USE_SEC_TAG = true,     // enable secondary tag matching
-    u64 CTR_WIDTH = 1,           // prediction counter width per lane
-    u64 HYST_WIDTH = 2,          // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 1,             // usefulness counter width
-    u64 FB_CAPACITY = 8192, // fallback table size (bimodal or gshare)
-    bool USE_GSHARE = false,     // use gshare base (PC^history) vs bimodal (PC)
-    u64 GS_HIST = 16,           // gshare history length (only when USE_GSHARE)
-    u64 META_WIDTH = 4,          // meta counter width (provider vs alt)
-    u64 META_CAPACITY = 256,     // meta table entries
-    u64 META_PIPE = 2,           // meta pipeline depth
-    u64 LINEINST = 1024,         // line size in instructions
-    bool SHARED_HYS = true,      // shared hyst: 2 entries share 1 counter
+    u64 N = 8,               // max conditional branches per block
+    u64 PATHBITS = 6,        // bits of next_pc injected into history
+    u64 SEC_TAG_BITS = 3,    // secondary tag width (ahead ambiguity)
+    bool USE_SEC_TAG = true, // enable secondary tag matching
+    u64 CTR_WIDTH = 1,       // prediction counter width per lane
+    u64 HYST_WIDTH = 2,      // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 1,         // usefulness counter width
+    u64 FB_CAPACITY = 8192,  // fallback table size (bimodal or gshare)
+    bool USE_GSHARE = true,  // use gshare base (PC^history) vs bimodal (PC)
+    u64 GS_HIST = 6,         // gshare history length (only when USE_GSHARE)
+    u64 META_WIDTH = 4,      // meta counter width (provider vs alt)
+    u64 META_CAPACITY = 256, // meta table entries
+    u64 META_PIPE = 2,       // meta pipeline depth
+    u64 LINEINST = 1024,     // line size in instructions
+    bool SHARED_HYS = true,  // shared hyst: 2 entries share 1 counter
     HistUpdate HIST_MODE =
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
+    // ---- Allocation policy ----
+    typename AllocCfg = TADefaultAllocConfig,
     // ---- Global pressure counters ----
     u64 ACC_WIDTH = 4,   // accuracy counter width
     u64 ALLOC_WIDTH = 4, // alloc pressure counter width
@@ -212,6 +214,10 @@ struct TageAhead : predictor {
   reg<ACC_WIDTH> acc_ctr;
   reg<ALLOC_WIDTH> alloc_ctr;
 
+  // Allocation LFSR (8-bit, hardware randomness for target policy + action
+  // gating)
+  reg<8> alloc_lfsr;
+
   // Per-table LFSRs (varying widths via tuple)
   static constexpr u64 MAX_LFSR_WIDTH =
       DECAY_ENABLE ? ta::array_max(DECAY_LFSR_WIDTHS) : 1;
@@ -230,7 +236,7 @@ struct TageAhead : predictor {
 // ---- Timing debug taps (zero cost in normal builds) ----
 #ifdef TIMING_DEBUG
   reg<1> dbg_full_hits;     // after per-table hit computation
-  reg<1> dbg_fb_pred;      // after fallback read
+  reg<1> dbg_fb_pred;       // after fallback read
   reg<1> dbg_match;         // after concat into match bitmask
   reg<1> dbg_match1;        // after one_hot (provider)
   reg<1> dbg_match2;        // after one_hot (alt)
@@ -263,7 +269,7 @@ struct TageAhead : predictor {
   reg<1> dbg_noalloc;       // candallocmask == 0
   reg<1> dbg_uclearmask;    // u-clear fallback
   // Train write chain (per-table)
-  reg<1> dbg_fb_write;      // fb_ctr.write gate
+  reg<1> dbg_fb_write;       // fb_ctr.write gate
   reg<1> dbg_meta_write;     // meta_ctr.write gate
   reg<1> dbg_pred_write[NT]; // pred_ram.write gate per table
   reg<1> dbg_hyst_write[NT]; // hyst_ram.write gate per table
@@ -682,7 +688,10 @@ struct TageAhead : predictor {
     // ---- Step 1: Correctness ----
     val<1> &mispredict = block_end_info.is_mispredict;
     mispredict.fanout(
-        hard<5>{}); // extra_cycle + bim + true_block + dbg + alloc
+        hard<5 + (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT
+                      ? 1
+                      : 0)>{}); // extra_cycle + fb + true_block + dbg + acc_ctr
+                                // + (alloc if MISPREDICT)
     need_extra_cycle(mispredict);
     do_train.fanout(hard<4 * NT + 3>{}); // gates bim, meta, 4 writes per table
 
@@ -708,7 +717,9 @@ struct TageAhead : predictor {
     t_pp.fanout(hard<2>{});
     actual_dir.fanout(hard<NT + 1>{});
     val<1> any_provider_wrong = (t_pp ^ actual_dir) != hard<0>{};
-    any_provider_wrong.fanout(hard<3 * NT + 1>{});
+    any_provider_wrong.fanout(
+        hard<3 * NT + 1 +
+             (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? 1 : 0)>{});
 #ifdef TIMING_DEBUG
     dbg_actual_dir = val<1>{actual_dir};
     dbg_any_prov_wrong = any_provider_wrong;
@@ -717,22 +728,86 @@ struct TageAhead : predictor {
     t_m1.fanout(hard<6>{});
     t_ad.fanout(hard<NT + 1>{});
 
-    // ---- Allocation masks (needed before merged loop) ----
+    // ---- Step 3: Allocation ----
+
+    // 3a. Allocation trigger
+    val<1> alloc_trigger = [&]() -> val<1> {
+      if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT)
+        return mispredict;
+      else if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG)
+        return any_provider_wrong;
+      else {
+        static_assert(AllocCfg::ALLOC_TRIGGER == AllocTrigger::ALWAYS);
+        return val<1>{1};
+      }
+    }();
+    val<NT> triggermask = alloc_trigger.replicate(hard<NT>{}).concat();
+
+    // 3b. Allocation action (probabilistic gating)
+    val<8> alloc_rng = val<8>{alloc_lfsr};
+    val<NT> gated_triggermask = [&]() -> val<NT> {
+      if constexpr (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD) {
+        return triggermask;
+      } else if constexpr (AllocCfg::ALLOC_ACTION == AllocAction::FILTERED) {
+        static_assert(ACC_WIDTH > 0, "FILTERED requires ACC_WIDTH > 0");
+        val<1> allow = (val<ACC_WIDTH>{acc_ctr} >= val<ACC_WIDTH>{alloc_rng});
+        return triggermask & allow.replicate(hard<NT>{}).concat();
+      } else {
+        static_assert(AllocCfg::ALLOC_ACTION == AllocAction::THROTTLED);
+        static_assert(ALLOC_WIDTH > 0, "THROTTLED requires ALLOC_WIDTH > 0");
+        val<1> allow =
+            (val<ALLOC_WIDTH>{alloc_ctr} >= val<ALLOC_WIDTH>{alloc_rng});
+        return triggermask & allow.replicate(hard<NT>{}).concat();
+      }
+    }();
+
+    // 3c. Candidate mask: tables above provider with u=0
     val<NT> alloc_base = val<NT>{t_match1 - 1};
     arr<val<1>, NT> u_zero = [&](u64 i) -> val<1> {
       return val<U_WIDTH>{train_u[i]} == hard<0>{};
     };
     val<NT> notumask = u_zero.concat();
     notumask.fanout(hard<2>{});
-    val<NT> misp_alloc = alloc_base & mispredict.replicate(hard<NT>{}).concat();
-    misp_alloc.fanout(hard<2>{});
-    val<NT> candallocmask = misp_alloc & notumask;
+    val<NT> postmask = alloc_base & gated_triggermask;
+    postmask.fanout(hard<2>{});
+    val<NT> candallocmask = postmask & notumask;
     candallocmask.fanout(hard<2>{});
-    val<NT> alloc_target = candallocmask.reverse().one_hot().reverse();
-    arr<val<1>, NT> allocate = alloc_target.make_array(val<1>{});
+
+    // 3d. Target policy (may skip closest candidates)
+    val<NT> collamask = AllocCfg::TARGET_POLICY::template apply<NT>(
+        candallocmask.reverse(), val<ALLOC_WIDTH>{alloc_ctr},
+        val<ACC_WIDTH>{acc_ctr}, alloc_rng);
+
+    // 3e. Final allocation decision (one-hot or two-hot)
+    arr<val<1>, NT> allocate = [&]() -> arr<val<1>, NT> {
+      if constexpr (AllocCfg::MAX_ALLOC >= 2) {
+        collamask.fanout(hard<3>{});
+        val<NT> pick1 = collamask.one_hot();
+        pick1.fanout(hard<3>{});
+        val<NT> pick2 = [&]() -> val<NT> {
+          val<NT> basic2 = (collamask ^ pick1).one_hot();
+          if constexpr (AllocCfg::NON_CONSECUTIVE) {
+            val<NT> neighbors = (pick1 << 1) | (pick1 >> 1);
+            val<NT> nc_mask = (collamask ^ pick1) & ~neighbors;
+            val<NT> nc_pick = nc_mask.reverse().one_hot();
+            return select(nc_mask != hard<0>{}, nc_pick, basic2);
+          } else {
+            return basic2;
+          }
+        }();
+        return (pick1 | pick2).reverse().make_array(val<1>{});
+      } else {
+        val<NT> alloc_target_rev = collamask.one_hot();
+        return alloc_target_rev.reverse().make_array(val<1>{});
+      }
+    }();
     allocate.fanout(hard<6>{});
+    val<NT> alloc_target = [&]() {
+      arr<val<1>, NT> a = allocate;
+      return a.concat();
+    }();
     val<1> noalloc = (candallocmask == hard<0>{});
-    val<NT> uclearmask = misp_alloc & noalloc.replicate(hard<NT>{}).concat();
+    val<NT> uclearmask = postmask & noalloc.replicate(hard<NT>{}).concat();
     arr<val<1>, NT> uclear = uclearmask.make_array(val<1>{});
     uclear.fanout(hard<2>{});
 #ifdef TIMING_DEBUG
@@ -749,17 +824,19 @@ struct TageAhead : predictor {
       u64 at = static_cast<u64>(alloc_target);
       mon.record_allocation(at != 0, at);
       // Provider index for cascade tracking
-      u64 prov_idx = TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY>::decode_provider(
-          static_cast<u64>(t_match1));
-      if (static_cast<u64>(mispredict)) {
-        if (static_cast<u64>(misp_alloc) == 0)
+      u64 prov_idx =
+          TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE,
+                    FB_CAPACITY>::decode_provider(static_cast<u64>(t_match1));
+      if (static_cast<u64>(alloc_trigger)) {
+        if (static_cast<u64>(postmask) == 0)
           mon.record_alloc_blocked(); // fallback was provider, no candidates
         mon.record_alloc_cascade(prov_idx, at);
       }
     }
 #endif
 
-    // ---- Step 4: Fallback update (mispredict + fallback is provider only) ----
+    // ---- Step 4: Fallback update (mispredict + fallback is provider only)
+    // ----
     val<1> fb_changed = actual_dir != val<PRED_BITS>{train_fb};
     val<1> fb_gate = do_train & t_m1[NT] & mispredict & fb_changed;
     execute_if(fb_gate, [&]() {
@@ -951,6 +1028,15 @@ struct TageAhead : predictor {
                           static_cast<u64>(alloc_ctr));
 #endif
 
+    // ---- Allocation LFSR tick (8-bit, polynomial x^8+x^6+x^5+x^4+1) ----
+    {
+      val<8> old = val<8>{alloc_lfsr};
+      val<1> fb = old & hard<1>{};
+      val<8> shifted = val<8>{old >> 1};
+      val<8> tap = val<8>{u64(1) << 7};
+      alloc_lfsr = shifted ^ (tap & fb.replicate(hard<8>{}).concat());
+    }
+
     // ---- Decay: LFSR tick ----
     if constexpr (DECAY_ENABLE) {
       static_loop<NT>([&]<u64 I>() {
@@ -969,8 +1055,10 @@ struct TageAhead : predictor {
     // correct_pred) to avoid timing bleed from old_pred reg reads
     true_block = ~mispredict | val<1>{branch_dir[num_branch - 1]} | line_end();
     true_block.fanout(
-        hard<NT * 2 + 2 + (USE_GSHARE ? 1 : 0)>{}); // NT fold_idx + NT fold_tag apply_update muxes +
-                             // gh.update + monitor + (fb_fold if gshare)
+        hard<NT * 2 + 2 + (USE_GSHARE ? 1 : 0)>{}); // NT fold_idx + NT fold_tag
+                                                    // apply_update muxes +
+                                                    // gh.update + monitor +
+                                                    // (fb_fold if gshare)
 
 #ifdef TAGE_MONITOR
     if (static_cast<u64>(true_block))

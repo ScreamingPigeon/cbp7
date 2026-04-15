@@ -666,4 +666,141 @@ struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
                                     SEC_TAG_BITS, N, SHARED_HYS>...>;
 };
 
+// ============================================================================
+// Allocation Policy Infrastructure (shared by TageAhead, TageDirect, etc.)
+// ============================================================================
+
+// Allocation trigger: what condition causes TAGE to attempt allocation
+enum class AllocTrigger {
+  MISPREDICT,   // final misprediction (default, conservative)
+  TAGE_WRONG,   // TAGE provider was wrong (even if meta corrected it)
+  ALWAYS,       // every update cycle (most aggressive)
+};
+
+// Allocation action: how to gate allocation when triggered
+enum class AllocAction {
+  STANDARD,     // allocate in tables above provider with u=0 (default)
+  FILTERED,     // probabilistically throttle by accuracy counter
+  THROTTLED,    // probabilistically throttle by alloc pressure counter
+};
+
+// ---- Allocation Target Policies (functors) ----
+//
+// Uniform interface:
+//   apply(collamask, alloc_pressure, acc_pressure, rng)
+// where all args are val<> types. Functors ignore what they don't need.
+//
+// collamask = reversed candidate mask (LSB = closest to provider)
+// rng       = val<8> from caller's LFSR (hardware randomness)
+//
+// x & (x-1) clears the lowest set bit = skip closest candidate.
+
+struct ClosestTarget {
+  static constexpr const char* name() { return "Closest"; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8>) {
+    return collamask;
+  }
+};
+
+namespace target_detail {
+  template <u64 NT>
+  val<NT> clear_lsb(val<NT> x) {
+    x.fanout(hard<2>{});
+    return x & val<NT>(x - 1);
+  }
+
+  template <u64 SKIP, u64 NT>
+  val<NT> skip_n(val<NT> x) {
+    static_assert(SKIP <= 4, "skip_n: SKIP > 4 not supported");
+    if constexpr (SKIP == 0) return x;
+    else if constexpr (SKIP == 1) return clear_lsb(x);
+    else { val<NT> s = skip_n<SKIP - 1, NT>(x); return clear_lsb(s); }
+  }
+} // namespace target_detail
+
+// Deterministically skip SKIP closest candidates, always allocate further out
+template <u64 SKIP = 1>
+struct DeterministicSkipTarget {
+  static_assert(SKIP <= 4, "DeterministicSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "DetSkip"; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8>) {
+    return target_detail::skip_n<SKIP, NT>(collamask);
+  }
+};
+
+// Skip SKIP closest with static probability PROB/256
+template <u64 SKIP = 1, u64 PROB_256 = 64>
+struct StaticSkipTarget {
+  static_assert(SKIP <= 4, "StaticSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "StaticSkip"; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8> rng) {
+    collamask.fanout(hard<2>{});
+    val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
+    return select(rng < hard<PROB_256>{}, skipped, collamask);
+  }
+};
+
+// Skip probability scales with alloc pressure (high pressure = skip more)
+template <u64 SKIP = 1>
+struct AllocPressureSkipTarget {
+  static_assert(SKIP <= 4, "AllocPressureSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "AllocPressSkip"; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, valtype auto ap, valtype auto, val<8> rng) {
+    collamask.fanout(hard<2>{});
+    val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
+    return select(val<8>{ap} > rng, skipped, collamask);
+  }
+};
+
+// Skip probability scales with accuracy pressure (low accuracy = skip more)
+template <u64 SKIP = 1>
+struct AccuracyPressureSkipTarget {
+  static_assert(SKIP <= 4, "AccuracyPressureSkipTarget: SKIP > 4 not supported");
+  static constexpr const char* name() { return "AccPressSkip"; }
+  template <u64 NT>
+  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto acp, val<8> rng) {
+    collamask.fanout(hard<2>{});
+    val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
+    return select(val<8>{acp} > rng, skipped, collamask);
+  }
+};
+
+// ---- Allocation Config Structs ----
+
+struct TADefaultAllocConfig {
+  static constexpr u64 MAX_ALLOC = 1;
+  static constexpr bool NON_CONSECUTIVE = false;
+  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::MISPREDICT;
+  static constexpr AllocAction  ALLOC_ACTION  = AllocAction::STANDARD;
+  using TARGET_POLICY = ClosestTarget;
+};
+
+struct TAAllocSkip1 : TADefaultAllocConfig {
+  using TARGET_POLICY = StaticSkipTarget<1, 64>;
+};
+
+struct TAAllocDetSkip1 : TADefaultAllocConfig {
+  using TARGET_POLICY = DeterministicSkipTarget<1>;
+};
+
+struct TAAlloc2 : TADefaultAllocConfig {
+  static constexpr u64 MAX_ALLOC = 2;
+};
+
+struct TAAllocTageWrong : TADefaultAllocConfig {
+  static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::TAGE_WRONG;
+};
+
+struct TAAllocFiltered : TADefaultAllocConfig {
+  static constexpr AllocAction ALLOC_ACTION = AllocAction::FILTERED;
+};
+
+struct TAAllocThrottled : TADefaultAllocConfig {
+  static constexpr AllocAction ALLOC_ACTION = AllocAction::THROTTLED;
+};
+
 #endif // CUSTOM_COMMON_H
