@@ -55,10 +55,10 @@ template <
     u64 SEC_TAG_BITS = 3,    // secondary tag width (ahead ambiguity)
     bool USE_SEC_TAG = true, // enable secondary tag matching
     u64 CTR_WIDTH = 1,       // prediction counter width per lane
-    u64 HYST_WIDTH = 2,      // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 1,         // usefulness counter width
-    u64 FB_CAPACITY = 8192,  // fallback table size (bimodal or gshare)
-    bool USE_GSHARE = true,  // use gshare base (PC^history) vs bimodal (PC)
+    u64 HYST_WIDTH = 3,      // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 2,         // usefulness counter width
+    u64 FB_CAPACITY = 8192 * 2, // fallback table size (bimodal or gshare)
+    bool USE_GSHARE = false, // use gshare base (PC^history) vs bimodal (PC)
     u64 GS_HIST = 6,         // gshare history length (only when USE_GSHARE)
     u64 META_WIDTH = 5,      // meta counter width (provider vs alt)
     u64 META_CAPACITY = 256, // meta table entries
@@ -68,7 +68,7 @@ template <
     HistUpdate HIST_MODE =
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
     // ---- Allocation policy ----
-    typename AllocCfg = TADefaultAllocConfig,
+    typename AllocCfg = TAAlloc2,
     // ---- Global pressure counters ----
     u64 ACC_WIDTH = 4,   // accuracy counter width
     u64 ALLOC_WIDTH = 4, // alloc pressure counter width
@@ -79,8 +79,32 @@ template <
     typename DecayThreshFn = ta::DefaultDecayThresh,
     // ---- Epoch-based u-bit reset ----
     bool EPOCH_ENABLE = true, typename EpochTriggerFn = ta::DefaultEpochTrigger,
-    bool EPOCH_RESET_ACC = false, // reset acc_ctr on epoch fire
-    bool EPOCH_RESET_ALLOC = true // reset alloc_ctr on epoch fire
+    u64 EPOCH_CTR_WIDTH =
+        16, // epoch counter width (for interval-based triggers)
+    bool EPOCH_RESET_ACC = false,  // reset acc_ctr on epoch fire
+    bool EPOCH_RESET_ALLOC = true, // reset alloc_ctr on epoch fire
+    // ---- Replacement policy (Technique 4) ----
+    typename ReplacePolicyFn = ReplaceUZero,
+    // ---- Alt bank promotion (Technique 3) ----
+    typename AltPromoteFn = AltPromoteOff,
+    // ---- DIP-like allocation (Technique 6) ----
+    u64 DIP_PROB_256 =
+        0, // probability of setting u>0 on alloc (0=off, 256=always)
+    u64 DIP_INIT_U = 1, // initial u value when DIP fires
+    // ---- Provider u-bit update policy ----
+    UProvUpdate U_PROV_UPDATE = UProvUpdate::INC_DEC,
+    // ---- Fallback trains toward P2 (gshare only) ----
+    bool FB_TRAIN_P2 = false, // when TAGE is provider and gshare disagrees,
+                              // write TAGE pred into gshare
+    // ---- Far-allocation epoch pressure ----
+    u64 FARALLOC_DIST =
+        3, // 0=off; when >0, alloc_ctr uses faralloc logic (Tage.hpp style)
+    // ---- Per-branch hyst/u banking ----
+    u64 HYST_BANKS = 2, // hyst banks per table (1=shared, N=per-branch)
+    u64 HYST_BANK_BIT =
+        0,             // starting bit of branch rank for hyst bank selection
+    u64 U_BANKS = 4,   // u banks per table (1=shared, N=per-branch)
+    u64 U_BANK_BIT = 0 // starting bit of branch rank for u bank selection
     >
 struct TageAhead : predictor {
 
@@ -88,6 +112,9 @@ struct TageAhead : predictor {
 
   static_assert(!(DECAY_ENABLE && EPOCH_ENABLE),
                 "DECAY_ENABLE and EPOCH_ENABLE are mutually exclusive");
+  static_assert(CTR_WIDTH == 1);
+  static_assert(!FB_TRAIN_P2 || USE_GSHARE,
+                "FB_TRAIN_P2 requires USE_GSHARE=true");
 
   static constexpr u64 NT = TableCfg::NUM_TABLES;
   static constexpr u64 LOGLINEINST = ta::clog2(LINEINST);
@@ -109,13 +136,43 @@ struct TageAhead : predictor {
   // Prediction bits per entry: one CTR_WIDTH counter per branch
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
 
+  // Per-branch banking helpers
+  static_assert(HYST_BANKS >= 1 && HYST_BANKS <= N &&
+                std::has_single_bit(HYST_BANKS));
+  static_assert(U_BANKS >= 1 && U_BANKS <= N && std::has_single_bit(U_BANKS));
+  static constexpr u64 HYST_BANK_BITS = std::bit_width(HYST_BANKS) - 1;
+  static constexpr u64 U_BANK_BITS = std::bit_width(U_BANKS) - 1;
+  // Compile-time bank index for branch b
+  static constexpr u64 hyst_bank_of(u64 b) {
+    return (b >> HYST_BANK_BIT) & (HYST_BANKS - 1);
+  }
+  static constexpr u64 u_bank_of(u64 b) {
+    return (b >> U_BANK_BIT) & (U_BANKS - 1);
+  }
+  // Compile-time bitmask of branches in a given hyst/u bank
+  static constexpr u64 hyst_bank_mask(u64 bank) {
+    u64 mask = 0;
+    for (u64 b = 0; b < N; b++)
+      if (hyst_bank_of(b) == bank)
+        mask |= (1ULL << b);
+    return mask;
+  }
+  static constexpr u64 u_bank_mask(u64 bank) {
+    u64 mask = 0;
+    for (u64 b = 0; b < N; b++)
+      if (u_bank_of(b) == bank)
+        mask |= (1ULL << b);
+    return mask;
+  }
+
   // ======================================================================
   // Storage
   // ======================================================================
   // ---- Table tuple (per-table tag width and table size) ----
-  using Tables = typename TAMakeTableTuple<TableCfg, CTR_WIDTH, HYST_WIDTH,
-                                           U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
-                                           std::make_index_sequence<NT>>::type;
+  using Tables =
+      typename TAMakeTableTuple<TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
+                                SEC_TAG_BITS, N, SHARED_HYS, HYST_BANKS,
+                                U_BANKS, std::make_index_sequence<NT>>::type;
   Tables tables;
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
   ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
@@ -172,8 +229,8 @@ struct TageAhead : predictor {
   reg<PRED_BITS> prefetch_pred[NT];
   reg<SEC_TAG_BITS> prefetch_sec[NT];
   reg<MAX_IDX_BITS> prefetch_idx[NT];
-  reg<std::max(u64(1), HYST_WIDTH)> prefetch_hyst[NT];
-  reg<U_WIDTH> prefetch_u[NT];
+  reg<std::max(u64(1), HYST_WIDTH)> prefetch_hyst[NT][HYST_BANKS];
+  reg<U_WIDTH> prefetch_u[NT][U_BANKS];
   reg<MAX_TAG_WIDTH> prefetch_ctag[NT]; // computed tag for allocation piping
 
   // current_*: shifted from prefetch, used for prediction
@@ -182,15 +239,15 @@ struct TageAhead : predictor {
   reg<PRED_BITS> current_pred[NT];
   reg<SEC_TAG_BITS> current_sec[NT];
   reg<MAX_IDX_BITS> current_idx[NT];
-  reg<std::max(u64(1), HYST_WIDTH)> current_hyst[NT];
-  reg<U_WIDTH> current_u[NT];
+  reg<std::max(u64(1), HYST_WIDTH)> current_hyst[NT][HYST_BANKS];
+  reg<U_WIDTH> current_u[NT][U_BANKS];
   reg<MAX_TAG_WIDTH> current_ctag[NT]; // piped computed tag for allocation
 
   // train_*: saved from current_* before pipeline shift, used for training
   // (training is for block A, resolution is for block B)
   reg<MAX_IDX_BITS> train_idx[NT];
-  reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT];
-  reg<U_WIDTH> train_u[NT];
+  reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT][HYST_BANKS];
+  reg<U_WIDTH> train_u[NT][U_BANKS];
   reg<PRED_BITS> train_fb;
   reg<FB_IDX_BITS> train_fb_idx;
   reg<ALLOC_PC_BITS> train_pc;
@@ -198,8 +255,11 @@ struct TageAhead : predictor {
 
   // Piped resolution values from previous update_cycle (block A's resolution)
   reg<MATCH_BITS> train_match1;
+  reg<MATCH_BITS> train_match2; // alt match (for alt promotion)
   reg<PRED_BITS> train_provider_pred;
+  reg<PRED_BITS> train_alt_pred; // alt prediction (for alt promotion)
   reg<1> train_provider_weak;
+  reg<1> train_provider_weakconf; // hyst==0 only (for pred flip)
   reg<1> train_altdiff;
 
   // Guard: skip training until piped resolution regs have been populated
@@ -213,6 +273,7 @@ struct TageAhead : predictor {
   // Global pressure counters (always declared, zero-cost when unused)
   reg<ACC_WIDTH> acc_ctr;
   reg<ALLOC_WIDTH> alloc_ctr;
+  reg<EPOCH_CTR_WIDTH> epoch_ctr;
 
   // Allocation LFSR (8-bit, hardware randomness for target policy + action
   // gating)
@@ -282,7 +343,8 @@ struct TageAhead : predictor {
 #endif
 
 #ifdef TAGE_MONITOR
-  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY> mon;
+  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, HYST_BANKS, U_BANKS>
+      mon;
   ~TageAhead() { mon.print_summary(); }
 #endif
 
@@ -349,8 +411,11 @@ struct TageAhead : predictor {
       if constexpr (USE_SEC_TAG)
         prefetch_sec[I] = t.sec_ram.read(idx);
       prefetch_idx[I] = idx;
-      prefetch_hyst[I] = t.hyst_ram.read(val<t.HYST_IDX_BITS>{idx});
-      prefetch_u[I] = t.u_ram.read(idx);
+      static_loop<HYST_BANKS>([&]<u64 HB>() {
+        prefetch_hyst[I][HB] = t.hyst_ram[HB].read(val<t.HYST_IDX_BITS>{idx});
+      });
+      static_loop<U_BANKS>(
+          [&]<u64 UB>() { prefetch_u[I][UB] = t.u_ram[UB].read(idx); });
     });
 
     // Fallback ahead read (direct-mapped, no tag match needed)
@@ -423,8 +488,10 @@ struct TageAhead : predictor {
     // Save current_* into train_* before shift (block A's data for training)
     static_loop<NT>([&]<u64 I>() {
       train_idx[I] = current_idx[I];
-      train_hyst[I] = current_hyst[I];
-      train_u[I] = current_u[I];
+      static_loop<HYST_BANKS>(
+          [&]<u64 HB>() { train_hyst[I][HB] = current_hyst[I][HB]; });
+      static_loop<U_BANKS>(
+          [&]<u64 UB>() { train_u[I][UB] = current_u[I][UB]; });
       train_ctag[I] = current_ctag[I];
       train_tag_hit[I] = current_tag_hit[I];
       if constexpr (USE_SEC_TAG)
@@ -442,8 +509,10 @@ struct TageAhead : predictor {
       if constexpr (USE_SEC_TAG)
         current_sec[I] = prefetch_sec[I];
       current_idx[I] = prefetch_idx[I];
-      current_hyst[I] = prefetch_hyst[I];
-      current_u[I] = prefetch_u[I];
+      static_loop<HYST_BANKS>(
+          [&]<u64 HB>() { current_hyst[I][HB] = prefetch_hyst[I][HB]; });
+      static_loop<U_BANKS>(
+          [&]<u64 UB>() { current_u[I][UB] = prefetch_u[I][UB]; });
       current_ctag[I] = prefetch_ctag[I];
     });
     current_fb = prefetch_fb;
@@ -492,18 +561,17 @@ struct TageAhead : predictor {
 
 #ifdef TAGE_MONITOR
     for (u64 i = 0; i < NT; i++) {
-      if constexpr (USE_SEC_TAG) {
-        mon.record_tag_lookup(
-            i, static_cast<u64>(current_tag_hit[i]),
-            static_cast<u64>(val<SEC_TAG_BITS>{current_sec[i]} ==
-                             val<SEC_TAG_BITS>{curr_sec_tag}));
-      } else {
-        mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
-      }
+      bool th = static_cast<u64>(current_tag_hit[i]);
+      bool sh = USE_SEC_TAG
+                    ? static_cast<u64>(val<SEC_TAG_BITS>{current_sec[i]} ==
+                                       val<SEC_TAG_BITS>{curr_sec_tag})
+                    : false;
+      mon.record_tag_lookup(i, th, sh);
+      mon.record_table_pred(
+          i, static_cast<u64>(val<PRED_BITS>{current_pred[i]}), th, sh);
       // Feature 7: tag collision check
       mon.record_collision_check(
-          i, static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]}),
-          static_cast<u64>(current_tag_hit[i]));
+          i, static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]}), th);
     }
 #endif
 
@@ -569,18 +637,46 @@ struct TageAhead : predictor {
     dbg_alt_pred = val<1>{alt_pred};
 #endif
 
-    // 7. Provider weakness: newly allocated entry = hyst==0 AND u==0.
-    //    Only check the provider table (mask by match1 bit). Fallback
-    //    (index NT) is never considered "weak".
+    // 7. Provider weakness (per-branch via banking):
+    //    provider_weak = any branch has (hyst==0 AND u==0) → meta override
+    //    provider_weakconf = any branch has hyst==0 → pred direction flip
+    constexpr u64 HW_RES = std::max(u64(1), HYST_WIDTH);
     arr<val<1>, NT + 1> weak_arr = [&](u64 i) -> val<1> {
-      if (i < NT)
-        return m1_bits[i] &
-               val<1>{val<std::max(u64(1), HYST_WIDTH)>{current_hyst[i]} ==
-                      hard<0>{}} &
-               val<1>{val<U_WIDTH>{current_u[i]} == hard<0>{}};
+      if (i < NT) {
+        if constexpr (HYST_BANKS == 1 && U_BANKS == 1) {
+          return m1_bits[i] &
+                 val<1>{val<HW_RES>{current_hyst[i][0]} == hard<0>{}} &
+                 val<1>{val<U_WIDTH>{current_u[i][0]} == hard<0>{}};
+        } else {
+          // OR across branches: any branch weak in this table?
+          arr<val<1>, N> per_br = [&](u64 b) -> val<1> {
+            u64 hb = hyst_bank_of(b);
+            u64 ub = u_bank_of(b);
+            return val<1>{val<HW_RES>{current_hyst[i][hb]} == hard<0>{}} &
+                   val<1>{val<U_WIDTH>{current_u[i][ub]} == hard<0>{}};
+          };
+          return m1_bits[i] & (per_br.concat() != hard<0>{});
+        }
+      }
       return val<1>{0};
     };
     val<1> provider_weak = weak_arr.fold_or();
+    arr<val<1>, NT + 1> weakconf_arr = [&](u64 i) -> val<1> {
+      if (i < NT) {
+        if constexpr (HYST_BANKS == 1) {
+          return m1_bits[i] &
+                 val<1>{val<HW_RES>{current_hyst[i][0]} == hard<0>{}};
+        } else {
+          arr<val<1>, N> per_br = [&](u64 b) -> val<1> {
+            u64 hb = hyst_bank_of(b);
+            return val<1>{val<HW_RES>{current_hyst[i][hb]} == hard<0>{}};
+          };
+          return m1_bits[i] & (per_br.concat() != hard<0>{});
+        }
+      }
+      return val<1>{0};
+    };
+    val<1> provider_weakconf = weakconf_arr.fold_or();
 
     // 8. has_alt: does the alt match point to a TAGE table (not fallback)?
     //    Mask out the fallback bit (MSB) and check if anything remains.
@@ -656,6 +752,8 @@ struct TageAhead : predictor {
         mon.record_provider_entry(prov, prov_index, num_branch, nc);
       }
     }
+    // Record num_branch for sec rejection analysis pipeline
+    mon.record_table_pred_num_branch(num_branch);
 #endif
 
     // ================================================================
@@ -674,15 +772,23 @@ struct TageAhead : predictor {
     arr<val<1>, NT + 1> t_m1 = t_match1.make_array(val<1>{});
     val<PRED_BITS> t_pp = train_provider_pred;
     val<1> t_pw = train_provider_weak;
+    val<1> t_pwc = train_provider_weakconf;
     val<1> t_ad = train_altdiff;
 
     // Save current resolution → train regs (for NEXT cycle's training)
-    alt_pred.fanout(hard<2>{});
+    constexpr bool ALT_PROMOTE_ACTIVE =
+        !std::is_same_v<AltPromoteFn, AltPromoteOff>;
+    alt_pred.fanout(hard<2 + (ALT_PROMOTE_ACTIVE ? 1 : 0)>{});
     val<1> altdiff = (provider_pred ^ alt_pred) != hard<0>{};
     train_match1 = match1;
     train_provider_pred = provider_pred;
     train_provider_weak = provider_weak;
+    train_provider_weakconf = provider_weakconf;
     train_altdiff = altdiff;
+    if constexpr (ALT_PROMOTE_ACTIVE) {
+      train_match2 = match2;
+      train_alt_pred = alt_pred;
+    }
 #ifdef TIMING_DEBUG
     dbg_altdiff = val<1>{altdiff};
 #endif
@@ -712,10 +818,12 @@ struct TageAhead : predictor {
     // ---- Step 1: Correctness ----
     val<1> &mispredict = block_end_info.is_mispredict;
     mispredict.fanout(
-        hard<5 + (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT
-                      ? 1
-                      : 0)>{}); // extra_cycle + fb + true_block + dbg + acc_ctr
-                                // + (alloc if MISPREDICT)
+        hard<5 + (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT ? 1 : 0) +
+             (FB_TRAIN_P2 ? 1 : 0) +
+             (FARALLOC_DIST > 0 ? 1 : 0)>{}); // extra_cycle + fb + true_block +
+                                              // dbg + acc_ctr
+                                              // + (alloc if MISPREDICT) + fb_p2
+                                              // + faralloc
     need_extra_cycle(mispredict);
     do_train.fanout(hard<4 * NT + 3>{}); // gates bim, meta, 4 writes per table
 
@@ -727,6 +835,13 @@ struct TageAhead : predictor {
                          r == num_branch - 1 && static_cast<u64>(mispredict));
     if (!static_cast<u64>(do_train))
       mon.record_train_skip();
+    // Sec tag rejection analysis: compare shadowed per-table preds vs actual
+    if (static_cast<u64>(do_train)) {
+      u64 actual_bits = 0;
+      for (u64 r = 0; r < num_branch; r++)
+        actual_bits |= (static_cast<u64>(branch_dir[r]) & 1) << r;
+      mon.eval_sec_rejections(actual_bits);
+    }
 #endif
     [[maybe_unused]] arr<val<1>, N> badpred = [&](u64 i) -> val<1> {
       return old_pred[i] ^ val<1>{branch_dir[i]};
@@ -739,17 +854,20 @@ struct TageAhead : predictor {
 
     // Provider wrong on any branch? (uses piped provider_pred)
     t_pp.fanout(hard<2>{});
-    actual_dir.fanout(hard<NT + 1>{});
+    actual_dir.fanout(hard<NT + 1 + (ALT_PROMOTE_ACTIVE ? NT : 0)>{});
     val<1> any_provider_wrong = (t_pp ^ actual_dir) != hard<0>{};
     any_provider_wrong.fanout(
         hard<3 * NT + 1 +
-             (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? 1 : 0)>{});
+             (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? 1 : 0) +
+             (ALT_PROMOTE_ACTIVE ? NT : 0)>{});
+
 #ifdef TIMING_DEBUG
     dbg_actual_dir = val<1>{actual_dir};
     dbg_any_prov_wrong = any_provider_wrong;
 #endif
-    t_pw.fanout(hard<NT + 1>{});
-    t_m1.fanout(hard<6>{});
+    t_pw.fanout(hard<2>{});   // meta gate only
+    t_pwc.fanout(hard<NT>{}); // pred flip per table
+    t_m1.fanout(hard<6 + (FB_TRAIN_P2 ? 1 : 0)>{});
     t_ad.fanout(hard<NT + 1>{});
 
     // ---- Step 3: Allocation ----
@@ -767,8 +885,11 @@ struct TageAhead : predictor {
     }();
     val<NT> triggermask = alloc_trigger.replicate(hard<NT>{}).concat();
 
-    // 3b. Allocation action (probabilistic gating)
+    // 3b. Alt bank promotion (Technique 3) — computed here so alloc_rng is
+    // available
     val<8> alloc_rng = val<8>{alloc_lfsr};
+
+    // 3c. Allocation action (probabilistic gating)
     val<NT> gated_triggermask = [&]() -> val<NT> {
       if constexpr (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD) {
         return triggermask;
@@ -785,12 +906,17 @@ struct TageAhead : predictor {
       }
     }();
 
-    // 3c. Candidate mask: tables above provider with u=0
+    // 3c. Candidate mask: tables above provider with replaceable entries
     val<NT> alloc_base = val<NT>{t_match1 - 1};
-    arr<val<1>, NT> u_zero = [&](u64 i) -> val<1> {
-      return val<U_WIDTH>{train_u[i]} == hard<0>{};
+    arr<val<1>, NT> replaceable = [&](u64 i) -> val<1> {
+      // Use bank 0 for replacement check (heuristic — entry-level decision)
+      return ReplacePolicyFn::template is_replaceable<
+          U_WIDTH, std::max(u64(1), HYST_WIDTH)>(
+          val<U_WIDTH>{train_u[i][0]},
+          val<std::max(u64(1), HYST_WIDTH)>{train_hyst[i][0]},
+          val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr});
     };
-    val<NT> notumask = u_zero.concat();
+    val<NT> notumask = replaceable.concat();
     notumask.fanout(hard<2>{});
     val<NT> postmask = alloc_base & gated_triggermask;
     postmask.fanout(hard<2>{});
@@ -802,27 +928,50 @@ struct TageAhead : predictor {
         candallocmask.reverse(), val<ALLOC_WIDTH>{alloc_ctr},
         val<ACC_WIDTH>{acc_ctr}, alloc_rng);
 
-    // 3e. Final allocation decision (one-hot or two-hot)
-    arr<val<1>, NT> allocate = [&]() -> arr<val<1>, NT> {
-      if constexpr (AllocCfg::MAX_ALLOC >= 2) {
-        collamask.fanout(hard<3>{});
-        val<NT> pick1 = collamask.one_hot();
-        pick1.fanout(hard<3>{});
-        val<NT> pick2 = [&]() -> val<NT> {
-          val<NT> basic2 = (collamask ^ pick1).one_hot();
+    // 3e. Final allocation decision (up to MAX_ALLOC picks with prob decay)
+    // Helper: recursive pick from candidate mask. Each successive pick
+    // has probability 1/2^(K*DECAY_SHIFT). Returns OR of all picks.
+    constexpr auto multi_pick = []<u64 K>(auto self, val<NT> cands,
+                                          val<8> rng) -> val<NT> {
+      constexpr u64 MA = AllocCfg::MAX_ALLOC;
+      constexpr u64 DS = AllocCfg::ALLOC_DECAY_SHIFT;
+      val<NT> pick = cands.one_hot();
+      // Gate this pick by probability (pick 0 always fires)
+      auto gated_pick = [&]() {
+        if constexpr (K == 0 || DS == 0) {
+          return pick;
+        } else {
+          constexpr u64 SHIFT = std::min(K * DS, u64(7));
+          constexpr u64 THRESH = u64(1) << (8 - SHIFT);
+          val<1> prob_ok = (rng < hard<THRESH>{});
+          return val<NT>{pick & prob_ok.replicate(hard<NT>{}).concat()};
+        }
+      }();
+      if constexpr (K + 1 >= MA) {
+        return gated_pick;
+      } else {
+        pick.fanout(hard<2>{});
+        val<NT> next_cands = [&]() -> val<NT> {
           if constexpr (AllocCfg::NON_CONSECUTIVE) {
-            val<NT> neighbors = (pick1 << 1) | (pick1 >> 1);
-            val<NT> nc_mask = (collamask ^ pick1) & ~neighbors;
-            val<NT> nc_pick = nc_mask.reverse().one_hot();
-            return select(nc_mask != hard<0>{}, nc_pick, basic2);
+            val<NT> neighbors = (pick << 1) | (pick >> 1);
+            return (cands ^ pick) & ~neighbors;
           } else {
-            return basic2;
+            return cands ^ pick;
           }
         }();
-        return (pick1 | pick2).reverse().make_array(val<1>{});
-      } else {
+        return gated_pick |
+               self.template operator()<K + 1>(self, next_cands, rng);
+      }
+    };
+    arr<val<1>, NT> allocate = [&]() -> arr<val<1>, NT> {
+      if constexpr (AllocCfg::MAX_ALLOC == 1) {
         val<NT> alloc_target_rev = collamask.one_hot();
         return alloc_target_rev.reverse().make_array(val<1>{});
+      } else {
+        collamask.fanout(hard<2>{});
+        val<NT> result =
+            multi_pick.template operator()<0>(multi_pick, collamask, alloc_rng);
+        return result.reverse().make_array(val<1>{});
       }
     }();
     allocate.fanout(hard<6>{});
@@ -849,8 +998,8 @@ struct TageAhead : predictor {
       mon.record_allocation(at != 0, at);
       // Provider index for cascade tracking
       u64 prov_idx =
-          TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE,
-                    FB_CAPACITY>::decode_provider(static_cast<u64>(t_match1));
+          TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, HYST_BANKS,
+                    U_BANKS>::decode_provider(static_cast<u64>(t_match1));
       if (static_cast<u64>(alloc_trigger)) {
         if (static_cast<u64>(postmask) == 0)
           mon.record_alloc_blocked(); // fallback was provider, no candidates
@@ -859,13 +1008,25 @@ struct TageAhead : predictor {
     }
 #endif
 
-    // ---- Step 4: Fallback update (mispredict + fallback is provider only)
-    // ----
+    // ---- Step 4: Fallback update ----
+    // 4a: Standard — mispredict when fallback is provider → write actual dir
     val<1> fb_changed = actual_dir != val<PRED_BITS>{train_fb};
     val<1> fb_gate = do_train & t_m1[NT] & mispredict & fb_changed;
-    execute_if(fb_gate, [&]() {
-      fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir);
-    });
+    // 4b: Train toward P2 — on mispredict when TAGE is provider,
+    //     overwrite gshare with actual dir (like Tage.hpp P1→P2)
+    if constexpr (FB_TRAIN_P2) {
+      val<1> tage_is_prov = ~t_m1[NT];
+      val<1> fb_p2_gate =
+          do_train & tage_is_prov & mispredict & fb_changed & ~fb_gate;
+      val<1> fb_any_write = fb_gate | fb_p2_gate;
+      execute_if(fb_any_write, [&]() {
+        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir);
+      });
+    } else {
+      execute_if(fb_gate, [&]() {
+        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir);
+      });
+    }
 #ifdef TAGE_MONITOR
     if (static_cast<u64>(fb_gate))
       mon.record_fb_write(static_cast<u64>(val<FB_IDX_BITS>{train_fb_idx}));
@@ -891,21 +1052,54 @@ struct TageAhead : predictor {
       auto &t = std::get<I>(tables);
       val<1> do_alloc = allocate[I];
 
-      // pred_ram: alloc writes actual_dir, update writes actual_dir → same data
-      val<1> do_pred_update = t_m1[I] & t_pw & any_provider_wrong;
-      execute_if(do_train & (do_alloc | do_pred_update), [&]() {
-        t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, actual_dir, hard<0>{});
-      });
+      // Per-branch wrong bits for banked training
+      val<N> per_branch_wrong = t_pp ^ actual_dir;
 
-      // hyst_ram: alloc writes 0, update writes new_hyst → mux on do_alloc
+      // pred_ram: with banking, only flip pred bits where branch is weakconf
+      // AND wrong
+      if constexpr (HYST_BANKS == 1) {
+        // Original: block-wide weakconf gate
+        val<1> do_pred_update = t_m1[I] & t_pwc & any_provider_wrong;
+        execute_if(do_train & (do_alloc | do_pred_update), [&]() {
+          t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, actual_dir,
+                           hard<0>{});
+        });
+      } else {
+        // Per-branch: build weakconf mask from banked hyst, only flip
+        // weak+wrong bits
+        constexpr u64 HW_P = std::max(u64(1), HYST_WIDTH);
+        arr<val<1>, N> per_br_weakconf = [&](u64 b) -> val<1> {
+          u64 hb = hyst_bank_of(b);
+          return val<1>{val<HW_P>{train_hyst[I][hb]} == hard<0>{}};
+        };
+        val<N> weakconf_mask = per_br_weakconf.concat();
+        val<N> flip_mask = per_branch_wrong & weakconf_mask;
+        val<1> any_flip = t_m1[I] & (flip_mask != hard<0>{});
+        val<PRED_BITS> new_pred = t_pp ^ flip_mask;
+        execute_if(do_train & (do_alloc | any_flip), [&]() {
+          t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]},
+                           select(do_alloc, actual_dir, new_pred), hard<0>{});
+        });
+      }
+
+      // hyst_ram: per-bank training
       constexpr u64 HW = std::max(u64(1), HYST_WIDTH);
-      auto old_hyst = val<HW>{train_hyst[I]};
-      auto new_hyst = ta_update_ctr(old_hyst, ~any_provider_wrong);
-      auto hyst_data = select(do_alloc, val<HW>{0}, new_hyst);
-      val<1> do_hyst_update = t_m1[I] & (new_hyst != old_hyst);
-      execute_if(do_train & (do_alloc | do_hyst_update), [&]() {
-        t.hyst_ram.write(val<t.HYST_IDX_BITS>{train_idx[I]}, hyst_data,
-                         hard<0>{});
+      static_loop<HYST_BANKS>([&]<u64 HB>() {
+        auto old_hyst = val<HW>{train_hyst[I][HB]};
+        // Bank wrong: OR of per_branch_wrong for branches in this bank
+        val<1> bank_wrong =
+            (per_branch_wrong & hard<hyst_bank_mask(HB)>{}) != hard<0>{};
+        auto new_hyst = ta_update_ctr(old_hyst, ~bank_wrong);
+        auto hyst_data = select(do_alloc, val<HW>{0}, new_hyst);
+        val<1> do_hyst_update = t_m1[I] & (new_hyst != old_hyst);
+        execute_if(do_train & (do_alloc | do_hyst_update), [&]() {
+          t.hyst_ram[HB].write(val<t.HYST_IDX_BITS>{train_idx[I]}, hyst_data,
+                               hard<0>{});
+        });
+#ifdef TAGE_MONITOR
+        if (static_cast<u64>(do_train & do_hyst_update))
+          mon.record_hyst_update(I, HB, !static_cast<u64>(bank_wrong));
+#endif
       });
 
       // tag_ram + sec_ram: alloc only (plain RAM, protected by extra_cycle)
@@ -925,87 +1119,141 @@ struct TageAhead : predictor {
       }
 #endif
 
-      // u_ram: combined provider update + allocation + uclear + decay
-      val<U_WIDTH> base_newu = val<U_WIDTH>{~any_provider_wrong} &
-                               val<U_WIDTH>{~allocate[I]} &
-                               val<U_WIDTH>{~uclear[I]};
-      val<1> base_u_write = (t_m1[I] & t_ad) | allocate[I] | uclear[I];
-
-      // Probabilistic decay: on tag/sec miss, LFSR < threshold → decay u
-      auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
-        if constexpr (!DECAY_ENABLE) {
-          return {base_newu, base_u_write};
+      // u_ram: combined provider update + allocation + uclear + decay + DIP
+      // Banked: each u bank gets per-bank wrong signal
+      val<U_WIDTH> alloc_u = [&]() -> val<U_WIDTH> {
+        if constexpr (DIP_PROB_256 == 0) {
+          return val<U_WIDTH>{0};
         } else {
-          constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
-          auto &lfsr = std::get<I>(decay_lfsrs);
-
-          // Miss condition from piped tag/sec hit
-          val<1> tag_missed = ~val<1>{train_tag_hit[I]};
-          val<1> decay_miss = [&]() {
-            if constexpr (!USE_SEC_TAG || DECAY_MISS == DecayMiss::TAG)
-              return tag_missed;
-            else {
-              val<1> sec_missed = ~val<1>{train_sec_hit[I]};
-              if constexpr (DECAY_MISS == DecayMiss::SEC)
-                return sec_missed;
-              else if constexpr (DECAY_MISS == DecayMiss::TAG_OR_SEC)
-                return tag_missed | sec_missed;
-              else
-                return tag_missed & sec_missed;
-            }
-          }();
-
-          // Threshold from global counters
-          auto thresh = DecayThreshFn::template compute<I, LW>(
-              val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
-
-          // LFSR fires when below threshold, on miss, not allocating
-          val<1> decay_fire =
-              decay_miss & ~allocate[I] & (val<LW>{lfsr} < thresh);
-
-          // Apply decay op to train_u
-          val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
-          val<U_WIDTH> decayed_u = [&]() {
-            if constexpr (DECAY_OP == DecayOp::DECREMENT)
-              return select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
-            else if constexpr (DECAY_OP == DecayOp::HALVE)
-              return val<U_WIDTH>{old_u >> 1};
-            else // CLEAR
-              return val<U_WIDTH>{0};
-          }();
-
-          // Mux: if base write active, use base_newu; else if decay, use
-          // decayed_u
-          val<U_WIDTH> merged = select(base_u_write, base_newu,
-                                       select(decay_fire, decayed_u, old_u));
-          val<1> merged_write = base_u_write | decay_fire;
-          val<1> merged_changed = merged != old_u;
-          return {merged, merged_write & merged_changed};
+          val<1> dip_fire = (alloc_rng < hard<DIP_PROB_256>{});
+          return select(dip_fire, val<U_WIDTH>{hard<DIP_INIT_U>{}},
+                        val<U_WIDTH>{0});
         }
       }();
 
-      execute_if(do_train & u_write, [&]() {
-        t.u_ram.write(val<t.IDX_BITS>{train_idx[I]}, newu, hard<0>{});
-      });
+      static_loop<U_BANKS>([&]<u64 UB>() {
+        // Per-bank provider_u: depends on U_PROV_UPDATE policy
+        val<1> bank_u_wrong =
+            (per_branch_wrong & hard<u_bank_mask(UB)>{}) != hard<0>{};
+        val<1> bank_u_correct = ~bank_u_wrong;
+        val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I][UB]};
+        constexpr u64 MAX_U = (1ULL << U_WIDTH) - 1;
 
+        // provider_u: value to write; prov_u_write: should we write at all
+        auto [provider_u,
+              prov_u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
+          if constexpr (U_PROV_UPDATE == UProvUpdate::SET_OR_CLEAR) {
+            // correct → max_u, wrong → 0, always write
+            return {val<U_WIDTH>{
+                        bank_u_correct.replicate(hard<U_WIDTH>{}).concat()},
+                    val<1>{hard<1>{}}};
+          } else if constexpr (U_PROV_UPDATE == UProvUpdate::SET_ON_CORRECT) {
+            // correct → max_u, wrong → no write
+            return {val<U_WIDTH>{hard<MAX_U>{}}, bank_u_correct};
+          } else if constexpr (U_PROV_UPDATE == UProvUpdate::INC_DEC) {
+            // correct → saturating u+1, wrong → saturating u-1
+            val<U_WIDTH> inc =
+                select(old_u == hard<MAX_U>{}, old_u, val<U_WIDTH>{old_u + 1});
+            val<U_WIDTH> dec =
+                select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
+            val<U_WIDTH> new_val = select(bank_u_correct, inc, dec);
+            return {new_val, new_val != old_u};
+          } else { // INC_ONLY
+            // correct → saturating u+1, wrong → no write
+            val<U_WIDTH> inc =
+                select(old_u == hard<MAX_U>{}, old_u, val<U_WIDTH>{old_u + 1});
+            return {inc, bank_u_correct & (inc != old_u)};
+          }
+        }();
+
+        struct UResult {
+          val<U_WIDTH> newu;
+          val<1> uw;
+        };
+        auto [base_newu, base_u_write] = [&]() -> UResult {
+          if constexpr (ALT_PROMOTE_ACTIVE) {
+            val<MATCH_BITS> t_match2_loc = train_match2;
+            arr<val<1>, NT + 1> t_m2 = t_match2_loc.make_array(val<1>{});
+            val<PRED_BITS> t_ap = train_alt_pred;
+            val<1> any_alt_correct = (t_ap ^ actual_dir) == hard<0>{};
+            val<1> alt_prom = AltPromoteFn::should_promote(
+                any_provider_wrong, any_alt_correct,
+                val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr},
+                alloc_rng);
+            val<1> do_alt_promote = alt_prom & t_m2[I];
+            return {
+                select(do_alt_promote, val<U_WIDTH>{1},
+                       select(allocate[I], alloc_u,
+                              select(uclear[I], val<U_WIDTH>{0}, provider_u))),
+                (t_m1[I] & prov_u_write & t_ad) | allocate[I] | uclear[I] |
+                    do_alt_promote};
+          } else {
+            return {select(allocate[I], alloc_u,
+                           select(uclear[I], val<U_WIDTH>{0}, provider_u)),
+                    (t_m1[I] & prov_u_write & t_ad) | allocate[I] | uclear[I]};
+          }
+        }();
+
+        // Probabilistic decay
+        auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
+          if constexpr (!DECAY_ENABLE) {
+            return {base_newu, base_u_write};
+          } else {
+            constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
+            auto &lfsr = std::get<I>(decay_lfsrs);
+            val<1> tag_missed = ~val<1>{train_tag_hit[I]};
+            val<1> decay_miss = [&]() {
+              if constexpr (!USE_SEC_TAG || DECAY_MISS == DecayMiss::TAG)
+                return tag_missed;
+              else {
+                val<1> sec_missed = ~val<1>{train_sec_hit[I]};
+                if constexpr (DECAY_MISS == DecayMiss::SEC)
+                  return sec_missed;
+                else if constexpr (DECAY_MISS == DecayMiss::TAG_OR_SEC)
+                  return tag_missed | sec_missed;
+                else
+                  return tag_missed & sec_missed;
+              }
+            }();
+            auto thresh = DecayThreshFn::template compute<I, LW>(
+                val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
+            val<1> decay_fire =
+                decay_miss & ~allocate[I] & (val<LW>{lfsr} < thresh);
+            val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I][UB]};
+            val<U_WIDTH> decayed_u = [&]() {
+              if constexpr (DECAY_OP == DecayOp::DECREMENT)
+                return select(old_u == hard<0>{}, old_u,
+                              val<U_WIDTH>{old_u - 1});
+              else if constexpr (DECAY_OP == DecayOp::HALVE)
+                return val<U_WIDTH>{old_u >> 1};
+              else
+                return val<U_WIDTH>{0};
+            }();
+            val<U_WIDTH> merged = select(base_u_write, base_newu,
+                                         select(decay_fire, decayed_u, old_u));
+            val<1> merged_write = base_u_write | decay_fire;
+            val<1> merged_changed = merged != old_u;
+            return {merged, merged_write & merged_changed};
+          }
+        }();
+
+        execute_if(do_train & u_write, [&]() {
+          t.u_ram[UB].write(val<t.IDX_BITS>{train_idx[I]}, newu, hard<0>{});
+        });
 #ifdef TAGE_MONITOR
-      if (static_cast<u64>(do_train & u_write))
-        mon.record_u_write(I, static_cast<u64>(newu) != 0);
-      if constexpr (DECAY_ENABLE) {
-        // decay_fire = u_write & ~base_u_write (only non-base u write is decay)
-        if (static_cast<u64>(do_train & u_write & ~base_u_write))
-          mon.record_decay_fire();
-      }
+        if (static_cast<u64>(do_train & u_write))
+          mon.record_u_write(I, UB,
+                             static_cast<u64>(val<t.IDX_BITS>{train_idx[I]}),
+                             static_cast<u64>(newu));
 #endif
+      }); // end static_loop<U_BANKS>
 #ifdef TIMING_DEBUG
-      dbg_pred_write[I] = do_train & (do_alloc | do_pred_update);
-      dbg_hyst_write[I] = do_train & (do_alloc | do_hyst_update);
       dbg_tag_write[I] = do_train & do_alloc;
-      dbg_u_write[I] = do_train & u_write;
-      if constexpr (DECAY_ENABLE) {
-        dbg_decay_fire[I] = u_write & ~base_u_write;
-        dbg_decay_merged[I] = val<1>{newu};
-      }
+      // pred_write and hyst_write not easily tracked with banking; use alloc
+      // gate
+      dbg_pred_write[I] = do_train & do_alloc;
+      dbg_hyst_write[I] = do_train & do_alloc;
+      dbg_u_write[I] = do_train & do_alloc;
 #endif
     });
 
@@ -1014,18 +1262,41 @@ struct TageAhead : predictor {
       // Accuracy counter: increment on correct, decrement on mispredict
       auto new_acc = ta_update_ctr(val<ACC_WIDTH>{acc_ctr}, ~mispredict);
 
-      // Alloc pressure counter: increment when no alloc slot found
-      val<1> any_alloc = alloc_target != hard<0>{};
-      auto new_alloc = ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
+      // Alloc pressure counter
+      auto new_alloc = [&]() {
+        if constexpr (FARALLOC_DIST > 0) {
+          // Tage.hpp-style: only update on mispredict; inc on far alloc, dec on
+          // close
+          val<NT> at = alloc_target;
+          at.fanout(hard<2>{});
+          val<NT> shifted_prov = val<NT>{t_match1} >> FARALLOC_DIST;
+          val<1> faralloc = ((shifted_prov | at).one_hot() ^ at) == hard<0>{};
+          return select(mispredict,
+                        ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, faralloc),
+                        val<ALLOC_WIDTH>{alloc_ctr});
+        } else {
+          // Default: increment when no alloc slot found
+          val<1> any_alloc = alloc_target != hard<0>{};
+          return ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
+        }
+      }();
 
       if constexpr (EPOCH_ENABLE) {
+        // Epoch counter: free-running, incremented each update_cycle
+        val<EPOCH_CTR_WIDTH> ectr = val<EPOCH_CTR_WIDTH>{epoch_ctr};
+
         // Epoch: bulk reset u_ram when trigger fires
         val<1> epoch_fire =
-            EpochTriggerFn::template should_fire<ACC_WIDTH, ALLOC_WIDTH>(
-                val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
+            EpochTriggerFn::template should_fire<ACC_WIDTH, ALLOC_WIDTH,
+                                                 EPOCH_CTR_WIDTH>(
+                val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr}, ectr);
         execute_if(epoch_fire, [&]() {
-          static_loop<NT>([&]<u64 I>() { std::get<I>(tables).u_ram.reset(); });
+          static_loop<NT>([&]<u64 I>() {
+            static_loop<U_BANKS>(
+                [&]<u64 UB>() { std::get<I>(tables).u_ram[UB].reset(); });
+          });
         });
+        epoch_ctr = val<EPOCH_CTR_WIDTH>{ectr + 1};
 #ifdef TIMING_DEBUG
         dbg_epoch_fire = epoch_fire;
 #endif
@@ -1147,3 +1418,100 @@ struct TageAhead : predictor {
     // std::cerr << "=== EXIT update_cycle ===\n";
   }
 };
+
+// ---- Convenience typedefs for technique sweeps ----
+// Technique 3: Alt bank promotion variants
+using TageAhead_AltPromAlways =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteAlways>;
+using TageAhead_AltPromProb128 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteProb<128>>;
+using TageAhead_AltPromPress =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromotePressure>;
+
+// Technique 4: Replacement policy variants
+using TageAhead_ReplWeakConf1 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZeroWeakConf<1>>;
+using TageAhead_ReplPressAdapt =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplacePressureAdaptive<1, 4>>;
+
+// Technique 6: DIP-like allocation variants
+using TageAhead_DIP64 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteOff, 64, 1,
+              UProvUpdate::SET_OR_CLEAR>;
+using TageAhead_DIP128 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteOff, 128, 1,
+              UProvUpdate::SET_OR_CLEAR>;
+
+// Combined: best of each (alt promote + confidence gate + DIP)
+using TageAhead_AllTechniques =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 3, 2, 2, 8192, true, 6, 5, 256, 2,
+              1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZeroWeakConf<1>, AltPromoteAlways, 64, 1,
+              UProvUpdate::SET_OR_CLEAR>;
+
+// Per-branch banking variants (HYST_BANKS, HYST_BANK_BIT, U_BANKS, U_BANK_BIT)
+// 2 hyst banks, bit 1 (pairs {0,1},{2,3},{4,5},{6,7} interleaved)
+using TageAhead_HystBank2 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 1, 3, 2, 8192 * 2, false, 6, 5,
+              256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4,
+              false, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteOff, 0, 1,
+              UProvUpdate::SET_OR_CLEAR, false, 0, 2, 1, 1, 0>;
+// 4 hyst+u banks, bit 0 (interleaved)
+using TageAhead_Bank4 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 1, 3, 2, 8192 * 2, false, 6, 5,
+              256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4,
+              false, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteOff, 0, 1,
+              UProvUpdate::SET_OR_CLEAR, false, 0, 4, 0, 4, 0>;
+// 8 hyst+u banks (fully per-branch)
+using TageAhead_Bank8 =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 1, 3, 2, 8192 * 2, false, 6, 5,
+              256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig, 4, 4,
+              false, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteOff, 0, 1,
+              UProvUpdate::SET_OR_CLEAR, false, 0, 8, 0, 8, 0>;
