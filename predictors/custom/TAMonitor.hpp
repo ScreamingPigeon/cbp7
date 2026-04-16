@@ -17,7 +17,7 @@ using u64 = uint64_t;
 
 template <u64 NUM_TABLES, u64 N, u64 MAX_TABLE_ENTRIES = 2048,
           bool USE_GSHARE = false, u64 FB_CAPACITY = 8192,
-          u64 HYST_BANKS = 1, u64 U_BANKS = 1>
+          u64 HYST_BANKS = 1, u64 U_BANKS = 1, u64 NUM_PATHS = 1>
 struct TAMonitor {
 
   static constexpr const char *FB_NAME = USE_GSHARE ? "Gshare" : "Bimodal";
@@ -100,6 +100,14 @@ struct TAMonitor {
     std::array<u64, NUM_TABLES> sec_reject_count{};      // tag hit, sec miss
     std::array<u64, NUM_TABLES> sec_reject_correct{};    // rejected but would have predicted correctly
     std::array<u64, NUM_TABLES> sec_reject_wrong{};      // rejected and would have predicted wrong
+
+    // Multi-path sec tag banking (NUM_PATHS > 1)
+    std::array<std::array<u64, NUM_PATHS>, NUM_TABLES> path_hit{};    // per-table, per-path sec match
+    std::array<u64, NUM_TABLES> path_neither{};    // neither path matched (bimodal fallback)
+    std::array<u64, NUM_TABLES> path_both{};       // both paths matched (degenerate)
+    std::array<std::array<u64, NUM_PATHS>, NUM_TABLES> provider_from_path{};  // which path provided
+    std::array<std::array<u64, NUM_PATHS>, NUM_TABLES> provider_path_correct{}; // correct per path
+    std::array<std::array<u64, NUM_PATHS>, NUM_TABLES> alloc_to_path{};  // allocation target path
 
     // Allocation
     u64 alloc_attempts = 0;
@@ -290,6 +298,39 @@ struct TAMonitor {
       if (tag_hit) c.tag_matches[table]++;
       if (sec_hit) c.sec_matches[table]++;
       if (tag_hit && sec_hit) c.full_matches[table]++;
+    };
+    record(cum);
+    record(win);
+  }
+
+  // Multi-path: per-table path hit distribution (called during path mux)
+  void record_path_hits(u64 table, const bool path_hits[NUM_PATHS]) {
+    auto record = [&](Counters &c) {
+      u64 hit_count = 0;
+      for (u64 p = 0; p < NUM_PATHS; p++) {
+        if (path_hits[p]) { c.path_hit[table][p]++; hit_count++; }
+      }
+      if (hit_count == 0) c.path_neither[table]++;
+      if (hit_count > 1) c.path_both[table]++;
+    };
+    record(cum);
+    record(win);
+  }
+
+  // Multi-path: which path was the provider and was it correct
+  void record_provider_path(u64 table, u64 path, bool correct) {
+    auto record = [&](Counters &c) {
+      c.provider_from_path[table][path]++;
+      if (correct) c.provider_path_correct[table][path]++;
+    };
+    record(cum);
+    record(win);
+  }
+
+  // Multi-path: allocation went to which path
+  void record_alloc_path(u64 table, u64 path) {
+    auto record = [&](Counters &c) {
+      c.alloc_to_path[table][path]++;
     };
     record(cum);
     record(win);
@@ -762,6 +803,63 @@ struct TAMonitor {
            << std::setw(11) << total_wrong << " |"
            << std::setw(7) << pct(total_correct, total_reject) << "%\n";
       }
+    }
+
+    // Multi-path sec tag banking
+    if constexpr (NUM_PATHS > 1) {
+      os << "\n--- Multi-Path Sec Tag Banking (NUM_PATHS=" << NUM_PATHS << ") ---\n";
+      os << "  Table  |";
+      for (u64 p = 0; p < NUM_PATHS; p++) os << "   P" << p << "hit ";
+      os << "| Neither | Both    | P0prov  | P1prov  | P0acc   | P1acc   | P0alloc | P1alloc\n";
+      os << "  -------+";
+      for (u64 p = 0; p < NUM_PATHS; p++) os << "---------";
+      os << "+---------+---------+---------+---------+---------+---------+---------+--------\n";
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        u64 lookups = c.tag_lookups[i];
+        os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|";
+        for (u64 p = 0; p < NUM_PATHS; p++)
+          os << std::setw(7) << pct(c.path_hit[i][p], lookups) << "% ";
+        os << "|" << std::setw(7) << pct(c.path_neither[i], lookups) << "%"
+           << " |" << std::setw(7) << pct(c.path_both[i], lookups) << "%";
+        // Provider path distribution + accuracy
+        u64 total_prov = 0;
+        for (u64 p = 0; p < NUM_PATHS; p++) total_prov += c.provider_from_path[i][p];
+        for (u64 p = 0; p < std::min(NUM_PATHS, u64(2)); p++)
+          os << " |" << std::setw(8) << c.provider_from_path[i][p];
+        for (u64 p = 0; p < std::min(NUM_PATHS, u64(2)); p++)
+          os << " |" << std::setw(6) << pct(c.provider_path_correct[i][p],
+                                             c.provider_from_path[i][p]) << "%";
+        for (u64 p = 0; p < std::min(NUM_PATHS, u64(2)); p++)
+          os << " |" << std::setw(8) << c.alloc_to_path[i][p];
+        os << "\n";
+      }
+      // Totals
+      u64 t_lookups = 0;
+      std::array<u64, NUM_PATHS> t_phit{}, t_pprov{}, t_pcorr{}, t_palloc{};
+      u64 t_neither = 0, t_both = 0;
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        t_lookups += c.tag_lookups[i];
+        t_neither += c.path_neither[i];
+        t_both += c.path_both[i];
+        for (u64 p = 0; p < NUM_PATHS; p++) {
+          t_phit[p] += c.path_hit[i][p];
+          t_pprov[p] += c.provider_from_path[i][p];
+          t_pcorr[p] += c.provider_path_correct[i][p];
+          t_palloc[p] += c.alloc_to_path[i][p];
+        }
+      }
+      os << "  Total  |";
+      for (u64 p = 0; p < NUM_PATHS; p++)
+        os << std::setw(7) << pct(t_phit[p], t_lookups) << "% ";
+      os << "|" << std::setw(7) << pct(t_neither, t_lookups) << "%"
+         << " |" << std::setw(7) << pct(t_both, t_lookups) << "%";
+      for (u64 p = 0; p < std::min(NUM_PATHS, u64(2)); p++)
+        os << " |" << std::setw(8) << t_pprov[p];
+      for (u64 p = 0; p < std::min(NUM_PATHS, u64(2)); p++)
+        os << " |" << std::setw(6) << pct(t_pcorr[p], t_pprov[p]) << "%";
+      for (u64 p = 0; p < std::min(NUM_PATHS, u64(2)); p++)
+        os << " |" << std::setw(8) << t_palloc[p];
+      os << "\n";
     }
 
     // Allocation

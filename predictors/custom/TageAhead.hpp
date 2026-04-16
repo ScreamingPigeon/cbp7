@@ -13,7 +13,7 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 8, u64 SIZE = 1024, u64 TAG = 10, u64 MINH = 10,
+template <u64 N = 8, u64 SIZE = 512, u64 TAG = 10, u64 MINH = 10,
           u64 MAXH = 100, u64 SIZE_RATIO = 1,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::GradedTag<TAG, TAG - 1>,
@@ -50,21 +50,21 @@ struct TATableConfig {
 
 template <
     typename TableCfg = TATableConfig<>,
-    u64 N = 8,               // max conditional branches per block
-    u64 PATHBITS = 6,        // bits of next_pc injected into history
-    u64 SEC_TAG_BITS = 3,    // secondary tag width (ahead ambiguity)
-    bool USE_SEC_TAG = true, // enable secondary tag matching
-    u64 CTR_WIDTH = 1,       // prediction counter width per lane
-    u64 HYST_WIDTH = 3,      // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 2,         // usefulness counter width
+    u64 N = 8,                  // max conditional branches per block
+    u64 PATHBITS = 6,           // bits of next_pc injected into history
+    u64 SEC_TAG_BITS = 1,       // secondary tag width (1-bit: slot index IS the tag)
+    bool USE_SEC_TAG = true,    // enable secondary tag matching
+    u64 CTR_WIDTH = 1,          // prediction counter width per lane
+    u64 HYST_WIDTH = 3,         // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 2,            // usefulness counter width
     u64 FB_CAPACITY = 8192 * 2, // fallback table size (bimodal or gshare)
-    bool USE_GSHARE = false, // use gshare base (PC^history) vs bimodal (PC)
-    u64 GS_HIST = 6,         // gshare history length (only when USE_GSHARE)
-    u64 META_WIDTH = 5,      // meta counter width (provider vs alt)
-    u64 META_CAPACITY = 256, // meta table entries
-    u64 META_PIPE = 2,       // meta pipeline depth
-    u64 LINEINST = 1024,     // line size in instructions
-    bool SHARED_HYS = true,  // shared hyst: 2 entries share 1 counter
+    bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
+    u64 GS_HIST = 6,            // gshare history length (only when USE_GSHARE)
+    u64 META_WIDTH = 5,         // meta counter width (provider vs alt)
+    u64 META_CAPACITY = 256,    // meta table entries
+    u64 META_PIPE = 2,          // meta pipeline depth
+    u64 LINEINST = 1024,        // line size in instructions
+    bool SHARED_HYS = true,     // shared hyst: 2 entries share 1 counter
     HistUpdate HIST_MODE =
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
     // ---- Allocation policy ----
@@ -100,11 +100,16 @@ template <
     u64 FARALLOC_DIST =
         3, // 0=off; when >0, alloc_ctr uses faralloc logic (Tage.hpp style)
     // ---- Per-branch hyst/u banking ----
-    u64 HYST_BANKS = 2, // hyst banks per table (1=shared, N=per-branch)
+    u64 HYST_BANKS = 1, // hyst banks per table (1=shared, N=per-branch)
     u64 HYST_BANK_BIT =
-        0,             // starting bit of branch rank for hyst bank selection
-    u64 U_BANKS = 4,   // u banks per table (1=shared, N=per-branch)
-    u64 U_BANK_BIT = 0 // starting bit of branch rank for u bank selection
+        0,              // starting bit of branch rank for hyst bank selection
+    u64 U_BANKS = 2,    // u banks per table (1=shared, N=per-branch)
+    u64 U_BANK_BIT = 0, // starting bit of branch rank for u bank selection
+    // ---- Multi-path sec tag banking ----
+    // Each table entry stores NUM_PATHS copies of (pred, sec_tag, u).
+    // In update_cycle, the path whose sec_tag matches the actual next_pc
+    // is selected. This disambiguates ahead-pipelined stale history.
+    u64 NUM_PATHS = 2 // paths per entry (1=off, 2=sec tag banking)
     >
 struct TageAhead : predictor {
 
@@ -173,7 +178,7 @@ struct TageAhead : predictor {
       typename TAMakeTableTuple<TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
                                 SEC_TAG_BITS, N, SHARED_HYS, HYST_BANKS,
                                 U_BANKS, std::make_index_sequence<NT>>::type;
-  Tables tables;
+  Tables tables[NUM_PATHS];
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
   ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
 
@@ -226,28 +231,26 @@ struct TageAhead : predictor {
   // prefetch_*: written in predict1 (ahead reads for next block)
   reg<MAX_TAG_WIDTH> prefetch_tag[NT];
   reg<1> prefetch_tag_hit[NT]; // primary tag match (computed off crit path)
-  reg<PRED_BITS> prefetch_pred[NT];
-  reg<SEC_TAG_BITS> prefetch_sec[NT];
+  reg<PRED_BITS> prefetch_pred[NT][NUM_PATHS];
   reg<MAX_IDX_BITS> prefetch_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> prefetch_hyst[NT][HYST_BANKS];
-  reg<U_WIDTH> prefetch_u[NT][U_BANKS];
+  reg<U_WIDTH> prefetch_u[NT][NUM_PATHS][U_BANKS];
   reg<MAX_TAG_WIDTH> prefetch_ctag[NT]; // computed tag for allocation piping
 
   // current_*: shifted from prefetch, used for prediction
   reg<MAX_TAG_WIDTH> current_tag[NT];
   reg<1> current_tag_hit[NT];
-  reg<PRED_BITS> current_pred[NT];
-  reg<SEC_TAG_BITS> current_sec[NT];
+  reg<PRED_BITS> current_pred[NT][NUM_PATHS];
   reg<MAX_IDX_BITS> current_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> current_hyst[NT][HYST_BANKS];
-  reg<U_WIDTH> current_u[NT][U_BANKS];
+  reg<U_WIDTH> current_u[NT][NUM_PATHS][U_BANKS];
   reg<MAX_TAG_WIDTH> current_ctag[NT]; // piped computed tag for allocation
 
   // train_*: saved from current_* before pipeline shift, used for training
   // (training is for block A, resolution is for block B)
   reg<MAX_IDX_BITS> train_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT][HYST_BANKS];
-  reg<U_WIDTH> train_u[NT][U_BANKS];
+  reg<U_WIDTH> train_u[NT][NUM_PATHS][U_BANKS];
   reg<PRED_BITS> train_fb;
   reg<FB_IDX_BITS> train_fb_idx;
   reg<ALLOC_PC_BITS> train_pc;
@@ -265,10 +268,14 @@ struct TageAhead : predictor {
   // Guard: skip training until piped resolution regs have been populated
   reg<1> train_valid = 0;
 
+  // ---- Path selection for training ----
+  // With 1-bit sec_tag, slot index IS the sec_tag. curr_sec_tag at resolution
+  // time determines which path was "active" for this block.
+  reg<1> train_active_path; // scalar: which path slot was active (0 or 1)
+
   // ---- U-bit decay (probabilistic) ----
-  // Piped tag/sec hit for decay miss detection
+  // Piped tag hit for decay miss detection (sec_hit removed — no sec_ram)
   reg<1> train_tag_hit[NT];
-  reg<1> train_sec_hit[NT];
 
   // Global pressure counters (always declared, zero-cost when unused)
   reg<ACC_WIDTH> acc_ctr;
@@ -296,6 +303,10 @@ struct TageAhead : predictor {
 
 // ---- Timing debug taps (zero cost in normal builds) ----
 #ifdef TIMING_DEBUG
+  // Path mux (NUM_PATHS > 1)
+  reg<1> dbg_next_pc;       // block_end_info.next_pc arrival
+  reg<1> dbg_sec_tag_write; // curr_sec_tag after write (line 556)
+  reg<1> dbg_sec_tag_read;  // curr_sec_tag as read in path mux (line 581)
   reg<1> dbg_full_hits;     // after per-table hit computation
   reg<1> dbg_fb_pred;       // after fallback read
   reg<1> dbg_match;         // after concat into match bitmask
@@ -307,7 +318,11 @@ struct TageAhead : predictor {
   reg<1> dbg_has_alt;       // after has_alt mask
   reg<1> dbg_meta_use_alt;  // after meta pipeline read
   reg<1> dbg_use_alt;       // after final use_alt AND
-  reg<1> dbg_final_pred;    // after select mux
+  reg<1> dbg_use_alt_0;     // chain 0: provider_weak_0 & meta_use_alt & has_alt
+  reg<1> dbg_use_alt_1;     // chain 1: pw1 & meta_use_alt & has_alt (NUM_PATHS>1)
+  reg<1> dbg_final_pred_0;  // chain 0 final_pred before path select
+  reg<1> dbg_final_pred_1;  // chain 1 final_pred before path select (NUM_PATHS>1)
+  reg<1> dbg_final_pred;    // after path select mux
   reg<1> dbg_mispredict;    // framework's is_mispredict
   reg<1> dbg_true_block;    // true_block after computation
   reg<1> dbg_inst_pc;       // inst_pc arrival in predict1
@@ -340,10 +355,15 @@ struct TageAhead : predictor {
   reg<1> dbg_decay_fire[NT];   // decay_fire per table
   reg<1> dbg_decay_merged[NT]; // merged u value per table
   reg<1> dbg_epoch_fire;       // epoch trigger
+  // predict1 RAM read timing
+  reg<1> dbg_tag_ram_p1;
+  reg<1> dbg_pred_ram_p1;
+  reg<1> dbg_fb_ram_p1;
 #endif
 
 #ifdef TAGE_MONITOR
-  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, HYST_BANKS, U_BANKS>
+  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, HYST_BANKS, U_BANKS,
+            NUM_PATHS>
       mon;
   ~TageAhead() { mon.print_summary(); }
 #endif
@@ -389,33 +409,52 @@ struct TageAhead : predictor {
     //   current_*. In hardware, the RAM reads happen regardless — execute_if
     //   only gates the output latch, so removing it has zero area/power impact.
     static_loop<NT>([&]<u64 I>() {
-      auto &t = std::get<I>(tables);
-      auto idx = t.fold_idx.get() ^ val<t.IDX_BITS>{inst_pc >> 2};
-      idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
-      auto computed_tag = t.fold_tag.get() ^ val<t.tag_width>{inst_pc >> 4};
+      auto &t = std::get<I>(tables[0]);
+      auto fold_idx_val = t.fold_idx.get();
+      fold_idx_val.fanout(hard<2>{}); // idx XOR + debug tap
+      auto fold_tag_val = t.fold_tag.get();
+      fold_tag_val.fanout(hard<2>{}); // tag XOR + debug tap
+      auto idx = fold_idx_val ^ val<t.IDX_BITS>{inst_pc >> 2};
+      // fanout: 1 tag_ram + HYST_BANKS hyst_ram + NUM_PATHS*(1 pred +
+      // U_BANKS u) + 1 idx  (sec_ram removed)
+      idx.fanout(hard<2 + HYST_BANKS + NUM_PATHS * (1 + U_BANKS)>{});
+      auto computed_tag = fold_tag_val ^ val<t.tag_width>{inst_pc >> 4};
 
 #ifdef TIMING_DEBUG
       if constexpr (I == 0) {
-        dbg_fold_idx = val<1>{t.fold_idx.get()};
-        dbg_fold_tag = val<1>{t.fold_tag.get()};
+        dbg_fold_idx = val<1>{fold_idx_val};
+        dbg_fold_tag = val<1>{fold_tag_val};
       }
 #endif
 
       auto stored_tag = t.tag_ram.read(idx);
       stored_tag.fanout(hard<2>{});
+#ifdef TIMING_DEBUG
+      if constexpr (I == 0)
+        dbg_tag_ram_p1 = val<1>{stored_tag};
+#endif
       prefetch_tag[I] = stored_tag;
       prefetch_tag_hit[I] =
           val<MAX_TAG_WIDTH>{stored_tag} == val<MAX_TAG_WIDTH>{computed_tag};
       prefetch_ctag[I] = computed_tag;
-      prefetch_pred[I] = t.pred_ram.read(idx);
-      if constexpr (USE_SEC_TAG)
-        prefetch_sec[I] = t.sec_ram.read(idx);
       prefetch_idx[I] = idx;
+      // Shared reads (path 0 only): hyst
       static_loop<HYST_BANKS>([&]<u64 HB>() {
         prefetch_hyst[I][HB] = t.hyst_ram[HB].read(val<t.HYST_IDX_BITS>{idx});
       });
-      static_loop<U_BANKS>(
-          [&]<u64 UB>() { prefetch_u[I][UB] = t.u_ram[UB].read(idx); });
+      // Per-path reads: each path has its own pred and u RAMs
+      // in tables[P]. All paths read at the same stale index (parallel).
+      // sec_ram eliminated — slot index IS the 1-bit sec_tag.
+      static_loop<NUM_PATHS>([&]<u64 P>() {
+        auto &tp = std::get<I>(tables[P]);
+        prefetch_pred[I][P] = tp.pred_ram.read(idx);
+#ifdef TIMING_DEBUG
+        if constexpr (I == 0 && P == 0)
+          dbg_pred_ram_p1 = val<1>{prefetch_pred[I][P]};
+#endif
+        static_loop<U_BANKS>(
+            [&]<u64 UB>() { prefetch_u[I][P][UB] = tp.u_ram[UB].read(idx); });
+      });
     });
 
     // Fallback ahead read (direct-mapped, no tag match needed)
@@ -428,6 +467,9 @@ struct TageAhead : predictor {
     }();
     prefetch_fb_idx = fb_idx;
     prefetch_fb = fb_ctr.read(fb_idx);
+#ifdef TIMING_DEBUG
+    dbg_fb_ram_p1 = val<1>{prefetch_fb};
+#endif
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
 
     // Crit path: just read precomputed prediction from reg
@@ -490,13 +532,12 @@ struct TageAhead : predictor {
       train_idx[I] = current_idx[I];
       static_loop<HYST_BANKS>(
           [&]<u64 HB>() { train_hyst[I][HB] = current_hyst[I][HB]; });
-      static_loop<U_BANKS>(
-          [&]<u64 UB>() { train_u[I][UB] = current_u[I][UB]; });
+      static_loop<NUM_PATHS>([&]<u64 P>() {
+        static_loop<U_BANKS>(
+            [&]<u64 UB>() { train_u[I][P][UB] = current_u[I][P][UB]; });
+      });
       train_ctag[I] = current_ctag[I];
       train_tag_hit[I] = current_tag_hit[I];
-      if constexpr (USE_SEC_TAG)
-        train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I]} ==
-                            val<SEC_TAG_BITS>{curr_sec_tag});
     });
     train_fb = current_fb;
     train_fb_idx = current_fb_idx;
@@ -505,14 +546,14 @@ struct TageAhead : predictor {
     static_loop<NT>([&]<u64 I>() {
       current_tag[I] = prefetch_tag[I];
       current_tag_hit[I] = prefetch_tag_hit[I];
-      current_pred[I] = prefetch_pred[I];
-      if constexpr (USE_SEC_TAG)
-        current_sec[I] = prefetch_sec[I];
       current_idx[I] = prefetch_idx[I];
       static_loop<HYST_BANKS>(
           [&]<u64 HB>() { current_hyst[I][HB] = prefetch_hyst[I][HB]; });
-      static_loop<U_BANKS>(
-          [&]<u64 UB>() { current_u[I][UB] = prefetch_u[I][UB]; });
+      static_loop<NUM_PATHS>([&]<u64 P>() {
+        current_pred[I][P] = prefetch_pred[I][P];
+        static_loop<U_BANKS>(
+            [&]<u64 UB>() { current_u[I][P][UB] = prefetch_u[I][P][UB]; });
+      });
       current_ctag[I] = prefetch_ctag[I];
     });
     current_fb = prefetch_fb;
@@ -523,53 +564,48 @@ struct TageAhead : predictor {
     mon.shift_block_pc();
 #endif
 
-    // Precompute secondary tag for next block
+    // Precompute 1-bit secondary tag for next block.
+    // XOR hash of two bit positions for ~50/50 distribution.
     if constexpr (USE_SEC_TAG) {
       block_end_info.next_pc.fanout(
-          hard<3>{}); // curr_sec_tag + meta_idx + hist path_bits
-      curr_sec_tag = val<SEC_TAG_BITS>{block_end_info.next_pc >> 2};
+          hard<5>{}); // sec_tag(>>2) + sec_tag(>>5) + meta_idx + hist path_bits
+                      // + dbg
+      curr_sec_tag =
+          val<1>{block_end_info.next_pc >> 2} ^
+          val<1>{block_end_info.next_pc >> 5};
+#ifdef TIMING_DEBUG
+      dbg_next_pc = val<1>{block_end_info.next_pc};
+      dbg_sec_tag_write = val<1>{curr_sec_tag};
+#endif
     } else {
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     }
 
     // ================================================================
-    // Provider / altpred resolution via bitmask + one_hot
+    // Provider / altpred resolution
     //
-    // We cannot reassign val<N> (private operator=), so we avoid
-    // accumulation loops. Instead:
-    //   1. Compute per-table hit bits → arr<val<1>, NT>
-    //   2. Concat into val<NT+1> with fallback as MSB always-hit
-    //   3. one_hot() → lowest set bit = longest-history hit = provider
-    //   4. one_hot() on remainder → alt
-    //   5. Replicate one-hot bits to PRED_BITS width, AND with each
-    //      table's prediction, fold_or → extract provider/alt pred
+    // With 1-bit sec_tag: slot index IS the sec_tag. Both path chains
+    // run in parallel using primary-tag-only full_hits. curr_sec_tag
+    // gates only the final select — completely off the critical path.
+    //
+    // Shared across paths: full_hits, match, match1, match2, has_alt,
+    //   meta_use_alt, provider_weakconf (hyst is shared).
+    // Per-path: table_preds, provider_pred, alt_pred, provider_weak,
+    //   use_alt, final_pred.
     // ================================================================
 
-    // 2. Per-table hit: primary tag matched (off crit path) AND
-    //    optionally stored secondary tag matches curr_sec_tag
-    if constexpr (USE_SEC_TAG)
-      curr_sec_tag.fanout(hard<NT>{}); // compared once per table
-    arr<val<1>, NT> full_hits = [&](u64 i) {
-      if constexpr (USE_SEC_TAG) {
-        return val<1>{current_tag_hit[i]} &
-               (val<SEC_TAG_BITS>{current_sec[i]} ==
-                val<SEC_TAG_BITS>{curr_sec_tag});
-      } else {
-        return val<1>{current_tag_hit[i]};
-      }
+    // 2. full_hits — primary tag match only (no sec_tag check).
+    //    With parallel chains, curr_sec_tag is deferred to the final select.
+    arr<val<1>, NT> full_hits = [&](u64 i) -> val<1> {
+      return val<1>{current_tag_hit[i]};
     };
 
 #ifdef TAGE_MONITOR
     for (u64 i = 0; i < NT; i++) {
       bool th = static_cast<u64>(current_tag_hit[i]);
-      bool sh = USE_SEC_TAG
-                    ? static_cast<u64>(val<SEC_TAG_BITS>{current_sec[i]} ==
-                                       val<SEC_TAG_BITS>{curr_sec_tag})
-                    : false;
-      mon.record_tag_lookup(i, th, sh);
+      mon.record_tag_lookup(i, th, th); // sec_hit = tag_hit (implicit sec)
       mon.record_table_pred(
-          i, static_cast<u64>(val<PRED_BITS>{current_pred[i]}), th, sh);
-      // Feature 7: tag collision check
+          i, static_cast<u64>(val<PRED_BITS>{current_pred[i][0]}), th, th);
       mon.record_collision_check(
           i, static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]}), th);
     }
@@ -581,24 +617,21 @@ struct TageAhead : predictor {
 
     // 3. Fallback — ahead-pipelined, already in current_fb from pipe shift.
     val<PRED_BITS> fb_pred = val<PRED_BITS>{current_fb};
+    // Consumers: NUM_PATHS table_preds arrays (each reads fb_pred as element NT)
+    fb_pred.fanout(hard<std::max(u64(2), u64(NUM_PATHS))>{});
 
 #ifdef TIMING_DEBUG
     dbg_fb_pred = val<1>{fb_pred};
 #endif
 
-    // 4. Build match bitmask.
-    //    Bit layout of val<NT+1>:
-    //      bit 0     = table 0 (longest history)
-    //      bit NT-1  = table NT-1 (shortest history)
-    //      bit NT    = fallback (always 1)
-    //    one_hot() returns lowest set bit → longest-history hit = provider.
-    //    Second one_hot() on (match ^ match1) → alt provider.
+    // 4. Build match bitmask (SHARED across paths).
+    //    full_hits is primary-tag-only, so match/match1/match2 are path-independent.
     val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
     match.fanout(hard<2>{}); // one_hot + XOR
     val<MATCH_BITS> match1 = match.one_hot();
     match1.fanout(hard<3>{}); // make_array + XOR with match + alloc_base
     val<MATCH_BITS> match2 = (match ^ match1).one_hot();
-    match2.fanout(hard<2>{}); // make_array + has_alt mask
+    match2.fanout(hard<2>{}); // make_array + has_alt
 
 #ifdef TIMING_DEBUG
     dbg_match = val<1>{match};
@@ -606,61 +639,41 @@ struct TageAhead : predictor {
     dbg_match2 = val<1>{match2};
 #endif
 
-    // 5. Prediction array: one PRED_BITS-wide entry per table + fallback.
-    //    table_preds[0..NT-1] = TAGE tables, table_preds[NT] = fallback.
-    arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
-      if (i < NT)
-        return val<PRED_BITS>{current_pred[i]};
-      return val<PRED_BITS>{fb_pred};
-    };
-
-    // 6. Extract provider and alt predictions.
-    //    For each table: replicate its one-hot match bit to PRED_BITS width,
-    //    AND with that table's prediction. Since match1 is one-hot, exactly
-    //    one table contributes non-zero bits. fold_or collapses to that pred.
+    // 5. Shared one-hot bit arrays.
+    //    m1_bits per-element consumers:
+    //      NUM_PATHS × provider_masked + NUM_PATHS × weak_arr + 1 × weakconf_arr
+    //    = 2*NUM_PATHS + 1
     arr<val<1>, NT + 1> m1_bits = match1.make_array(val<1>{});
     arr<val<1>, NT + 1> m2_bits = match2.make_array(val<1>{});
-    m1_bits.fanout(hard<6>{});
-    m2_bits.fanout(hard<2>{});
+    m1_bits.fanout(hard<2 * NUM_PATHS + 1>{}); // provider + weak per path + weakconf
+    m2_bits.fanout(hard<std::max(u64(2), u64(NUM_PATHS))>{}); // alt_masked per path
 
-    arr<val<PRED_BITS>, NT + 1> provider_masked = [&](u64 i) {
-      return m1_bits[i].replicate(hard<PRED_BITS>{}).concat() & table_preds[i];
-    };
-    arr<val<PRED_BITS>, NT + 1> alt_masked = [&](u64 i) {
-      return m2_bits[i].replicate(hard<PRED_BITS>{}).concat() & table_preds[i];
-    };
-    val<PRED_BITS> provider_pred = provider_masked.fold_or();
-    val<PRED_BITS> alt_pred = alt_masked.fold_or();
+    // 6. has_alt (SHARED): does the alt match point to a TAGE table?
+    val<1> has_alt =
+        (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
+    // Consumers: NUM_PATHS (one per chain's use_alt)
+    has_alt.fanout(hard<std::max(u64(2), u64(NUM_PATHS))>{});
+
+    // 7. Meta counter (SHARED).
+    auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
+    // Shift FIRST: save old pipeline values before overwriting pipe[0]
+    for (u64 i = META_PIPE - 1; i > 0; i--) {
+      meta_pipe[i] = meta_pipe[i - 1];
+      meta_idx_pipe[i] = meta_idx_pipe[i - 1];
+    }
+    meta_pipe[0] = meta_ctr.read(meta_idx);
+    meta_idx_pipe[0] = meta_idx;
+    val<1> meta_use_alt =
+        val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
+    // Consumers: NUM_PATHS (one per chain's use_alt)
+    meta_use_alt.fanout(hard<std::max(u64(2), u64(NUM_PATHS))>{});
 
 #ifdef TIMING_DEBUG
-    dbg_provider_pred = val<1>{provider_pred};
-    dbg_alt_pred = val<1>{alt_pred};
+    dbg_meta_use_alt = meta_use_alt;
 #endif
 
-    // 7. Provider weakness (per-branch via banking):
-    //    provider_weak = any branch has (hyst==0 AND u==0) → meta override
-    //    provider_weakconf = any branch has hyst==0 → pred direction flip
+    // 8. Provider weakconf (SHARED — hyst is path-independent).
     constexpr u64 HW_RES = std::max(u64(1), HYST_WIDTH);
-    arr<val<1>, NT + 1> weak_arr = [&](u64 i) -> val<1> {
-      if (i < NT) {
-        if constexpr (HYST_BANKS == 1 && U_BANKS == 1) {
-          return m1_bits[i] &
-                 val<1>{val<HW_RES>{current_hyst[i][0]} == hard<0>{}} &
-                 val<1>{val<U_WIDTH>{current_u[i][0]} == hard<0>{}};
-        } else {
-          // OR across branches: any branch weak in this table?
-          arr<val<1>, N> per_br = [&](u64 b) -> val<1> {
-            u64 hb = hyst_bank_of(b);
-            u64 ub = u_bank_of(b);
-            return val<1>{val<HW_RES>{current_hyst[i][hb]} == hard<0>{}} &
-                   val<1>{val<U_WIDTH>{current_u[i][ub]} == hard<0>{}};
-          };
-          return m1_bits[i] & (per_br.concat() != hard<0>{});
-        }
-      }
-      return val<1>{0};
-    };
-    val<1> provider_weak = weak_arr.fold_or();
     arr<val<1>, NT + 1> weakconf_arr = [&](u64 i) -> val<1> {
       if (i < NT) {
         if constexpr (HYST_BANKS == 1) {
@@ -678,49 +691,152 @@ struct TageAhead : predictor {
     };
     val<1> provider_weakconf = weakconf_arr.fold_or();
 
-    // 8. has_alt: does the alt match point to a TAGE table (not fallback)?
-    //    Mask out the fallback bit (MSB) and check if anything remains.
-    val<1> has_alt =
-        (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
+    // ================================================================
+    // 9. Per-path resolution chains.
+    //    Each chain uses its own current_pred[I][P] and current_u[I][P].
+    //    Both chains share full_hits, match1, match2, has_alt, meta_use_alt,
+    //    and provider_weakconf.
+    //
+    //    For NUM_PATHS=1: single chain, no final select.
+    //    For NUM_PATHS=2: two chains, final select with curr_sec_tag.
+    // ================================================================
+
+    // --- Path 0 chain ---
+    arr<val<PRED_BITS>, NT + 1> table_preds_0 = [&](u64 i) -> val<PRED_BITS> {
+      if (i < NT)
+        return val<PRED_BITS>{current_pred[i][0]};
+      return val<PRED_BITS>{fb_pred};
+    };
+    arr<val<PRED_BITS>, NT + 1> prov_masked_0 = [&](u64 i) {
+      return m1_bits[i].replicate(hard<PRED_BITS>{}).concat() & table_preds_0[i];
+    };
+    arr<val<PRED_BITS>, NT + 1> alt_masked_0 = [&](u64 i) {
+      return m2_bits[i].replicate(hard<PRED_BITS>{}).concat() & table_preds_0[i];
+    };
+    val<PRED_BITS> provider_pred_0 = prov_masked_0.fold_or();
+    val<PRED_BITS> alt_pred_0 = alt_masked_0.fold_or();
+    arr<val<1>, NT + 1> weak_arr_0 = [&](u64 i) -> val<1> {
+      if (i < NT) {
+        if constexpr (HYST_BANKS == 1 && U_BANKS == 1) {
+          return m1_bits[i] &
+                 val<1>{val<HW_RES>{current_hyst[i][0]} == hard<0>{}} &
+                 val<1>{val<U_WIDTH>{current_u[i][0][0]} == hard<0>{}};
+        } else {
+          arr<val<1>, N> per_br = [&](u64 b) -> val<1> {
+            u64 hb = hyst_bank_of(b);
+            u64 ub = u_bank_of(b);
+            return val<1>{val<HW_RES>{current_hyst[i][hb]} == hard<0>{}} &
+                   val<1>{val<U_WIDTH>{current_u[i][0][ub]} == hard<0>{}};
+          };
+          return m1_bits[i] & (per_br.concat() != hard<0>{});
+        }
+      }
+      return val<1>{0};
+    };
+    val<1> provider_weak_0 = weak_arr_0.fold_or();
+    val<1> use_alt_0 = provider_weak_0 & meta_use_alt & has_alt;
+    // altdiff: per-path (different provider_pred/alt_pred per chain)
+    constexpr bool ALT_PROMOTE_ACTIVE =
+        !std::is_same_v<AltPromoteFn, AltPromoteOff>;
+    alt_pred_0.fanout(hard<2 + (ALT_PROMOTE_ACTIVE ? 1 : 0)>{}); // select + altdiff + (pipe)
+    val<PRED_BITS> final_pred_0 = select(use_alt_0, alt_pred_0, provider_pred_0);
+#ifdef TIMING_DEBUG
+    dbg_use_alt_0 = use_alt_0;
+    dbg_final_pred_0 = val<1>{final_pred_0};
+#endif
+
+    // --- Path 1 chain (only when NUM_PATHS > 1) ---
+    auto [final_pred_1, provider_pred_1, alt_pred_1, provider_weak_1] = [&]() {
+      if constexpr (NUM_PATHS > 1) {
+        arr<val<PRED_BITS>, NT + 1> tp1 = [&](u64 i) -> val<PRED_BITS> {
+          if (i < NT)
+            return val<PRED_BITS>{current_pred[i][1]};
+          return val<PRED_BITS>{fb_pred};
+        };
+        arr<val<PRED_BITS>, NT + 1> pm1 = [&](u64 i) {
+          return m1_bits[i].replicate(hard<PRED_BITS>{}).concat() & tp1[i];
+        };
+        arr<val<PRED_BITS>, NT + 1> am1 = [&](u64 i) {
+          return m2_bits[i].replicate(hard<PRED_BITS>{}).concat() & tp1[i];
+        };
+        val<PRED_BITS> pp1 = pm1.fold_or();
+        val<PRED_BITS> ap1 = am1.fold_or();
+        arr<val<1>, NT + 1> wa1 = [&](u64 i) -> val<1> {
+          if (i < NT) {
+            if constexpr (HYST_BANKS == 1 && U_BANKS == 1) {
+              return m1_bits[i] &
+                     val<1>{val<HW_RES>{current_hyst[i][0]} == hard<0>{}} &
+                     val<1>{val<U_WIDTH>{current_u[i][1][0]} == hard<0>{}};
+            } else {
+              arr<val<1>, N> per_br = [&](u64 b) -> val<1> {
+                u64 hb = hyst_bank_of(b);
+                u64 ub = u_bank_of(b);
+                return val<1>{val<HW_RES>{current_hyst[i][hb]} == hard<0>{}} &
+                       val<1>{val<U_WIDTH>{current_u[i][1][ub]} == hard<0>{}};
+              };
+              return m1_bits[i] & (per_br.concat() != hard<0>{});
+            }
+          }
+          return val<1>{0};
+        };
+        val<1> pw1 = wa1.fold_or();
+        val<1> ua1 = pw1 & meta_use_alt & has_alt;
+        ap1.fanout(hard<2 + (ALT_PROMOTE_ACTIVE ? 1 : 0)>{}); // select + altdiff + (pipe)
+        val<PRED_BITS> fp1 = select(ua1, ap1, pp1);
+#ifdef TIMING_DEBUG
+        dbg_use_alt_1 = ua1;
+        dbg_final_pred_1 = val<1>{fp1};
+#endif
+        return std::tuple{fp1, pp1, ap1, pw1};
+      } else {
+        // Dummy: NUM_PATHS=1, only path 0 exists
+        return std::tuple{final_pred_0, provider_pred_0, alt_pred_0,
+                          provider_weak_0};
+      }
+    }();
+
+    // 10. Final path select + active chain mux for training.
+    //     curr_sec_tag at +35 gates only these muxes — off the critical
+    //     resolution chain. For NUM_PATHS=1: no select, just use path 0.
+    //     Read curr_sec_tag ONCE, fanout for all consumers.
+    auto [final_pred, provider_pred, alt_pred, provider_weak] = [&]() {
+      if constexpr (NUM_PATHS > 1 && USE_SEC_TAG) {
+        // sec_bit consumers:
+        //   4 selects (final_pred + provider_pred + alt_pred + provider_weak)
+        //   + 1 train_active_path + 1 dbg = 6
+        val<1> sec_bit = val<1>{curr_sec_tag};
+        sec_bit.fanout(hard<6>{});
+        train_active_path = sec_bit;
+#ifdef TIMING_DEBUG
+        dbg_sec_tag_read = sec_bit;
+#endif
+        return std::tuple{
+            select(sec_bit, final_pred_1, final_pred_0),
+            select(sec_bit, provider_pred_1, provider_pred_0),
+            select(sec_bit, alt_pred_1, alt_pred_0),
+            select(sec_bit, provider_weak_1, provider_weak_0)};
+      } else {
+        train_active_path = 0;
+        return std::tuple{final_pred_0, provider_pred_0, alt_pred_0,
+                          provider_weak_0};
+      }
+    }();
 
 #ifdef TIMING_DEBUG
+    dbg_provider_pred = val<1>{provider_pred};
+    dbg_alt_pred = val<1>{alt_pred};
     dbg_provider_weak = provider_weak;
     dbg_has_alt = has_alt;
-#endif
-
-    // 9. Meta counter: predicts whether to trust a newly-allocated provider
-    //    or fall back to alt. Read from PC-indexed RAM, shifted through a
-    //    META_PIPE-stage pipeline. Sign bit of oldest stage decides.
-    auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
-    meta_pipe[0] = meta_ctr.read(meta_idx);
-    meta_idx_pipe[0] = meta_idx;
-    for (u64 i = META_PIPE - 1; i > 0; i--) {
-      meta_pipe[i] = meta_pipe[i - 1];
-      meta_idx_pipe[i] = meta_idx_pipe[i - 1];
-    }
-    val<1> meta_use_alt =
-        val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
-
-#ifdef TIMING_DEBUG
-    dbg_meta_use_alt = meta_use_alt;
-#endif
-
-    // 10. Final prediction mux.
-    //     If provider is newly allocated AND meta says use alt AND
-    //     alt is a real TAGE hit (not just fallback) → use alt_pred.
-    //     Otherwise → provider_pred (which is fallback if no TAGE hit,
-    //     since match1 falls through to the fallback bit).
-    val<1> use_alt = provider_weak & meta_use_alt & has_alt;
-    val<PRED_BITS> final_pred = select(use_alt, alt_pred, provider_pred);
-
-#ifdef TIMING_DEBUG
-    dbg_use_alt = use_alt;
+    dbg_use_alt = provider_weak & has_alt & meta_use_alt; // post-select use_alt
     dbg_final_pred = val<1>{final_pred};
 #endif
 
     // 11. Save old prediction (block B) before scatter overwrites with B+1.
     branch_dir.fanout(
-        hard<4>{}); // badpred + true_block + hist_input + actual_dir
+        hard<3 + (HIST_MODE != HistUpdate::PATH
+                      ? 1
+                      : 0)>{}); // badpred + true_block + actual_dir +
+                                // hist_input(DIR/BOTH)
     arr<val<1>, N> old_pred = [&](u64 i) -> val<1> { return val<1>{pred[i]}; };
 
     // 12. Scatter PRED_BITS into per-branch prediction regs.
@@ -732,7 +848,7 @@ struct TageAhead : predictor {
     for (u64 r = 0; r < num_branch; r++) {
       bool meta_overrode =
           static_cast<u64>(provider_weak) && static_cast<u64>(has_alt);
-      bool meta_chose = static_cast<u64>(use_alt);
+      bool meta_chose = meta_overrode && static_cast<u64>(meta_use_alt);
       bool pred_taken = (static_cast<u64>(final_pred) >> r) & 1;
       mon.record_prediction(r, static_cast<u64>(match1),
                             static_cast<u64>(match2), meta_overrode, meta_chose,
@@ -776,8 +892,7 @@ struct TageAhead : predictor {
     val<1> t_ad = train_altdiff;
 
     // Save current resolution → train regs (for NEXT cycle's training)
-    constexpr bool ALT_PROMOTE_ACTIVE =
-        !std::is_same_v<AltPromoteFn, AltPromoteOff>;
+    // alt_pred consumers: altdiff + train pipe + (alt promote pipe)
     alt_pred.fanout(hard<2 + (ALT_PROMOTE_ACTIVE ? 1 : 0)>{});
     val<1> altdiff = (provider_pred ^ alt_pred) != hard<0>{};
     train_match1 = match1;
@@ -803,7 +918,7 @@ struct TageAhead : predictor {
       path_bits.fanout(hard<NT * 2 + 1 + (USE_GSHARE ? 1 : 0)>{});
       gh.template fanout_per_bit<GH_FANOUT>();
       static_loop<NT>([&]<u64 I>() {
-        auto &t = std::get<I>(tables);
+        auto &t = std::get<I>(tables[0]);
         t.fold_idx.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
         t.fold_tag.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
       });
@@ -825,7 +940,11 @@ struct TageAhead : predictor {
                                               // + (alloc if MISPREDICT) + fb_p2
                                               // + faralloc
     need_extra_cycle(mispredict);
-    do_train.fanout(hard<4 * NT + 3>{}); // gates bim, meta, 4 writes per table
+    do_train.fanout(
+        hard<2 + (FB_TRAIN_P2 ? 1 : 0) +
+             NT *(NUM_PATHS + HYST_BANKS + 1 +
+                  NUM_PATHS * U_BANKS)>{}); // fb + meta + per-table(pred×NP +
+                                            // hyst×HB + tag + u×NP×UB)
 
 #ifdef TAGE_MONITOR
     mon.record_block(static_cast<u64>(val<LOGLINEINST>{block_entry}),
@@ -853,22 +972,53 @@ struct TageAhead : predictor {
                                 }}.concat();
 
     // Provider wrong on any branch? (uses piped provider_pred)
-    t_pp.fanout(hard<2>{});
-    actual_dir.fanout(hard<NT + 1 + (ALT_PROMOTE_ACTIVE ? NT : 0)>{});
+    t_pp.fanout(hard<1 + NT +
+                     (HYST_BANKS > 1 ? NT : 0)>{}); // any_prov_wrong +
+                                                    // per_branch_wrong×NT +
+                                                    // pred_update_data×NT(HB>1)
+    actual_dir.fanout(
+        hard<3 + NT * (1 + (HYST_BANKS == 1 ? 1 : 0) + NUM_PATHS) +
+             (ALT_PROMOTE_ACTIVE ? NT * NUM_PATHS * U_BANKS
+                                 : 0)>{}); // any_prov_wrong + fb_changed +
+                                           // fb_write + NT×(per_branch_wrong +
+                                           // pred_update(HB1) + pred_select×NP)
+                                           // + alt_correct
     val<1> any_provider_wrong = (t_pp ^ actual_dir) != hard<0>{};
     any_provider_wrong.fanout(
-        hard<3 * NT + 1 +
-             (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? 1 : 0) +
-             (ALT_PROMOTE_ACTIVE ? NT : 0)>{});
+        hard<std::max(
+            u64(2),
+            u64(1 + (HYST_BANKS == 1 ? NT : 0) +
+                (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? 1 : 0) +
+                (ALT_PROMOTE_ACTIVE ? NT * NUM_PATHS * U_BANKS
+                                    : 0)))>{}); // meta + do_pred_update×NT(HB1)
+                                                // + alloc_trigger + alt_promote
 
 #ifdef TIMING_DEBUG
     dbg_actual_dir = val<1>{actual_dir};
     dbg_any_prov_wrong = any_provider_wrong;
 #endif
-    t_pw.fanout(hard<2>{});   // meta gate only
-    t_pwc.fanout(hard<NT>{}); // pred flip per table
-    t_m1.fanout(hard<6 + (FB_TRAIN_P2 ? 1 : 0)>{});
-    t_ad.fanout(hard<NT + 1>{});
+#ifdef TAGE_MONITOR
+    // Multi-path: record which path was provider and its accuracy
+    if constexpr (NUM_PATHS > 1) {
+      if (static_cast<u64>(do_train)) {
+        u64 prov = decltype(mon)::decode_provider(static_cast<u64>(t_match1));
+        if (prov < NT) {
+          u64 path = static_cast<u64>(val<1>{train_active_path});
+          bool correct = !static_cast<u64>(any_provider_wrong);
+          mon.record_provider_path(prov, path, correct);
+        }
+      }
+    }
+#endif
+    t_pw.fanout(hard<2>{}); // meta gate only
+    if constexpr (HYST_BANKS == 1)
+      t_pwc.fanout(hard<NT>{}); // pred flip per table (HB==1 only)
+    t_m1.fanout(
+        hard<1 + HYST_BANKS + NUM_PATHS * U_BANKS>{}); // do_pred_update +
+                                                       // do_hyst_update×HB +
+                                                       // u_base_write×NP×UB
+    t_ad.fanout(hard<1 + NT * NUM_PATHS * U_BANKS>{}); // meta_gate +
+                                                       // u_base_write×NT×NP×UB
 
     // ---- Step 3: Allocation ----
 
@@ -910,11 +1060,27 @@ struct TageAhead : predictor {
     val<NT> alloc_base = val<NT>{t_match1 - 1};
     arr<val<1>, NT> replaceable = [&](u64 i) -> val<1> {
       // Use bank 0 for replacement check (heuristic — entry-level decision)
-      return ReplacePolicyFn::template is_replaceable<
-          U_WIDTH, std::max(u64(1), HYST_WIDTH)>(
-          val<U_WIDTH>{train_u[i][0]},
-          val<std::max(u64(1), HYST_WIDTH)>{train_hyst[i][0]},
-          val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr});
+      // With NUM_PATHS: replaceable if ANY path's u qualifies (can evict that
+      // path)
+      if constexpr (NUM_PATHS == 1) {
+        return ReplacePolicyFn::template is_replaceable<
+            U_WIDTH, std::max(u64(1), HYST_WIDTH)>(
+            val<U_WIDTH>{train_u[i][0][0]},
+            val<std::max(u64(1), HYST_WIDTH)>{train_hyst[i][0]},
+            val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr});
+      } else {
+        val<1> repl_p0 = ReplacePolicyFn::template is_replaceable<
+            U_WIDTH, std::max(u64(1), HYST_WIDTH)>(
+            val<U_WIDTH>{train_u[i][0][0]},
+            val<std::max(u64(1), HYST_WIDTH)>{train_hyst[i][0]},
+            val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr});
+        val<1> repl_p1 = ReplacePolicyFn::template is_replaceable<
+            U_WIDTH, std::max(u64(1), HYST_WIDTH)>(
+            val<U_WIDTH>{train_u[i][1][0]},
+            val<std::max(u64(1), HYST_WIDTH)>{train_hyst[i][0]},
+            val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr});
+        return repl_p0 | repl_p1;
+      }
     };
     val<NT> notumask = replaceable.concat();
     notumask.fanout(hard<2>{});
@@ -974,7 +1140,11 @@ struct TageAhead : predictor {
         return result.reverse().make_array(val<1>{});
       }
     }();
-    allocate.fanout(hard<6>{});
+    allocate.fanout(
+        hard<2 + 2 * NUM_PATHS + HYST_BANKS +
+             2 * NUM_PATHS * U_BANKS>{}); // alloc_target_copy + do_alloc +
+                                          // pred×NP + hyst×HB + (u_gate +
+                                          // decay)×NP×UB
     val<NT> alloc_target = [&]() {
       arr<val<1>, NT> a = allocate;
       return a.concat();
@@ -982,7 +1152,7 @@ struct TageAhead : predictor {
     val<1> noalloc = (candallocmask == hard<0>{});
     val<NT> uclearmask = postmask & noalloc.replicate(hard<NT>{}).concat();
     arr<val<1>, NT> uclear = uclearmask.make_array(val<1>{});
-    uclear.fanout(hard<2>{});
+    uclear.fanout(hard<2 * NUM_PATHS * U_BANKS>{}); // (u_select + u_gate)×NP×UB
 #ifdef TIMING_DEBUG
     dbg_alloc_base = val<1>{alloc_base};
     dbg_notumask = val<1>{notumask};
@@ -997,13 +1167,20 @@ struct TageAhead : predictor {
       u64 at = static_cast<u64>(alloc_target);
       mon.record_allocation(at != 0, at);
       // Provider index for cascade tracking
-      u64 prov_idx =
-          TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, HYST_BANKS,
-                    U_BANKS>::decode_provider(static_cast<u64>(t_match1));
+      u64 prov_idx = decltype(mon)::decode_provider(static_cast<u64>(t_match1));
       if (static_cast<u64>(alloc_trigger)) {
         if (static_cast<u64>(postmask) == 0)
           mon.record_alloc_blocked(); // fallback was provider, no candidates
         mon.record_alloc_cascade(prov_idx, at);
+      }
+      // Multi-path: record which path gets the allocation (victim path)
+      if constexpr (NUM_PATHS > 1) {
+        for (u64 i = 0; i < NT; i++) {
+          if (at & (u64(1) << i)) {
+            u64 victim = static_cast<u64>(val<1>{train_active_path}) ? 0 : 1;
+            mon.record_alloc_path(i, victim);
+          }
+        }
       }
     }
 #endif
@@ -1045,56 +1222,84 @@ struct TageAhead : predictor {
     dbg_meta_write = meta_gate;
 #endif
 
-    // ---- Merged per-table writes (one write per RAM per table) ----
-    // For each table: alloc takes priority over update. Mux selects data.
+    // ---- Merged per-table writes (one write per RAM per table per path) ----
+    // For each table: alloc targets victim path, provider update targets active
+    // path. tag_ram and hyst_ram are shared (always tables[0]).
     train_pc.fanout(hard<NT>{});
     static_loop<NT>([&]<u64 I>() {
-      auto &t = std::get<I>(tables);
+      auto &t0 = std::get<I>(tables[0]);
       val<1> do_alloc = allocate[I];
+
+      // Per-path active/victim selection (piped from resolution):
+      //   active = path that sec_tag-matched in resolution → gets provider
+      //   update victim = other path → gets alloc/uclear writes For
+      //   NUM_PATHS=1: both are path 0 (original behavior)
+      val<1> use_p1_I = val<1>{train_active_path};
+      if constexpr (NUM_PATHS > 1)
+        use_p1_I.fanout(hard<NUM_PATHS * (1 + U_BANKS)>{}); // pred_ram×NP + u_ram×NP×UB
 
       // Per-branch wrong bits for banked training
       val<N> per_branch_wrong = t_pp ^ actual_dir;
 
-      // pred_ram: with banking, only flip pred bits where branch is weakconf
-      // AND wrong
-      if constexpr (HYST_BANKS == 1) {
-        // Original: block-wide weakconf gate
-        val<1> do_pred_update = t_m1[I] & t_pwc & any_provider_wrong;
-        execute_if(do_train & (do_alloc | do_pred_update), [&]() {
-          t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, actual_dir,
-                           hard<0>{});
-        });
-      } else {
-        // Per-branch: build weakconf mask from banked hyst, only flip
-        // weak+wrong bits
-        constexpr u64 HW_P = std::max(u64(1), HYST_WIDTH);
-        arr<val<1>, N> per_br_weakconf = [&](u64 b) -> val<1> {
-          u64 hb = hyst_bank_of(b);
-          return val<1>{val<HW_P>{train_hyst[I][hb]} == hard<0>{}};
-        };
-        val<N> weakconf_mask = per_br_weakconf.concat();
-        val<N> flip_mask = per_branch_wrong & weakconf_mask;
-        val<1> any_flip = t_m1[I] & (flip_mask != hard<0>{});
-        val<PRED_BITS> new_pred = t_pp ^ flip_mask;
-        execute_if(do_train & (do_alloc | any_flip), [&]() {
-          t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                           select(do_alloc, actual_dir, new_pred), hard<0>{});
-        });
-      }
+      // Compute pred update data (shared across paths — depends on t_pp which
+      // was piped from the active path's provider pred in the previous cycle)
+      val<PRED_BITS> pred_update_data = [&]() -> val<PRED_BITS> {
+        if constexpr (HYST_BANKS == 1) {
+          return actual_dir; // block-wide update
+        } else {
+          constexpr u64 HW_P = std::max(u64(1), HYST_WIDTH);
+          arr<val<1>, N> per_br_weakconf = [&](u64 b) -> val<1> {
+            u64 hb = hyst_bank_of(b);
+            return val<1>{val<HW_P>{train_hyst[I][hb]} == hard<0>{}};
+          };
+          val<N> weakconf_mask = per_br_weakconf.concat();
+          val<N> flip_mask = per_branch_wrong & weakconf_mask;
+          return t_pp ^ flip_mask;
+        }
+      }();
+      val<1> do_pred_update = [&]() -> val<1> {
+        if constexpr (HYST_BANKS == 1) {
+          return t_m1[I] & t_pwc & any_provider_wrong;
+        } else {
+          constexpr u64 HW_P = std::max(u64(1), HYST_WIDTH);
+          arr<val<1>, N> per_br_weakconf = [&](u64 b) -> val<1> {
+            u64 hb = hyst_bank_of(b);
+            return val<1>{val<HW_P>{train_hyst[I][hb]} == hard<0>{}};
+          };
+          val<N> weakconf_mask = per_br_weakconf.concat();
+          val<N> flip_mask = per_branch_wrong & weakconf_mask;
+          return t_m1[I] & (flip_mask != hard<0>{});
+        }
+      }();
 
-      // hyst_ram: per-bank training
+      // pred_ram: per-path writes (provider update → active, alloc → victim)
+      static_loop<NUM_PATHS>([&]<u64 P>() {
+        auto &tp = std::get<I>(tables[P]);
+        val<1> is_active_P =
+            (NUM_PATHS == 1) ? val<1>{1} : (P == 0 ? ~use_p1_I : use_p1_I);
+        val<1> is_victim_P = (NUM_PATHS == 1) ? val<1>{1} : ~is_active_P;
+        val<1> pred_gate = do_train & ((do_alloc & is_victim_P) |
+                                       (do_pred_update & is_active_P));
+        execute_if(pred_gate, [&]() {
+          tp.pred_ram.write(
+              val<tp.IDX_BITS>{train_idx[I]},
+              select(do_alloc & is_victim_P, actual_dir, pred_update_data),
+              hard<0>{});
+        });
+      });
+
+      // hyst_ram: per-bank training (shared, always tables[0])
       constexpr u64 HW = std::max(u64(1), HYST_WIDTH);
       static_loop<HYST_BANKS>([&]<u64 HB>() {
         auto old_hyst = val<HW>{train_hyst[I][HB]};
-        // Bank wrong: OR of per_branch_wrong for branches in this bank
         val<1> bank_wrong =
             (per_branch_wrong & hard<hyst_bank_mask(HB)>{}) != hard<0>{};
         auto new_hyst = ta_update_ctr(old_hyst, ~bank_wrong);
         auto hyst_data = select(do_alloc, val<HW>{0}, new_hyst);
         val<1> do_hyst_update = t_m1[I] & (new_hyst != old_hyst);
         execute_if(do_train & (do_alloc | do_hyst_update), [&]() {
-          t.hyst_ram[HB].write(val<t.HYST_IDX_BITS>{train_idx[I]}, hyst_data,
-                               hard<0>{});
+          t0.hyst_ram[HB].write(val<t0.HYST_IDX_BITS>{train_idx[I]}, hyst_data,
+                                hard<0>{});
         });
 #ifdef TAGE_MONITOR
         if (static_cast<u64>(do_train & do_hyst_update))
@@ -1102,25 +1307,23 @@ struct TageAhead : predictor {
 #endif
       });
 
-      // tag_ram + sec_ram: alloc only (plain RAM, protected by extra_cycle)
+      // tag_ram: alloc only, shared (always tables[0])
       execute_if(do_train & do_alloc, [&]() {
-        // Use piped computed tag (from predict1 time, not current folds)
-        t.tag_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                        val<t.tag_width>{train_ctag[I]});
-        if constexpr (USE_SEC_TAG)
-          t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                          val<SEC_TAG_BITS>{curr_sec_tag});
+        t0.tag_ram.write(val<t0.IDX_BITS>{train_idx[I]},
+                         val<t0.tag_width>{train_ctag[I]});
       });
+      // sec_ram eliminated: slot index IS the 1-bit sec_tag
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_train & do_alloc)) {
-        u64 tidx = static_cast<u64>(val<t.IDX_BITS>{train_idx[I]});
+        u64 tidx = static_cast<u64>(val<t0.IDX_BITS>{train_idx[I]});
         mon.record_tage_write(I, tidx);
         mon.record_entry_alloc_diag(I, tidx);
       }
 #endif
 
-      // u_ram: combined provider update + allocation + uclear + decay + DIP
-      // Banked: each u bank gets per-bank wrong signal
+      // u_ram: per-path writes
+      // Provider update → active path, alloc/uclear → victim path, decay →
+      // per-path
       val<U_WIDTH> alloc_u = [&]() -> val<U_WIDTH> {
         if constexpr (DIP_PROB_256 == 0) {
           return val<U_WIDTH>{0};
@@ -1131,122 +1334,125 @@ struct TageAhead : predictor {
         }
       }();
 
-      static_loop<U_BANKS>([&]<u64 UB>() {
-        // Per-bank provider_u: depends on U_PROV_UPDATE policy
-        val<1> bank_u_wrong =
-            (per_branch_wrong & hard<u_bank_mask(UB)>{}) != hard<0>{};
-        val<1> bank_u_correct = ~bank_u_wrong;
-        val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I][UB]};
-        constexpr u64 MAX_U = (1ULL << U_WIDTH) - 1;
+      // Per-path u_ram writes: each path P gets its own write.
+      // Active path: provider u update + alt promotion
+      // Victim path: alloc u + uclear
+      // Per-path: provider/alloc/uclear writes + probabilistic decay
+      static_loop<NUM_PATHS>([&]<u64 P>() {
+        auto &tp = std::get<I>(tables[P]);
+        val<1> is_active_P =
+            (NUM_PATHS == 1) ? val<1>{1} : (P == 0 ? ~use_p1_I : use_p1_I);
+        val<1> is_victim_P = (NUM_PATHS == 1) ? val<1>{1} : ~is_active_P;
 
-        // provider_u: value to write; prov_u_write: should we write at all
-        auto [provider_u,
-              prov_u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
-          if constexpr (U_PROV_UPDATE == UProvUpdate::SET_OR_CLEAR) {
-            // correct → max_u, wrong → 0, always write
-            return {val<U_WIDTH>{
-                        bank_u_correct.replicate(hard<U_WIDTH>{}).concat()},
-                    val<1>{hard<1>{}}};
-          } else if constexpr (U_PROV_UPDATE == UProvUpdate::SET_ON_CORRECT) {
-            // correct → max_u, wrong → no write
-            return {val<U_WIDTH>{hard<MAX_U>{}}, bank_u_correct};
-          } else if constexpr (U_PROV_UPDATE == UProvUpdate::INC_DEC) {
-            // correct → saturating u+1, wrong → saturating u-1
-            val<U_WIDTH> inc =
-                select(old_u == hard<MAX_U>{}, old_u, val<U_WIDTH>{old_u + 1});
-            val<U_WIDTH> dec =
-                select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
-            val<U_WIDTH> new_val = select(bank_u_correct, inc, dec);
-            return {new_val, new_val != old_u};
-          } else { // INC_ONLY
-            // correct → saturating u+1, wrong → no write
-            val<U_WIDTH> inc =
-                select(old_u == hard<MAX_U>{}, old_u, val<U_WIDTH>{old_u + 1});
-            return {inc, bank_u_correct & (inc != old_u)};
-          }
-        }();
+        static_loop<U_BANKS>([&]<u64 UB>() {
+          val<1> bank_u_wrong =
+              (per_branch_wrong & hard<u_bank_mask(UB)>{}) != hard<0>{};
+          val<1> bank_u_correct = ~bank_u_wrong;
+          val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I][P][UB]};
+          constexpr u64 MAX_U = (1ULL << U_WIDTH) - 1;
 
-        struct UResult {
-          val<U_WIDTH> newu;
-          val<1> uw;
-        };
-        auto [base_newu, base_u_write] = [&]() -> UResult {
-          if constexpr (ALT_PROMOTE_ACTIVE) {
-            val<MATCH_BITS> t_match2_loc = train_match2;
-            arr<val<1>, NT + 1> t_m2 = t_match2_loc.make_array(val<1>{});
-            val<PRED_BITS> t_ap = train_alt_pred;
-            val<1> any_alt_correct = (t_ap ^ actual_dir) == hard<0>{};
-            val<1> alt_prom = AltPromoteFn::should_promote(
-                any_provider_wrong, any_alt_correct,
-                val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr},
-                alloc_rng);
-            val<1> do_alt_promote = alt_prom & t_m2[I];
-            return {
-                select(do_alt_promote, val<U_WIDTH>{1},
-                       select(allocate[I], alloc_u,
-                              select(uclear[I], val<U_WIDTH>{0}, provider_u))),
-                (t_m1[I] & prov_u_write & t_ad) | allocate[I] | uclear[I] |
-                    do_alt_promote};
-          } else {
-            return {select(allocate[I], alloc_u,
-                           select(uclear[I], val<U_WIDTH>{0}, provider_u)),
-                    (t_m1[I] & prov_u_write & t_ad) | allocate[I] | uclear[I]};
-          }
-        }();
+          // Provider u computation (only meaningful for active path)
+          auto [provider_u,
+                prov_u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
+            if constexpr (U_PROV_UPDATE == UProvUpdate::SET_OR_CLEAR) {
+              return {val<U_WIDTH>{
+                          bank_u_correct.replicate(hard<U_WIDTH>{}).concat()},
+                      val<1>{hard<1>{}}};
+            } else if constexpr (U_PROV_UPDATE == UProvUpdate::SET_ON_CORRECT) {
+              return {val<U_WIDTH>{hard<MAX_U>{}}, bank_u_correct};
+            } else if constexpr (U_PROV_UPDATE == UProvUpdate::INC_DEC) {
+              val<U_WIDTH> inc = select(old_u == hard<MAX_U>{}, old_u,
+                                        val<U_WIDTH>{old_u + 1});
+              val<U_WIDTH> dec =
+                  select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
+              val<U_WIDTH> new_val = select(bank_u_correct, inc, dec);
+              return {new_val, new_val != old_u};
+            } else {
+              val<U_WIDTH> inc = select(old_u == hard<MAX_U>{}, old_u,
+                                        val<U_WIDTH>{old_u + 1});
+              return {inc, bank_u_correct & (inc != old_u)};
+            }
+          }();
 
-        // Probabilistic decay
-        auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
-          if constexpr (!DECAY_ENABLE) {
-            return {base_newu, base_u_write};
-          } else {
-            constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
-            auto &lfsr = std::get<I>(decay_lfsrs);
-            val<1> tag_missed = ~val<1>{train_tag_hit[I]};
-            val<1> decay_miss = [&]() {
-              if constexpr (!USE_SEC_TAG || DECAY_MISS == DecayMiss::TAG)
-                return tag_missed;
-              else {
-                val<1> sec_missed = ~val<1>{train_sec_hit[I]};
-                if constexpr (DECAY_MISS == DecayMiss::SEC)
-                  return sec_missed;
-                else if constexpr (DECAY_MISS == DecayMiss::TAG_OR_SEC)
-                  return tag_missed | sec_missed;
+          // Per-path base write: active gets provider/alt-promote, victim gets
+          // alloc/uclear
+          struct UResult {
+            val<U_WIDTH> newu;
+            val<1> uw;
+          };
+          auto [base_newu, base_u_write] = [&]() -> UResult {
+            if constexpr (ALT_PROMOTE_ACTIVE) {
+              val<MATCH_BITS> t_match2_loc = train_match2;
+              arr<val<1>, NT + 1> t_m2 = t_match2_loc.make_array(val<1>{});
+              val<PRED_BITS> t_ap = train_alt_pred;
+              val<1> any_alt_correct = (t_ap ^ actual_dir) == hard<0>{};
+              val<1> alt_prom = AltPromoteFn::should_promote(
+                  any_provider_wrong, any_alt_correct,
+                  val<ALLOC_WIDTH>{alloc_ctr}, val<ACC_WIDTH>{acc_ctr},
+                  alloc_rng);
+              val<1> do_alt_promote = alt_prom & t_m2[I] & is_active_P;
+              return {
+                  select(
+                      do_alt_promote, val<U_WIDTH>{1},
+                      select(allocate[I] & is_victim_P, alloc_u,
+                             select(uclear[I] & is_victim_P, val<U_WIDTH>{0},
+                                    select(is_active_P, provider_u, old_u)))),
+                  (t_m1[I] & prov_u_write & t_ad & is_active_P) |
+                      (allocate[I] & is_victim_P) | (uclear[I] & is_victim_P) |
+                      do_alt_promote};
+            } else {
+              return {select(allocate[I] & is_victim_P, alloc_u,
+                             select(uclear[I] & is_victim_P, val<U_WIDTH>{0},
+                                    select(is_active_P, provider_u, old_u))),
+                      (t_m1[I] & prov_u_write & t_ad & is_active_P) |
+                          (allocate[I] & is_victim_P) |
+                          (uclear[I] & is_victim_P)};
+            }
+          }();
+
+          // Probabilistic decay (per-path: use this path's sec_hit)
+          auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
+            if constexpr (!DECAY_ENABLE) {
+              return {base_newu, base_u_write};
+            } else {
+              constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
+              auto &lfsr = std::get<I>(decay_lfsrs);
+              val<1> tag_missed = ~val<1>{train_tag_hit[I]};
+              // sec_ram eliminated: decay always uses tag-only miss
+              val<1> decay_miss = tag_missed;
+              auto thresh = DecayThreshFn::template compute<I, LW>(
+                  val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
+              val<1> decay_fire =
+                  decay_miss & ~allocate[I] & (val<LW>{lfsr} < thresh);
+              val<U_WIDTH> decayed_u = [&]() {
+                if constexpr (DECAY_OP == DecayOp::DECREMENT)
+                  return select(old_u == hard<0>{}, old_u,
+                                val<U_WIDTH>{old_u - 1});
+                else if constexpr (DECAY_OP == DecayOp::HALVE)
+                  return val<U_WIDTH>{old_u >> 1};
                 else
-                  return tag_missed & sec_missed;
-              }
-            }();
-            auto thresh = DecayThreshFn::template compute<I, LW>(
-                val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
-            val<1> decay_fire =
-                decay_miss & ~allocate[I] & (val<LW>{lfsr} < thresh);
-            val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I][UB]};
-            val<U_WIDTH> decayed_u = [&]() {
-              if constexpr (DECAY_OP == DecayOp::DECREMENT)
-                return select(old_u == hard<0>{}, old_u,
-                              val<U_WIDTH>{old_u - 1});
-              else if constexpr (DECAY_OP == DecayOp::HALVE)
-                return val<U_WIDTH>{old_u >> 1};
-              else
-                return val<U_WIDTH>{0};
-            }();
-            val<U_WIDTH> merged = select(base_u_write, base_newu,
-                                         select(decay_fire, decayed_u, old_u));
-            val<1> merged_write = base_u_write | decay_fire;
-            val<1> merged_changed = merged != old_u;
-            return {merged, merged_write & merged_changed};
-          }
-        }();
+                  return val<U_WIDTH>{0};
+              }();
+              val<U_WIDTH> merged =
+                  select(base_u_write, base_newu,
+                         select(decay_fire, decayed_u, old_u));
+              val<1> merged_write = base_u_write | decay_fire;
+              val<1> merged_changed = merged != old_u;
+              return {merged, merged_write & merged_changed};
+            }
+          }();
 
-        execute_if(do_train & u_write, [&]() {
-          t.u_ram[UB].write(val<t.IDX_BITS>{train_idx[I]}, newu, hard<0>{});
-        });
+          execute_if(do_train & u_write, [&]() {
+            tp.u_ram[UB].write(val<tp.IDX_BITS>{train_idx[I]}, newu, hard<0>{});
+          });
 #ifdef TAGE_MONITOR
-        if (static_cast<u64>(do_train & u_write))
-          mon.record_u_write(I, UB,
-                             static_cast<u64>(val<t.IDX_BITS>{train_idx[I]}),
-                             static_cast<u64>(newu));
+          if (static_cast<u64>(do_train & u_write))
+            mon.record_u_write(I, UB,
+                               static_cast<u64>(val<tp.IDX_BITS>{train_idx[I]}),
+                               static_cast<u64>(newu));
 #endif
-      }); // end static_loop<U_BANKS>
+        }); // end static_loop<U_BANKS>
+      });   // end static_loop<NUM_PATHS>
 #ifdef TIMING_DEBUG
       dbg_tag_write[I] = do_train & do_alloc;
       // pred_write and hyst_write not easily tracked with banking; use alloc
@@ -1292,8 +1498,11 @@ struct TageAhead : predictor {
                 val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr}, ectr);
         execute_if(epoch_fire, [&]() {
           static_loop<NT>([&]<u64 I>() {
-            static_loop<U_BANKS>(
-                [&]<u64 UB>() { std::get<I>(tables).u_ram[UB].reset(); });
+            static_loop<U_BANKS>([&]<u64 UB>() {
+              // Reset u across all paths
+              static_loop<NUM_PATHS>(
+                  [&]<u64 P>() { std::get<I>(tables[P]).u_ram[UB].reset(); });
+            });
           });
         });
         epoch_ctr = val<EPOCH_CTR_WIDTH>{ectr + 1};
@@ -1392,7 +1601,7 @@ struct TageAhead : predictor {
     // select(true_block, new, old) avoids the execute_if timing bleed —
     // both paths resolve in parallel, mux adds ~10ps constant overhead.
     static_loop<NT>([&]<u64 I>() {
-      auto &t = std::get<I>(tables);
+      auto &t = std::get<I>(tables[0]);
       auto new_idx = t.fold_idx.compute_update(
           gh, hard<TableCfg::HIST_LEN[I]>{}, hist_input);
       auto new_tag = t.fold_tag.compute_update(
@@ -1400,15 +1609,11 @@ struct TageAhead : predictor {
 #ifdef TIMING_DEBUG
       if constexpr (I == 0) {
         dbg_fold_compute = val<1>{new_idx};
+        dbg_fold_apply = val<1>{new_idx}; // read computed value, not register
       }
 #endif
       t.fold_idx.apply_update(new_idx, true_block);
       t.fold_tag.apply_update(new_tag, true_block);
-#ifdef TIMING_DEBUG
-      if constexpr (I == 0) {
-        dbg_fold_apply = val<1>{t.fold_idx.get()};
-      }
-#endif
     });
     if constexpr (USE_GSHARE) {
       auto new_fb = fb_fold.compute_update(gh, hard<GS_HIST>{}, hist_input);
@@ -1486,6 +1691,16 @@ using TageAhead_AllTechniques =
               ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
               true, ReplaceUZeroWeakConf<1>, AltPromoteAlways, 64, 1,
               UProvUpdate::SET_OR_CLEAR>;
+
+// Multi-path sec tag banking (NUM_PATHS=2)
+using TageAhead_2Path =
+    TageAhead<TATableConfig<>, 8, 6, 3, true, 1, 3, 2, 8192 * 2, false, 6, 5,
+              256, 2, 1024, true, HistUpdate::PATH, TAAlloc2, 4, 4, false,
+              DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+              ta::uniform_array<u64, TATableConfig<>::NUM_TABLES>(8),
+              ta::DefaultDecayThresh, true, ta::DefaultEpochTrigger, 16, false,
+              true, ReplaceUZero, AltPromoteOff, 0, 1, UProvUpdate::INC_DEC,
+              false, 3, 2, 0, 4, 0, 2>;
 
 // Per-branch banking variants (HYST_BANKS, HYST_BANK_BIT, U_BANKS, U_BANK_BIT)
 // 2 hyst banks, bit 1 (pairs {0,1},{2,3},{4,5},{6,7} interleaved)
