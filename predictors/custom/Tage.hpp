@@ -1610,18 +1610,18 @@ struct TageImpl : predictor {
 
 // Template parameter names prefixed with TAGE_ to avoid collisions with
 // macros defined in other headers (e.g. tage.hpp's #define USE_META).
-template <typename TableCfg = SweepTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
+template <typename TableCfg = SweepTableConfig<8, 2048, 11, 1, 2, 1, 4, 100, 1>,
           typename AllocCfg = DefaultAllocConfig,
           // Global hardware params
           u64 TAGE_FETCH_WIDTH = 16, u64 TAGE_BIMODAL_SIZE = 4096,
           u64 TAGE_BR_P_ENTRY = 1, u64 TAGE_NUM_BANKS = 1,
           bool TAGE_SHARED_TAG = true,
           bool TAGE_SHARED_U = true, bool TAGE_SHARED_HYS = true,
-          bool TAGE_U_STOR_FF = false, u64 TAGE_DECAY_CTR = 8,
-          u64 TAGE_DECAY_GRAN = 2, typename TAGE_DECAY_POLICY = DecayMild,
+          bool TAGE_U_STOR_FF = false, u64 TAGE_DECAY_CTR = 0,
+          u64 TAGE_DECAY_GRAN = 0, typename TAGE_DECAY_POLICY = DecayMild,
           typename ResetFn = DefaultResetFn, bool TAGE_USE_FF_CACHE = false,
           // P1 params
-          bool TAGE_P1_USE_GSHARE = true, u64 TAGE_P1_TABLE_SIZE = 4096,
+          bool TAGE_P1_USE_GSHARE = true, u64 TAGE_P1_TABLE_SIZE = 16384,
           u64 TAGE_P1_HIST = 6,
           // Meta-prediction
           bool TAGE_USE_META = true, u64 TAGE_METABITS = 4,
@@ -1629,8 +1629,7 @@ template <typename TableCfg = SweepTableConfig<8, 512, 11, 1, 2, 1, 2, 100, 4>,
           // Path history
           bool TAGE_USE_PATH_HIST = false, u64 TAGE_PATH_HIST_WIDTH = 27,
           u64 TAGE_PATH_BITS = 6,
-          typename TAGE_OVERRIDER =
-              SCOverrider<3, 8, 6, TAGE_FETCH_WIDTH>>
+          typename TAGE_OVERRIDER = NoOverrider>
 
 using Tage =
     TageImpl<TableCfg, AllocCfg, TAGE_FETCH_WIDTH,

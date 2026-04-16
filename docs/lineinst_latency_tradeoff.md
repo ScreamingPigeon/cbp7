@@ -109,3 +109,9 @@ line_end() arithmetic. Potential architectural fixes:
   predict2 is trivial and pred[] is re-fanned in predict1)
 - **TageDirect**: LINEINST=1024, two-level with reuse_prediction → P2 inflated
   to ~2.47 due to excess fanout reads in reuse_predict2
+
+
+
+# What if prakhar notes
+
+what if we still advance cycle but skip re-reading rams?

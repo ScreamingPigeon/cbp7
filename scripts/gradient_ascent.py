@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from sweep_common import (
     run_trace, compute_metrics, resolve_traces, REPR_TRACES,
     append_csv_row, load_csv_rows, CXX, COMMON_FLAGS, WARN_FLAGS,
+    SweepConfig, CONFIG_FIELDS as SWEEP_CONFIG_FIELDS,
+    build_config as build_sweep_config,
 )
 
 
@@ -303,11 +305,21 @@ def run_monitor(binary: Path, trace: Path, warmup: int, measure: int,
 # CSV schema
 # ============================================================================
 
-GRADIENT_FIELDS = [
+GRADIENT_BASE_FIELDS = [
     "timestamp", "iteration", "config_id", "varied_param", "is_improvement",
     "mpki", "epi", "ipc", "vfs", "p1_lat", "p2_lat", "n_traces",
     "build_time_s", "eval_time_s",
-] + TD_CONFIG_FIELDS + ["predictor_string"]
+]
+
+# Default (TageDirect) field order; Tage uses its own
+GRADIENT_FIELDS = GRADIENT_BASE_FIELDS + TD_CONFIG_FIELDS + ["predictor_string"]
+GRADIENT_FIELDS_TAGE = GRADIENT_BASE_FIELDS + SWEEP_CONFIG_FIELDS + ["predictor_string"]
+
+
+def _gradient_fields(predictor: str = "tagedirect") -> list[str]:
+    if predictor == "tage":
+        return GRADIENT_FIELDS_TAGE
+    return GRADIENT_FIELDS
 
 
 # ============================================================================
@@ -368,15 +380,71 @@ def load_checkpoint(path: Path) -> dict | None:
         return json.load(f)
 
 
+def save_best_iteration(saved_dir: Path, iteration: int, cfg, metrics: dict):
+    """Save params and metrics for a new best iteration to saved/."""
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "iteration": iteration,
+        "config_id": cfg.config_id,
+        "predictor_string": cfg.predictor_string,
+        "metrics": {k: float(v) if isinstance(v, (int, float)) else v
+                    for k, v in metrics.items()},
+        "params": cfg.to_dict(),
+    }
+    path = saved_dir / f"iter_{iteration:03d}_{cfg.config_id}.json"
+    with open(path, "w") as f:
+        json.dump(entry, f, indent=2)
+    print(f"  Saved best to {path}", file=sys.stderr)
+
+
 # ============================================================================
 # Core evaluation
 # ============================================================================
 
-def evaluate_config(cfg: TDConfig, build_dir: Path, trace_paths: list[Path],
+def _build_config(cfg, build_dir: Path, extra_flags: str = "",
+                  monitor: bool = False, predictor: str = "tagedirect"):
+    """Dispatch to the correct build function based on predictor type."""
+    if predictor == "tage":
+        if monitor:
+            # build_sweep_config doesn't support monitor; build manually
+            return _build_tage_monitor(cfg, build_dir, extra_flags)
+        return build_sweep_config(cfg, build_dir, extra_flags)
+    return build_td_config(cfg, build_dir, extra_flags, monitor=monitor)
+
+
+def _build_tage_monitor(cfg, build_dir: Path, extra_flags: str = ""):
+    """Build a Tage monitor binary."""
+    prefix = "mon"
+    config_id = cfg.config_id
+    binary = build_dir / f"{prefix}_{config_id}"
+    if binary.exists():
+        return (cfg, binary, 0.0, None)
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    pred = cfg.predictor_string
+    monitor_flags = "-DTAGE_MONITOR -DCHEATING_MODE -DREAD_WRITE_RAM"
+    cmd = (f'{CXX} {COMMON_FLAGS} {WARN_FLAGS} {extra_flags} {monitor_flags} '
+           f'-Itrace_files -o {binary} cbp.cpp -lz '
+           f"-DPREDICTOR='{pred}'")
+
+    t0 = time.monotonic()
+    try:
+        subprocess.run(cmd, shell=True, check=True,
+                       capture_output=True, text=True, timeout=300)
+        return (cfg, binary, time.monotonic() - t0, None)
+    except subprocess.CalledProcessError as e:
+        return (cfg, binary, time.monotonic() - t0, e.stderr[-500:])
+    except subprocess.TimeoutExpired:
+        return (cfg, binary, 300.0, "TIMEOUT")
+
+
+def evaluate_config(cfg, build_dir: Path, trace_paths: list[Path],
                     warmup: int, measure: int, jobs: int,
-                    extra_flags: str = "") -> tuple[dict | None, float, float]:
+                    extra_flags: str = "",
+                    predictor: str = "tagedirect") -> tuple[dict | None, float, float]:
     """Build + run standard binary on all traces. Returns (metrics, build_t, eval_t)."""
-    _, binary, build_time, err = build_td_config(cfg, build_dir, extra_flags)
+    _, binary, build_time, err = _build_config(cfg, build_dir, extra_flags,
+                                                predictor=predictor)
     if err:
         print(f"    BUILD FAIL {cfg.config_id}: {err[:80]}", file=sys.stderr)
         return None, build_time, 0.0
@@ -400,11 +468,13 @@ def evaluate_config(cfg: TDConfig, build_dir: Path, trace_paths: list[Path],
     return compute_metrics(runs), build_time, eval_time
 
 
-def evaluate_monitor(cfg: TDConfig, build_dir: Path, monitor_dir: Path,
+def evaluate_monitor(cfg, build_dir: Path, monitor_dir: Path,
                      monitor_trace: Path, warmup: int, measure: int,
-                     extra_flags: str = "") -> float:
+                     extra_flags: str = "",
+                     predictor: str = "tagedirect") -> float:
     """Build + run monitor binary on one trace. Returns build_time."""
-    _, binary, bt, err = build_td_config(cfg, build_dir, extra_flags, monitor=True)
+    _, binary, bt, err = _build_config(cfg, build_dir, extra_flags,
+                                        monitor=True, predictor=predictor)
     if err:
         print(f"    MON BUILD FAIL {cfg.config_id}: {err[:80]}", file=sys.stderr)
         return bt
@@ -447,6 +517,15 @@ def gradient_ascent(args):
     epi_budget = ycfg["epi_budget"]
     max_iterations = ycfg["max_iterations"]
 
+    # Select config class based on predictor type
+    predictor = args.predictor
+    if predictor == "tage":
+        ConfigClass = SweepConfig
+        config_fields = SWEEP_CONFIG_FIELDS
+    else:
+        ConfigClass = TDConfig
+        config_fields = TD_CONFIG_FIELDS
+
     # Build parameter spaces
     param_spaces = {}
     for name, spec in ycfg["parameters"].items():
@@ -454,7 +533,7 @@ def gradient_ascent(args):
 
     # Starting config
     start = ycfg["starting_point"]
-    current = TDConfig(**{k: v for k, v in start.items() if k in TD_CONFIG_FIELDS})
+    current = ConfigClass(**{k: v for k, v in start.items() if k in config_fields})
 
     # Resolve traces
     if args.traces:
@@ -491,8 +570,8 @@ def gradient_ascent(args):
     if args.resume:
         ckpt = load_checkpoint(checkpoint_path)
         if ckpt:
-            current = TDConfig(**{k: v for k, v in ckpt["current_config"].items()
-                                  if k in TD_CONFIG_FIELDS})
+            current = ConfigClass(**{k: v for k, v in ckpt["current_config"].items()
+                                     if k in config_fields})
             perturbation = ckpt.get("perturbation", args.perturbation)
             total_evals = ckpt.get("total_evals", 0)
             start_iteration = ckpt["iteration"] + 1
@@ -511,7 +590,8 @@ def gradient_ascent(args):
         print(f"Evaluating start config {current.config_id}...", file=sys.stderr)
         metrics, bt, et = evaluate_config(
             current, build_dir, trace_paths,
-            args.warmup, args.measure, args.jobs, args.extra_flags)
+            args.warmup, args.measure, args.jobs, args.extra_flags,
+            predictor=predictor)
         if not metrics:
             print("ERROR: start config failed", file=sys.stderr)
             sys.exit(1)
@@ -520,10 +600,11 @@ def gradient_ascent(args):
         cache.put(current.config_id, metrics)
         total_evals += 1
         row = make_row(0, "init", current, metrics, True, bt, et)
-        append_csv_row(csv_path, row, GRADIENT_FIELDS)
+        append_csv_row(csv_path, row, _gradient_fields(predictor))
         # Run monitor for starting config
         evaluate_monitor(current, build_dir, monitor_dir, monitor_trace,
-                         args.warmup, args.measure, args.extra_flags)
+                         args.warmup, args.measure, args.extra_flags,
+                         predictor=predictor)
         print(f"Start: MPKI={current_mpki:.3f} EPI={current_epi:.0f}",
               file=sys.stderr)
 
@@ -550,8 +631,10 @@ def gradient_ascent(args):
             cur_val = getattr(current, pname)
             for nv in pspace.neighbors(cur_val, perturbation):
                 candidate = current.replace(**{pname: nv})
-                # Constraint: minh < maxh
-                if candidate.minh >= candidate.maxh:
+                # Constraint: minh < maxh (field names differ by predictor)
+                minh = getattr(candidate, 'minh', None) or getattr(candidate, 'minhist', 0)
+                maxh = getattr(candidate, 'maxh', None) or getattr(candidate, 'maxhist', 999)
+                if minh >= maxh:
                     continue
                 # Constraint: table sizes must be power of 2
                 # (GeoSize with size_ratio>1 might produce non-pow2, but
@@ -577,7 +660,8 @@ def gradient_ascent(args):
         print(f"  Building standard binaries...", file=sys.stderr)
         build_results = {}
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futs = {pool.submit(build_td_config, cfg, build_dir, args.extra_flags): (pname, nv, cfg)
+            futs = {pool.submit(_build_config, cfg, build_dir, args.extra_flags,
+                                predictor=predictor): (pname, nv, cfg)
                     for pname, nv, cfg in neighbors}
             for fut in as_completed(futs):
                 pname, nv, cfg = futs[fut]
@@ -644,13 +728,14 @@ def gradient_ascent(args):
                     mon_futs.append(pool.submit(
                         evaluate_monitor, cfg, build_dir, monitor_dir,
                         monitor_trace, args.warmup, args.measure,
-                        args.extra_flags))
+                        args.extra_flags, predictor=predictor))
             for fut in as_completed(mon_futs):
                 fut.result()  # collect errors
 
         # Filter by EPI budget and find best
         best_neighbor = None
         best_mpki = current_mpki
+        best_metrics = None
         best_param = None
         best_val = None
 
@@ -662,7 +747,7 @@ def gradient_ascent(args):
 
             # Log to CSV
             row = make_row(iteration, pname, cfg, metrics, is_better, bt, et)
-            append_csv_row(csv_path, row, GRADIENT_FIELDS)
+            append_csv_row(csv_path, row, _gradient_fields(predictor))
 
             marker = ""
             if not is_feasible:
@@ -675,6 +760,7 @@ def gradient_ascent(args):
 
             if is_better:
                 best_mpki = mpki
+                best_metrics = metrics
                 best_neighbor = cfg
                 best_param = pname
                 best_val = nv
@@ -686,6 +772,9 @@ def gradient_ascent(args):
             current_mpki = best_mpki
             print(f"\n  >> Improved: {best_param}={best_val} "
                   f"MPKI={best_mpki:.3f} ({iter_time:.0f}s)", file=sys.stderr)
+            # Save best iteration to saved/
+            save_best_iteration(csv_path.parent / "saved", iteration,
+                                current, best_metrics)
         elif perturbation > 1:
             perturbation = max(1, perturbation // 2)
             print(f"\n  >> No improvement, reducing perturbation to {perturbation} "
@@ -715,7 +804,7 @@ def gradient_ascent(args):
 # Report
 # ============================================================================
 
-def print_report(csv_path: Path, top_n: int = 20):
+def print_report(csv_path: Path, top_n: int = 20, predictor: str = "tagedirect"):
     rows = load_csv_rows(csv_path)
     if not rows:
         print("No results.", file=sys.stderr)
@@ -783,7 +872,8 @@ def print_report(csv_path: Path, top_n: int = 20):
         print(f"  Config ID: {best['config_id']}")
         print(f"  MPKI: {float(best['mpki']):.3f}  EPI: {float(best['epi']):.0f}  "
               f"VFS: {float(best['vfs']):.6f}")
-        for f in TD_CONFIG_FIELDS:
+        cfg_fields = SWEEP_CONFIG_FIELDS if predictor == "tage" else TD_CONFIG_FIELDS
+        for f in cfg_fields:
             if f in best:
                 print(f"  {f}: {best[f]}")
 
@@ -794,9 +884,12 @@ def print_report(csv_path: Path, top_n: int = 20):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gradient ascent optimizer for TageDirect predictor")
+        description="Gradient ascent optimizer for TageDirect/Tage predictor")
     parser.add_argument("--config", type=Path,
                         default=Path("configs/gradient_default.yaml"))
+    parser.add_argument("--predictor", choices=["tagedirect", "tage"],
+                        default="tagedirect",
+                        help="Predictor type: 'tagedirect' (default) or 'tage'")
     parser.add_argument("--trace-dir", type=Path, default=Path("./traces"))
     parser.add_argument("--traces", nargs="*", default=None,
                         help="Override trace list (paths to .gz files)")
@@ -804,8 +897,7 @@ def main():
     parser.add_argument("--perturbation", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=1000000)
     parser.add_argument("--measure", type=int, default=40000000)
-    parser.add_argument("-o", "--output", type=Path,
-                        default=Path("out/gradient/results.csv"))
+    parser.add_argument("-o", "--output", type=Path, default=None)
     parser.add_argument("--extra-flags", type=str, default="")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--report", type=Path, default=None,
@@ -813,8 +905,11 @@ def main():
     parser.add_argument("--top", type=int, default=20)
     args = parser.parse_args()
 
+    if args.output is None:
+        args.output = Path(f"out/gradient_{args.predictor}/results.csv")
+
     if args.report:
-        print_report(args.report, args.top)
+        print_report(args.report, args.top, predictor=args.predictor)
         return
 
     gradient_ascent(args)

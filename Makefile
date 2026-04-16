@@ -32,7 +32,7 @@ REGION_SHIFT ?= 12
 PRED_HASH := $(shell echo '$(PREDICTOR_TYPE)|$(EXTRA_COMMON_FLAGS)|$(EXTRA_CBP_FLAGS)' | md5sum | cut -c1-8)
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report gradient-tage gradient-tage-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -258,6 +258,22 @@ gradient:
 
 gradient-report:
 	$(PYTHON) scripts/gradient_ascent.py --report out/gradient/results.csv --top 20
+
+GRADIENT_TAGE_CONFIG ?= configs/gradient_tage.yaml
+GRADIENT_TAGE_JOBS ?= $(shell nproc)
+
+gradient-tage:
+	mkdir -p out/gradient_tage
+	$(PYTHON) scripts/gradient_ascent.py \
+		--predictor tage \
+		--config $(GRADIENT_TAGE_CONFIG) \
+		--trace-dir $(TRACE_DIR) \
+		-j $(GRADIENT_TAGE_JOBS) \
+		--perturbation $(GRADIENT_PERTURBATION) \
+		--extra-flags '$(EXTRA_COMMON_FLAGS) $(EXTRA_CBP_FLAGS)' --resume
+
+gradient-tage-report:
+	$(PYTHON) scripts/gradient_ascent.py --predictor tage --report out/gradient_tage/results.csv --top 20
 
 SAVE_DIR := $(BUILD_DIR)/saved
 SAVE_NAME ?= $(shell date +%Y%m%d_%H%M%S)

@@ -78,12 +78,13 @@ class TageConfig:
         parts.append(str(self.bimodal_size))
         parts.append(str(1))   # BR_P_ENTRY (fixed)
         parts.append(str(1))   # NUM_BANKS (fixed)
-        parts.append(str("false"))  # USE_AHEAD (fixed)
         parts.append("true" if self.shared_tag else "false")
         parts.append("true" if self.shared_u else "false")
         parts.append("true" if self.shared_hys else "false")
         parts.append("true" if self.u_stor_ff else "false")
         parts.append(str(self.decay_ctr))
+        parts.append("2")     # DECAY_GRAN (fixed)
+        parts.append("DecayMild")  # DECAY_POLICY
         parts.append("DefaultResetFn")
         parts.append("false")  # USE_FF_CACHE (fixed)
         # P1
@@ -99,6 +100,7 @@ class TageConfig:
         parts.append("true" if self.use_path_hist else "false")
         parts.append(str(self.path_hist_width))
         parts.append(str(self.path_bits))
+        parts.append("NoOverrider")
 
         return f"Tage<{','.join(parts)}>"
 

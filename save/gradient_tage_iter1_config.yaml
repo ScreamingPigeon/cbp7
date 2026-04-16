@@ -1,0 +1,69 @@
+# Gradient ascent optimizer config for Tage predictor
+# Minimize MPKI under EPI budget constraint
+
+epi_budget: 900.0
+max_iterations: 50
+objective: mpki  # minimize
+
+# Starting point: current best Tage<> defaults
+starting_point:
+  num_tables: 8
+  base_size: 2048
+  size_ratio: 1.0
+  tag_width: 11
+  ctr_width: 1
+  hyst_width: 2
+  u_width: 1
+  minhist: 2
+  maxhist: 100
+  bimodal_size: 4096
+  decay_ctr: 0
+  decay_gran: 0
+  p1_table_size: 16384
+  p1_hist: 6
+  metabits: 4
+  metapipe: 2
+  shared_tag: true
+  shared_u: true
+  shared_hys: true
+
+# Parameter search space
+parameters:
+  num_tables:
+    values: [4, 6, 8, 10, 12]
+  base_size:
+    values: [512, 1024, 2048, 4096]
+  size_ratio:
+    values: [1.0, 1.5, 2.0, 3.0, 4.0]
+  tag_width:
+    min: 7
+    max: 15
+    step: 1
+  ctr_width:
+    values: [1, 2, 3]
+  hyst_width:
+    values: [1, 2, 3]
+  minhist:
+    min: 2
+    max: 16
+    step: 2
+  maxhist:
+    min: 50
+    max: 400
+    step: 25
+  bimodal_size:
+    values: [1024, 2048, 4096, 8192, 16384]
+  decay_ctr:
+    values: [0, 256, 512, 1024, 2048, 4096]
+  p1_table_size:
+    values: [4096, 8192, 16384, 32768, 65536]
+  p1_hist:
+    min: 4
+    max: 12
+    step: 1
+  metabits:
+    values: [2, 3, 4, 6, 8]
+  metapipe:
+    values: [1, 2, 3]
+  shared_hys:
+    values: [true, false]

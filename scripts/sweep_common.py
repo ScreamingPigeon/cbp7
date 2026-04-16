@@ -136,16 +136,17 @@ class SweepConfig:
         b = lambda v: "true" if v else "false"
         parts = [tc, "DefaultAllocConfig",
                  "16", str(self.bimodal_size), "1", "1",
-                 "false",  # USE_AHEAD
                  b(self.shared_tag), b(self.shared_u), b(self.shared_hys),
                  b(self.u_stor_ff),
                  str(self.decay_ctr), str(self.decay_gran),
+                 "DecayMild",       # DECAY_POLICY
                  "DefaultResetFn", "false",  # USE_FF_CACHE
                  "true", str(self.p1_table_size), str(self.p1_hist),
                  "true", str(self.metabits), str(self.metapipe),
-                 "0",  # META_TABLE_SIZE (not implemented)
+                 "0",  # META_TABLE_SIZE
                  b(self.use_path_hist),
-                 str(self.path_hist_width), str(self.path_bits)]
+                 str(self.path_hist_width), str(self.path_bits),
+                 "NoOverrider"]
         return f"Tage<{','.join(parts)}>"
 
     def replace(self, **kwargs) -> 'SweepConfig':

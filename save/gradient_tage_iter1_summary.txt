@@ -1,0 +1,38 @@
+Gradient Ascent Iteration 1 Summary (2026-04-14)
+=================================================
+
+Starting config: 605f25cf (minhist=2, baseline)
+  MPKI=6.020  EPI=1163  VFS=0.876114  P1=1  P2=2
+
+Best VFS neighbor: 5a87318a (minhist=4)
+  MPKI=5.953  EPI=1163  VFS=0.877677  P1=1  P2=2
+  Delta: MPKI -0.067, VFS +0.0016
+
+All neighbors ranked by VFS:
+  minhist=4        VFS=0.8777  MPKI=5.953  EPI=1163
+  hyst_width=3     VFS=0.8773  MPKI=6.021  EPI=1109
+  p1_table=32768   VFS=0.8772  MPKI=6.019  EPI=1247
+  p1_hist=7        VFS=0.8770  MPKI=6.025  EPI=1163
+  bimodal=8192     VFS=0.8766  MPKI=6.000  EPI=1168
+  metapipe=3       VFS=0.8763  MPKI=6.014  EPI=1163
+  baseline         VFS=0.8761  MPKI=6.020  EPI=1163
+  num_tables=10    VFS=0.8756  MPKI=5.923  EPI=1319  (best raw MPKI)
+  tag_width=12     VFS=0.8759  MPKI=6.013  EPI=1187
+  maxhist=125      VFS=0.8762  MPKI=6.020  EPI=1165
+  num_tables=6     VFS=0.8754  MPKI=6.227  EPI=906   (closest to budget)
+  size_ratio=1.5   VFS=0.8743  MPKI=6.000  EPI=1309
+  p1_table=8192    VFS=0.8760  MPKI=6.019  EPI=999
+  tag_width=10     VFS=0.8752  MPKI=6.068  EPI=1139
+  maxhist=75       VFS=0.8746  MPKI=6.086  EPI=1162
+  bimodal=2048     VFS=0.8757  MPKI=6.051  EPI=1136
+  base_size=1024   VFS=0.8717  MPKI=6.309  EPI=1014
+  hyst_width=1     VFS=0.8698  MPKI=6.274  EPI=1080
+  base_size=4096   VFS=0.8483  MPKI=5.879  EPI=1299  (P2=3!)
+  ctr_width=2      VFS=0.3772  MPKI=42.57  EPI=1184  (broken)
+
+Notes:
+- All configs OVER EPI budget (900). Optimizer converged with no valid move.
+- decay_ctr=256 failed to build.
+- shared_hys=False identical VFS to baseline.
+
+Winner for iteration 2 starting point: minhist=4
