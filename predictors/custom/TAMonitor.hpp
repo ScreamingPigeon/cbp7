@@ -16,8 +16,7 @@
 using u64 = uint64_t;
 
 template <u64 NUM_TABLES, u64 N, u64 MAX_TABLE_ENTRIES = 2048,
-          bool USE_GSHARE = false, u64 FB_CAPACITY = 8192,
-          u64 HYST_BANKS = 1, u64 U_BANKS = 1>
+          bool USE_GSHARE = false, u64 FB_CAPACITY = 8192>
 struct TAMonitor {
 
   static constexpr const char *FB_NAME = USE_GSHARE ? "Gshare" : "Bimodal";
@@ -96,11 +95,6 @@ struct TAMonitor {
     std::array<u64, NUM_TABLES> sec_matches{};
     std::array<u64, NUM_TABLES> full_matches{};
 
-    // Secondary tag rejection analysis: would the rejected entry have been correct?
-    std::array<u64, NUM_TABLES> sec_reject_count{};      // tag hit, sec miss
-    std::array<u64, NUM_TABLES> sec_reject_correct{};    // rejected but would have predicted correctly
-    std::array<u64, NUM_TABLES> sec_reject_wrong{};      // rejected and would have predicted wrong
-
     // Allocation
     u64 alloc_attempts = 0;
     u64 alloc_success = 0;
@@ -111,15 +105,11 @@ struct TAMonitor {
     std::array<u64, NUM_TABLES + 1> alloc_from_provider{};
     std::array<std::array<u64, NUM_TABLES>, NUM_TABLES + 1> alloc_cascade{};
 
-    // u-bit (per table, per bank)
-    std::array<std::array<u64, U_BANKS>, NUM_TABLES> u_set_count{};
-    std::array<std::array<u64, U_BANKS>, NUM_TABLES> u_clear_count{};
+    // u-bit
+    std::array<u64, NUM_TABLES> u_set_count{};
+    std::array<u64, NUM_TABLES> u_clear_count{};
     u64 decay_fire_count = 0;
     u64 epoch_reset_count = 0;
-
-    // hyst training (per table, per bank)
-    std::array<std::array<u64, HYST_BANKS>, NUM_TABLES> hyst_inc_count{};
-    std::array<std::array<u64, HYST_BANKS>, NUM_TABLES> hyst_dec_count{};
 
     // Pressure counters (sampled each update_cycle with branches)
     u64 acc_ctr_sum = 0;
@@ -182,22 +172,6 @@ struct TAMonitor {
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> entry_ever_hit{};
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> win_entry_ever_hit{};
 
-  // Feature 10: Shadow u-values for histogram (per table, per entry, per bank)
-  static constexpr u64 MAX_U_VAL = 16; // enough for U_WIDTH up to 4
-  std::array<std::array<std::array<u64, U_BANKS>, MAX_TABLE_ENTRIES>, NUM_TABLES> u_shadow{};
-
-  // Shadow per-table prediction state (for sec tag rejection analysis)
-  // Saved at predict2, consumed at training (one cycle later)
-  struct TablePredShadow {
-    u64 pred_bits = 0;     // PRED_BITS-wide prediction from this table
-    bool tag_hit = false;  // primary tag matched
-    bool sec_hit = false;  // secondary tag matched
-  };
-  std::array<TablePredShadow, NUM_TABLES> shadow_table_pred{};
-  std::array<TablePredShadow, NUM_TABLES> train_table_pred{};  // piped one cycle
-  u64 shadow_num_branch = 0;
-  u64 train_num_branch = 0;
-
   // Block PC pipeline (for collision/lifetime tracking)
   u64 shadow_block_pc = 0;   // set in predict1
   u64 current_block_pc = 0;  // shifted in update_cycle
@@ -247,40 +221,6 @@ struct TAMonitor {
   void record_train_skip() {
     cum.train_skip_count++;
     win.train_skip_count++;
-  }
-
-  // Per-table prediction shadow (called at predict2 for each table)
-  void record_table_pred(u64 table, u64 pred_bits, bool tag_hit, bool sec_hit) {
-    shadow_table_pred[table] = {pred_bits, tag_hit, sec_hit};
-  }
-  void record_table_pred_num_branch(u64 nb) { shadow_num_branch = nb; }
-
-  // Pipeline shift for sec rejection shadow (called at start of update_cycle)
-  void shift_table_pred_shadow() {
-    train_table_pred = shadow_table_pred;
-    train_num_branch = shadow_num_branch;
-  }
-
-  // Evaluate sec tag rejections against actual direction (called during training)
-  void eval_sec_rejections(u64 actual_dir_bits) {
-    for (u64 t = 0; t < NUM_TABLES; t++) {
-      auto &tp = train_table_pred[t];
-      if (!tp.tag_hit || tp.sec_hit) continue; // only care about tag_hit && !sec_hit
-      auto record = [&](Counters &c) {
-        c.sec_reject_count[t]++;
-        // Check per-branch: was this table's prediction correct for each branch?
-        bool all_correct = true;
-        for (u64 r = 0; r < train_num_branch; r++) {
-          bool pred_r = (tp.pred_bits >> r) & 1;
-          bool actual_r = (actual_dir_bits >> r) & 1;
-          if (pred_r != actual_r) { all_correct = false; break; }
-        }
-        if (all_correct) c.sec_reject_correct[t]++;
-        else c.sec_reject_wrong[t]++;
-      };
-      record(cum);
-      record(win);
-    }
   }
 
   // Tag lookups per table
@@ -426,7 +366,6 @@ struct TAMonitor {
   void shift_block_pc() {
     train_block_pc = current_block_pc;
     current_block_pc = shadow_block_pc;
-    shift_table_pred_shadow();
   }
 
   // Feature 5: Record provider entry usage (call once per block during resolution)
@@ -486,27 +425,14 @@ struct TAMonitor {
     win_pc_diag[train_block_pc].alloc_count++;
   }
 
-  // u-bit write (per bank) — tracks shadow u-values for histogram
-  void record_u_write(u64 table, u64 bank, u64 index, u64 new_val) {
-    if (new_val > 0) {
-      cum.u_set_count[table][bank]++;
-      win.u_set_count[table][bank]++;
+  // u-bit write
+  void record_u_write(u64 table, bool new_u) {
+    if (new_u) {
+      cum.u_set_count[table]++;
+      win.u_set_count[table]++;
     } else {
-      cum.u_clear_count[table][bank]++;
-      win.u_clear_count[table][bank]++;
-    }
-    if (index < MAX_TABLE_ENTRIES)
-      u_shadow[table][index][bank] = new_val;
-  }
-
-  // hyst training (per bank)
-  void record_hyst_update(u64 table, u64 bank, bool incremented) {
-    if (incremented) {
-      cum.hyst_inc_count[table][bank]++;
-      win.hyst_inc_count[table][bank]++;
-    } else {
-      cum.hyst_dec_count[table][bank]++;
-      win.hyst_dec_count[table][bank]++;
+      cum.u_clear_count[table]++;
+      win.u_clear_count[table]++;
     }
   }
 
@@ -517,10 +443,6 @@ struct TAMonitor {
   void record_epoch_reset() {
     cum.epoch_reset_count++;
     win.epoch_reset_count++;
-    // Clear shadow u-values (mirrors hardware epoch reset)
-    for (auto &table : u_shadow)
-      for (auto &entry : table)
-        entry.fill(0);
   }
 
   void record_pressure(u64 acc_val, u64 alloc_val) {
@@ -737,33 +659,6 @@ struct TAMonitor {
        << "  Correct: " << c.meta_chose_pri_correct << " ("
        << pct(c.meta_chose_pri_correct, c.meta_chose_pri) << "%)\n";
 
-    // Secondary tag rejection analysis
-    {
-      u64 total_reject = 0, total_correct = 0, total_wrong = 0;
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        total_reject += c.sec_reject_count[i];
-        total_correct += c.sec_reject_correct[i];
-        total_wrong += c.sec_reject_wrong[i];
-      }
-      if (total_reject > 0) {
-        os << "\nSec Tag Rejection Analysis (tag hit but sec miss — would pred have been correct?):\n";
-        os << "  Table  | Rejected  | WouldCorrect | WouldWrong | Correct%\n";
-        os << "  -------+-----------+--------------+------------+---------\n";
-        for (u64 i = 0; i < NUM_TABLES; i++) {
-          if (c.sec_reject_count[i] == 0) continue;
-          os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
-             << std::setw(10) << c.sec_reject_count[i] << " |"
-             << std::setw(13) << c.sec_reject_correct[i] << " |"
-             << std::setw(11) << c.sec_reject_wrong[i] << " |"
-             << std::setw(7) << pct(c.sec_reject_correct[i], c.sec_reject_count[i]) << "%\n";
-        }
-        os << "  Total  |" << std::setw(10) << total_reject << " |"
-           << std::setw(13) << total_correct << " |"
-           << std::setw(11) << total_wrong << " |"
-           << std::setw(7) << pct(total_correct, total_reject) << "%\n";
-      }
-    }
-
     // Allocation
     os << "\nAllocation:\n";
     os << "  Attempts: " << c.alloc_attempts
@@ -830,104 +725,14 @@ struct TAMonitor {
     os << "  Table  | U set    | U clear  | Turnover\n";
     os << "  -------+----------+----------+----------\n";
     for (u64 i = 0; i < NUM_TABLES; i++) {
-      u64 total_set = 0, total_clear = 0;
-      for (u64 b = 0; b < U_BANKS; b++) {
-        total_set += c.u_set_count[i][b];
-        total_clear += c.u_clear_count[i][b];
-      }
-      u64 total_u = total_set + total_clear;
+      u64 total_u = c.u_set_count[i] + c.u_clear_count[i];
       os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
-         << std::setw(9) << total_set << " |" << std::setw(9)
-         << total_clear << " |" << std::setw(7)
-         << pct(total_clear, total_u) << "%\n";
+         << std::setw(9) << c.u_set_count[i] << " |" << std::setw(9)
+         << c.u_clear_count[i] << " |" << std::setw(7)
+         << pct(c.u_clear_count[i], total_u) << "%\n";
     }
     os << "  Decay fires: " << c.decay_fire_count
        << "  Epoch resets: " << c.epoch_reset_count << "\n";
-
-    // Per-bank U-bit breakdown (only when banked)
-    if constexpr (U_BANKS > 1) {
-      os << "\nU-bit Per Bank:\n";
-      os << "  Table  | Bank | U set    | U clear  | Turnover\n";
-      os << "  -------+------+----------+----------+----------\n";
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        for (u64 b = 0; b < U_BANKS; b++) {
-          u64 total_u = c.u_set_count[i][b] + c.u_clear_count[i][b];
-          os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
-             << std::setw(5) << b << " |" << std::setw(9) << c.u_set_count[i][b]
-             << " |" << std::setw(9) << c.u_clear_count[i][b]
-             << " |" << std::setw(7) << pct(c.u_clear_count[i][b], total_u) << "%\n";
-        }
-      }
-    }
-
-    // U-value distribution histogram (snapshot at end of trace)
-    {
-      // Find max u value present to size the histogram columns
-      u64 max_seen = 0;
-      for (u64 i = 0; i < NUM_TABLES; i++)
-        for (u64 e = 0; e < MAX_TABLE_ENTRIES; e++)
-          for (u64 b = 0; b < U_BANKS; b++)
-            if (u_shadow[i][e][b] > max_seen) max_seen = u_shadow[i][e][b];
-      u64 num_buckets = std::min(max_seen + 1, MAX_U_VAL);
-
-      os << "\nU-value Distribution (end-of-trace snapshot):\n";
-      os << "  Table  |";
-      for (u64 v = 0; v < num_buckets; v++)
-        os << " u=" << v << "   ";
-      os << "\n  -------+";
-      for (u64 v = 0; v < num_buckets; v++)
-        os << "--------";
-      os << "\n";
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        std::array<u64, MAX_U_VAL> hist{};
-        u64 total = 0;
-        for (u64 e = 0; e < MAX_TABLE_ENTRIES; e++) {
-          for (u64 b = 0; b < U_BANKS; b++) {
-            u64 v = u_shadow[i][e][b];
-            if (v < MAX_U_VAL) hist[v]++;
-            total++;
-          }
-        }
-        os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|";
-        for (u64 v = 0; v < num_buckets; v++)
-          os << std::setw(5) << hist[v] << "(" << std::setw(2)
-             << (total > 0 ? u64(100.0 * hist[v] / total + 0.5) : 0) << "%)";
-        os << "\n";
-      }
-    }
-
-    // Hyst training breakdown
-    os << "\nHyst Training:\n";
-    os << "  Table  | Hyst Inc | Hyst Dec | Inc%\n";
-    os << "  -------+----------+----------+------\n";
-    for (u64 i = 0; i < NUM_TABLES; i++) {
-      u64 total_inc = 0, total_dec = 0;
-      for (u64 b = 0; b < HYST_BANKS; b++) {
-        total_inc += c.hyst_inc_count[i][b];
-        total_dec += c.hyst_dec_count[i][b];
-      }
-      u64 total_h = total_inc + total_dec;
-      os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
-         << std::setw(9) << total_inc << " |" << std::setw(9)
-         << total_dec << " |" << std::setw(5)
-         << pct(total_inc, total_h) << "%\n";
-    }
-
-    // Per-bank hyst breakdown (only when banked)
-    if constexpr (HYST_BANKS > 1) {
-      os << "\nHyst Training Per Bank:\n";
-      os << "  Table  | Bank | Hyst Inc | Hyst Dec | Inc%\n";
-      os << "  -------+------+----------+----------+------\n";
-      for (u64 i = 0; i < NUM_TABLES; i++) {
-        for (u64 b = 0; b < HYST_BANKS; b++) {
-          u64 total_h = c.hyst_inc_count[i][b] + c.hyst_dec_count[i][b];
-          os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
-             << std::setw(5) << b << " |" << std::setw(9) << c.hyst_inc_count[i][b]
-             << " |" << std::setw(9) << c.hyst_dec_count[i][b]
-             << " |" << std::setw(5) << pct(c.hyst_inc_count[i][b], total_h) << "%\n";
-        }
-      }
-    }
 
     // Pressure
     if (c.pressure_samples > 0) {

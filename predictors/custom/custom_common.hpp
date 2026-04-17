@@ -131,12 +131,6 @@ struct ta_folded_gh {
 enum class HistUpdate { PATH, DIR, BOTH };
 enum class DecayMiss { TAG, SEC, TAG_OR_SEC, TAG_AND_SEC };
 enum class DecayOp { DECREMENT, HALVE, CLEAR };
-enum class UProvUpdate {
-  SET_OR_CLEAR, // current: correct → max_u, wrong → 0
-  SET_ON_CORRECT, // Tage.hpp style: correct → max_u, wrong → no write
-  INC_DEC,        // saturating: correct → u+1, wrong → u-1
-  INC_ONLY        // correct → u+1, wrong → no write
-};
 
 // ============================================================================
 // geometric_folds_ex — geometric_folds with templated update mode
@@ -485,63 +479,11 @@ struct DefaultDecayThresh {
   }
 };
 
-// Epoch trigger functors.
-// Interface: should_fire<AW, PW, EW>(acc_ctr, alloc_ctr, epoch_ctr) → val<1>
-// acc_ctr: accuracy counter (high = predicting well)
-// alloc_ctr: allocation pressure counter (high = can't allocate)
-// epoch_ctr: free-running counter incremented each update_cycle
-
-// AllocSaturate: fire when alloc_ctr saturates (original behavior).
-struct AllocSaturateEpoch {
-  template <u64 AW, u64 PW, u64 EW>
-  static val<1> should_fire(val<AW> /*acc_ctr*/, val<PW> alloc_ctr,
-                             val<EW> /*epoch_ctr*/) {
+// Default epoch trigger: fire when alloc_ctr saturates.
+struct DefaultEpochTrigger {
+  template <u64 AW, u64 PW>
+  static val<1> should_fire(val<AW> /*acc_ctr*/, val<PW> alloc_ctr) {
     return alloc_ctr == hard<alloc_ctr.maxval>{};
-  }
-};
-using DefaultEpochTrigger = AllocSaturateEpoch;
-
-// FixedIntervalEpoch<PERIOD>: fire every PERIOD update_cycles.
-// PERIOD must be a power of 2 (uses bit test for zero-gate-cost).
-template <u64 PERIOD>
-struct FixedIntervalEpoch {
-  static_assert(PERIOD > 0 && (PERIOD & (PERIOD - 1)) == 0,
-                "PERIOD must be a power of 2");
-  template <u64 AW, u64 PW, u64 EW>
-  static val<1> should_fire(val<AW> /*acc_ctr*/, val<PW> /*alloc_ctr*/,
-                             val<EW> epoch_ctr) {
-    // Fire when low bits are all zero (i.e. counter is a multiple of PERIOD)
-    constexpr u64 MASK = PERIOD - 1;
-    return (epoch_ctr & hard<MASK>{}) == hard<0>{};
-  }
-};
-
-// AllocAccJointEpoch<ALLOC_THRESH, ACC_THRESH>: fire when alloc pressure
-// exceeds ALLOC_THRESH AND accuracy is below ACC_THRESH.
-// Avoids resetting when predictor is accurate despite high pressure.
-template <u64 ALLOC_THRESH, u64 ACC_THRESH>
-struct AllocAccJointEpoch {
-  template <u64 AW, u64 PW, u64 EW>
-  static val<1> should_fire(val<AW> acc_ctr, val<PW> alloc_ctr,
-                             val<EW> /*epoch_ctr*/) {
-    return (alloc_ctr >= hard<ALLOC_THRESH>{}) &
-           (acc_ctr <= hard<ACC_THRESH>{});
-  }
-};
-
-// CountdownEpoch<PERIOD, ACC_GATE>: fire every PERIOD update_cycles, but
-// only if acc_ctr < ACC_GATE. Skips reset when predictor is doing well.
-// PERIOD must be a power of 2.
-template <u64 PERIOD, u64 ACC_GATE>
-struct CountdownEpoch {
-  static_assert(PERIOD > 0 && (PERIOD & (PERIOD - 1)) == 0,
-                "PERIOD must be a power of 2");
-  template <u64 AW, u64 PW, u64 EW>
-  static val<1> should_fire(val<AW> acc_ctr, val<PW> /*alloc_ctr*/,
-                             val<EW> epoch_ctr) {
-    constexpr u64 MASK = PERIOD - 1;
-    val<1> interval_hit = (epoch_ctr & hard<MASK>{}) == hard<0>{};
-    return interval_hit & (acc_ctr < hard<ACC_GATE>{});
   }
 };
 
@@ -672,9 +614,7 @@ template <u64 TABLE_SIZE,
           u64 U_WIDTH,
           u64 SEC_TAG_BITS,
           u64 N,            // max branches per block (= lanes of pred)
-          bool SHARED_HYS = false,  // shared hyst: 2 entries share 1 counter
-          u64 HYST_BANKS = 1,       // hyst banks (1=shared, N=per-branch)
-          u64 U_BANKS = 1>          // u banks (1=shared, N=per-branch)
+          bool SHARED_HYS = false>  // shared hyst: 2 entries share 1 counter
 struct TATable {
   static constexpr u64 IDX_BITS = ta::clog2(TABLE_SIZE);
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -685,8 +625,6 @@ struct TATable {
   static constexpr u64 hyst_width = HYST_WIDTH;
   static constexpr u64 u_width = U_WIDTH;
   static constexpr u64 sec_tag_bits = SEC_TAG_BITS;
-  static constexpr u64 hyst_banks = HYST_BANKS;
-  static constexpr u64 u_banks = U_BANKS;
 
   // When SHARED_HYS=true, halve the hyst table: pairs of entries share one counter
   static constexpr u64 HYST_SIZE = SHARED_HYS ? (TABLE_SIZE / 2) : TABLE_SIZE;
@@ -694,17 +632,13 @@ struct TATable {
 
   static_assert(TABLE_SIZE >= 2 && std::has_single_bit(TABLE_SIZE),
                 "TABLE_SIZE must be a power of 2 >= 2");
-  static_assert(HYST_BANKS >= 1 && std::has_single_bit(HYST_BANKS),
-                "HYST_BANKS must be a power of 2");
-  static_assert(U_BANKS >= 1 && std::has_single_bit(U_BANKS),
-                "U_BANKS must be a power of 2");
 
   // ---- RAMs ----
   hcm::ram<val<TAG_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
   ta_rwram<PRED_BITS, TABLE_SIZE, 2>      pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
-  ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram[HYST_BANKS];
-  ta_rwram<U_WIDTH, TABLE_SIZE, 2>        u_ram[U_BANKS];
+  ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
+  ta_rwram<U_WIDTH, TABLE_SIZE, 2>        u_ram{"ta_u"};
 
   // ---- Per-table folded histories (fold into exact widths) ----
   ta_folded_gh<IDX_BITS> fold_idx;
@@ -714,28 +648,22 @@ struct TATable {
 
 // Generate a TATable type from config arrays at index I
 template <typename Cfg, u64 I, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS = false,
-          u64 HYST_BANKS = 1, u64 U_BANKS = 1>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS = false>
 using TATableAt =
     TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I],
-            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
-            HYST_BANKS, U_BANKS>;
+            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS>;
 
 // Build a tuple of TATable types
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS,
-          u64 HYST_BANKS, u64 U_BANKS, typename Seq>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, typename Seq>
 struct TAMakeTableTuple;
 
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS,
-          u64 HYST_BANKS, u64 U_BANKS, u64... Is>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, u64... Is>
 struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                        SEC_TAG_BITS, N, SHARED_HYS,
-                        HYST_BANKS, U_BANKS, std::index_sequence<Is...>> {
+                        SEC_TAG_BITS, N, SHARED_HYS, std::index_sequence<Is...>> {
   using type = std::tuple<TATableAt<Cfg, Is, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                                    SEC_TAG_BITS, N, SHARED_HYS,
-                                    HYST_BANKS, U_BANKS>...>;
+                                    SEC_TAG_BITS, N, SHARED_HYS>...>;
 };
 
 // ============================================================================
@@ -841,84 +769,11 @@ struct AccuracyPressureSkipTarget {
   }
 };
 
-// ---- Replacement Policy Functors (Technique 4) ----
-// Determine whether an entry is replaceable during allocation.
-// Signature: is_replaceable(u, hyst, alloc_p, acc_p) → val<1>
-// u = val<UW>, hyst = val<HW>, alloc_p/acc_p = valtype auto (pressure counters)
-
-// Original behavior: replace when u == 0 (ignore confidence)
-struct ReplaceUZero {
-  static constexpr const char* name() { return "UZero"; }
-  template <u64 UW, u64 HW>
-  static val<1> is_replaceable(val<UW> u, val<HW>, valtype auto, valtype auto) {
-    return u == hard<0>{};
-  }
-};
-
-// Replace when u == 0 AND hysteresis below threshold (low confidence)
-template <u64 THRESH = 1>
-struct ReplaceUZeroWeakConf {
-  static constexpr const char* name() { return "UZeroWeak"; }
-  template <u64 UW, u64 HW>
-  static val<1> is_replaceable(val<UW> u, val<HW> hyst, valtype auto, valtype auto) {
-    return (u == hard<0>{}) & (val<HW>{hyst} <= val<HW>{hard<THRESH>{}});
-  }
-};
-
-// Replace when u == 0, but relax confidence gate under high alloc pressure
-template <u64 THRESH = 1, u64 ALLOC_W = 4>
-struct ReplacePressureAdaptive {
-  static constexpr const char* name() { return "PressAdapt"; }
-  template <u64 UW, u64 HW>
-  static val<1> is_replaceable(val<UW> u, val<HW> hyst, val<ALLOC_W> ap, valtype auto) {
-    val<1> u_zero = (u == hard<0>{});
-    val<1> weak = (val<HW>{hyst} <= val<HW>{hard<THRESH>{}});
-    // Under high pressure (alloc_ctr near saturation), allow any u==0 entry
-    val<1> high_pressure = val<1>{ap >> hard<ALLOC_W - 1>{}};
-    return u_zero & (weak | high_pressure);
-  }
-};
-
-// ---- Alt Bank Promotion Functors (Technique 3) ----
-// When provider wrong AND alt correct, optionally set alt's u-bit to protect it.
-// Signature: should_promote(prov_wrong, alt_correct, alloc_p, acc_p, rng) → val<1>
-
-struct AltPromoteOff {
-  static constexpr const char* name() { return "AltPromOff"; }
-  static val<1> should_promote(val<1>, val<1>, valtype auto, valtype auto, val<8>) {
-    return val<1>{0};
-  }
-};
-
-struct AltPromoteAlways {
-  static constexpr const char* name() { return "AltPromAlways"; }
-  static val<1> should_promote(val<1> prov_wrong, val<1> alt_correct, valtype auto, valtype auto, val<8>) {
-    return prov_wrong & alt_correct;
-  }
-};
-
-template <u64 PROB_256 = 128>
-struct AltPromoteProb {
-  static constexpr const char* name() { return "AltPromProb"; }
-  static val<1> should_promote(val<1> prov_wrong, val<1> alt_correct, valtype auto, valtype auto, val<8> rng) {
-    return prov_wrong & alt_correct & (rng < hard<PROB_256>{});
-  }
-};
-
-// Promote more aggressively under high alloc pressure (entries being evicted fast)
-struct AltPromotePressure {
-  static constexpr const char* name() { return "AltPromPress"; }
-  static val<1> should_promote(val<1> prov_wrong, val<1> alt_correct, valtype auto ap, valtype auto, val<8> rng) {
-    return prov_wrong & alt_correct & (val<8>{ap} > rng);
-  }
-};
-
 // ---- Allocation Config Structs ----
 
 struct TADefaultAllocConfig {
   static constexpr u64 MAX_ALLOC = 1;
   static constexpr bool NON_CONSECUTIVE = false;
-  static constexpr u64 ALLOC_DECAY_SHIFT = 1; // prob halved per extra slot (L-TAGE: 1)
   static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::MISPREDICT;
   static constexpr AllocAction  ALLOC_ACTION  = AllocAction::STANDARD;
   using TARGET_POLICY = ClosestTarget;
@@ -934,22 +789,6 @@ struct TAAllocDetSkip1 : TADefaultAllocConfig {
 
 struct TAAlloc2 : TADefaultAllocConfig {
   static constexpr u64 MAX_ALLOC = 2;
-};
-
-struct TAAlloc3 : TADefaultAllocConfig {
-  static constexpr u64 MAX_ALLOC = 3;
-};
-
-// L-TAGE style: up to 3 slots, prob decay 1/2 per extra slot
-struct TAAllocLTAGE : TADefaultAllocConfig {
-  static constexpr u64 MAX_ALLOC = 3;
-  static constexpr u64 ALLOC_DECAY_SHIFT = 1;
-};
-
-// Aggressive: up to 3 slots, no decay (always allocate all 3 if available)
-struct TAAlloc3NoDec : TADefaultAllocConfig {
-  static constexpr u64 MAX_ALLOC = 3;
-  static constexpr u64 ALLOC_DECAY_SHIFT = 0;
 };
 
 struct TAAllocTageWrong : TADefaultAllocConfig {
