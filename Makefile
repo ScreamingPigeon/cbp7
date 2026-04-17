@@ -191,7 +191,7 @@ $(BUILD_DIR)/timing-probe-$(PRED_HASH): predictors/custom/timing_probe.cpp cbp.h
 timing-probe: $(BUILD_DIR)/timing-probe-$(PRED_HASH)
 
 run-timing-probe: $(BUILD_DIR)/timing-probe-$(PRED_HASH)
-	./$(BUILD_DIR)/timing-probe-$(PRED_HASH) $(TRACE) $(TRACE_NAME) $(WARMUP) $(TIMING_MEASURE) 2>&1 
+	./$(BUILD_DIR)/timing-probe-$(PRED_HASH) $(TRACE) $(TRACE_NAME) $(WARMUP) $(TIMING_MEASURE) 2>&1 | head -60
 
 # Compare two predictors side-by-side.
 # Single trace:  make compare TRACE=path/to/trace.gz

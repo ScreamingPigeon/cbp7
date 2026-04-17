@@ -38,23 +38,16 @@ struct ta_global_history {
     // Unconditional write with enable mux — avoids execute_if gate timing.
     // When enable=1: shift and XOR in new input (normal update).
     // When enable=0: hold current state (registers still written, mux selects old value).
-    // Explicit fo1() on h[i] breaks the combinational feedback loop
-    // (h[i] read → select → h[i] write) that inflates timing.
     void update(valtype auto in, val<1> enable)
     {
         auto input = in.fo1().make_array(val<1>{});
         static_assert(input.size<=N);
         enable.fanout(hard<N>{});
-        for (u64 i=N-1; i>=input.size; i--) {
-            val<1> old = h[i].fo1();
-            h[i] = select(enable, h[i-1], old);
-        }
-        for (u64 i=input.size-1; i>=1; i--) {
-            val<1> old = h[i].fo1();
-            h[i] = select(enable, h[i-1] ^ input[i].fo1(), old);
-        }
-        val<1> old0 = h[0].fo1();
-        h[0] = select(enable, input[0].fo1(), old0);
+        for (u64 i=N-1; i>=input.size; i--)
+            h[i] = select(enable, h[i-1], h[i]);
+        for (u64 i=input.size-1; i>=1; i--)
+            h[i] = select(enable, h[i-1] ^ input[i].fo1(), h[i]);
+        h[0] = select(enable, input[0].fo1(), h[0]);
     }
 
     val<1>& operator[] (u64 i) { return h[i]; }
@@ -118,12 +111,9 @@ struct ta_folded_gh {
 
     // Unconditional write with enable mux — avoids execute_if gate timing.
     // When enable=1: write new_val. When enable=0: hold current value.
-    // Explicit fo1() on folded breaks the combinational feedback loop
-    // (folded read → select → folded write) that inflates timing.
     void apply_update(val<F> new_val, val<1> enable)
     {
-        val<F> old_val = folded.fo1();
-        folded = select(enable, new_val, old_val);
+        folded = select(enable, new_val, folded);
     }
 
     // Combined compute + apply (convenience, same as original folded_gh::update)
@@ -712,6 +702,7 @@ struct TATable {
   // ---- RAMs ----
   hcm::ram<val<TAG_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
   ta_rwram<PRED_BITS, TABLE_SIZE, 2>      pred_ram{"ta_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
   ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram[HYST_BANKS];
   ta_rwram<U_WIDTH, TABLE_SIZE, 2>        u_ram[U_BANKS];
 

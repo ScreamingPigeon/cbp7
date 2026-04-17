@@ -20,24 +20,18 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
     fprintf(stderr, "--- update_cycle datapath (cycle_end=%lu) ---\n", next_time);
 
     // Pipeline shift regs
-    constexpr uint64_t NT = std::tuple_size_v<std::remove_extent_t<decltype(pp.tables)>>;
-    constexpr uint64_t NP = std::extent_v<decltype(pp.tables)>;
+    constexpr uint64_t NT = std::tuple_size_v<decltype(pp.tables)>;
     uint64_t worst_current = 0;
     for (uint64_t i = 0; i < NT; i++) {
-        for (uint64_t p = 0; p < NP; p++)
-            worst_current = std::max(worst_current, pp.current_pred[i][p].time());
+        worst_current = std::max(worst_current, pp.current_pred[i].time());
         worst_current = std::max(worst_current, pp.current_tag_hit[i].time());
+        worst_current = std::max(worst_current, pp.current_sec[i].time());
     }
     d("pipe_shift (current_*)", worst_current);
     d("curr_sec_tag", pp.curr_sec_tag.time());
 
-    // Sec tag timing: write vs read (read is now at final select, not path mux)
-    d("next_pc (arrival)", pp.dbg_next_pc.time());
-    d("sec_tag (write)", pp.dbg_sec_tag_write.time());
-    d("sec_tag (read/select)", pp.dbg_sec_tag_read.time());
-
-    // Resolution chain (parallel per-path, shared match/one_hot)
-    d("full_hits (tag only)", pp.dbg_full_hits.time());
+    // Resolution chain
+    d("full_hits", pp.dbg_full_hits.time());
     d("fb_pred", pp.dbg_fb_pred.time());
     d("match (concat)", pp.dbg_match.time());
     d("match1 (one_hot)", pp.dbg_match1.time());
@@ -47,14 +41,8 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
     d("provider_weak", pp.dbg_provider_weak.time());
     d("has_alt", pp.dbg_has_alt.time());
     d("meta_use_alt", pp.dbg_meta_use_alt.time());
-    d("use_alt_0 (chain 0)", pp.dbg_use_alt_0.time());
-    d("final_pred_0 (chain 0)", pp.dbg_final_pred_0.time());
-    if constexpr (NP > 1) {
-        d("use_alt_1 (chain 1)", pp.dbg_use_alt_1.time());
-        d("final_pred_1 (chain 1)", pp.dbg_final_pred_1.time());
-    }
-    d("use_alt (post-select)", pp.dbg_use_alt.time());
-    d("final_pred (post-select)", pp.dbg_final_pred.time());
+    d("use_alt", pp.dbg_use_alt.time());
+    d("final_pred (select)", pp.dbg_final_pred.time());
 
     // Resolution gaps
     d("altdiff", pp.dbg_altdiff.time());
@@ -99,9 +87,6 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
     d("inst_pc (predict1)", pp.dbg_inst_pc.time());
     d("fold_idx[0] (predict1)", pp.dbg_fold_idx.time());
     d("fold_tag[0] (predict1)", pp.dbg_fold_tag.time());
-    d("tag_ram[0] (predict1)", pp.dbg_tag_ram_p1.time());
-    d("pred_ram[0] (predict1)", pp.dbg_pred_ram_p1.time());
-    d("fb_ram (predict1)", pp.dbg_fb_ram_p1.time());
     d("p1_return (predict1)", pp.dbg_p1_return.time());
     d("hist_input (update)", pp.dbg_hist_input.time());
     d("gh[0] (update)", pp.dbg_gh_fanout.time());
