@@ -621,7 +621,6 @@ struct TageAhead : predictor {
       val<1> ua = pw & meta_use_alt & ha;
       val<PRED_BITS> fp = select(ua, ap, pp);
 
-      pp.fanout(hard<3>{}); // altdiff + train/mux + select already consumed
       ap.fanout(hard<2>{});
       val<1> ad = (pp ^ ap) != hard<0>{};
 
