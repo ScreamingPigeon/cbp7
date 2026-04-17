@@ -487,6 +487,22 @@ struct DefaultEpochTrigger {
   }
 };
 
+// Default sec_tag hash: extract bits [2+SEC_TAG_BITS-1 : 2] from PC.
+struct DefaultSecTagHash {
+  template <u64 SEC_TAG_BITS>
+  static val<SEC_TAG_BITS> apply(val<64> pc) {
+    return val<SEC_TAG_BITS>{pc >> 2};
+  }
+};
+
+// XOR-folded sec_tag hash: XOR two non-overlapping bit slices of PC.
+struct XorSecTagHash {
+  template <u64 SEC_TAG_BITS>
+  static val<SEC_TAG_BITS> apply(val<64> pc) {
+    return val<SEC_TAG_BITS>{pc >> 2} ^ val<SEC_TAG_BITS>{pc >> (2 + SEC_TAG_BITS)};
+  }
+};
+
 } // namespace ta
 
 // ============================================================================

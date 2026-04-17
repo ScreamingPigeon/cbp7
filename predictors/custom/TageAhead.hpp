@@ -13,7 +13,7 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 8, u64 SIZE = 1024, u64 TAG = 10, u64 MINH = 10,
+template <u64 N = 7, u64 SIZE = 1024, u64 TAG = 10, u64 MINH = 10,
           u64 MAXH = 100, u64 SIZE_RATIO = 1,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::GradedTag<TAG, TAG - 1>,
@@ -54,17 +54,20 @@ template <
     u64 PATHBITS = 6,        // bits of next_pc injected into history
     u64 SEC_TAG_BITS = 3,    // secondary tag width (ahead ambiguity)
     bool USE_SEC_TAG = true, // enable secondary tag matching
-    u64 CTR_WIDTH = 1,       // prediction counter width per lane
-    u64 HYST_WIDTH = 2,      // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 1,         // usefulness counter width
-    u64 FB_CAPACITY = 8192,  // fallback table size (bimodal or gshare)
-    bool USE_GSHARE = true,  // use gshare base (PC^history) vs bimodal (PC)
-    u64 GS_HIST = 6,         // gshare history length (only when USE_GSHARE)
-    u64 META_WIDTH = 5,      // meta counter width (provider vs alt)
-    u64 META_CAPACITY = 256, // meta table entries
-    u64 META_PIPE = 2,       // meta pipeline depth
-    u64 LINEINST = 1024,     // line size in instructions
-    bool SHARED_HYS = true,  // shared hyst: 2 entries share 1 counter
+    u64 NUM_PATHS = 1, // parallel resolution chains (paper: 1 << SEC_TAG_BITS)
+    typename SecTagHashFn =
+        ta::DefaultSecTagHash, // sec_tag hash: PC → val<SEC_TAG_BITS>
+    u64 CTR_WIDTH = 1,         // prediction counter width per lane
+    u64 HYST_WIDTH = 2,        // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 1,           // usefulness counter width
+    u64 FB_CAPACITY = 8192,    // fallback table size (bimodal or gshare)
+    bool USE_GSHARE = true,    // use gshare base (PC^history) vs bimodal (PC)
+    u64 GS_HIST = 6,           // gshare history length (only when USE_GSHARE)
+    u64 META_WIDTH = 6,        // meta counter width (provider vs alt)
+    u64 META_CAPACITY = 1024,  // meta table entries
+    u64 META_PIPE = 2,         // meta pipeline depth
+    u64 LINEINST = 1024,       // line size in instructions
+    bool SHARED_HYS = true,    // shared hyst: 2 entries share 1 counter
     HistUpdate HIST_MODE =
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
     // ---- Allocation policy ----
@@ -79,15 +82,28 @@ template <
     typename DecayThreshFn = ta::DefaultDecayThresh,
     // ---- Epoch-based u-bit reset ----
     bool EPOCH_ENABLE = true, typename EpochTriggerFn = ta::DefaultEpochTrigger,
-    bool EPOCH_RESET_ACC = false, // reset acc_ctr on epoch fire
-    bool EPOCH_RESET_ALLOC = true // reset alloc_ctr on epoch fire
-    >
+    bool EPOCH_RESET_ACC = false,  // reset acc_ctr on epoch fire
+    bool EPOCH_RESET_ALLOC = true, // reset alloc_ctr on epoch fire
+    // ---- Fallback reconciliation ----
+    // When enabled, tracks agreement between fb and TAGE via fb_hyst RAM.
+    // Overwrites fb pred when they persistently disagree (hyst weak).
+    // Mirrors Tage.hpp's P1/P2 reconciliation — keeps fb aligned with TAGE.
+    bool FB_RECONCILE = false,
+    // ---- Far-allocation pressure ----
+    // When > 0, allocation distance >= FARALLOC_DIST from provider biases
+    // alloc_ctr harder toward epoch/decay (extra decrement).
+    // Mirrors Tage.hpp's faralloc-based uctr adaptation.
+    u64 FARALLOC_DIST = 0>
 struct TageAhead : predictor {
 
   // ======== Derived Constants ========
 
   static_assert(!(DECAY_ENABLE && EPOCH_ENABLE),
                 "DECAY_ENABLE and EPOCH_ENABLE are mutually exclusive");
+  static_assert(NUM_PATHS == 1 ||
+                    (USE_SEC_TAG && NUM_PATHS == (u64(1) << SEC_TAG_BITS)),
+                "NUM_PATHS must be 1 or 2^SEC_TAG_BITS with USE_SEC_TAG");
+  static_assert(NUM_PATHS <= 4, "NUM_PATHS > 4 not yet supported");
 
   static constexpr u64 NT = TableCfg::NUM_TABLES;
   static constexpr u64 LOGLINEINST = ta::clog2(LINEINST);
@@ -118,6 +134,10 @@ struct TageAhead : predictor {
                                            std::make_index_sequence<NT>>::type;
   Tables tables;
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
+  // Fallback hysteresis: tracks agreement between fb and TAGE.
+  // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
+  // Only accessed when FB_RECONCILE=true; zero cost otherwise.
+  hcm::ram<val<1>, FB_CAPACITY> fb_hyst{"fb_hyst"};
   ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
 
   // ======================================================================
@@ -134,6 +154,9 @@ struct TageAhead : predictor {
   static constexpr u64 FB_IDX_BITS = ta::clog2(FB_CAPACITY);
   reg<FB_IDX_BITS> prefetch_fb_idx;
   reg<FB_IDX_BITS> current_fb_idx;
+  // Piped fb hyst for reconciliation (only accessed when FB_RECONCILE=true)
+  reg<1> prefetch_fb_hyst;
+  reg<1> current_fb_hyst;
 
   // Gshare fold register — folds GS_HIST bits of global history into
   // FB_IDX_BITS for the fallback index. Zero cost when USE_GSHARE=false
@@ -189,17 +212,23 @@ struct TageAhead : predictor {
   // train_*: saved from current_* before pipeline shift, used for training
   // (training is for block A, resolution is for block B)
   reg<MAX_IDX_BITS> train_idx[NT];
+  reg<PRED_BITS>
+      train_pred[NT]; // per-table pred for per-table training signals
   reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT];
   reg<U_WIDTH> train_u[NT];
   reg<PRED_BITS> train_fb;
   reg<FB_IDX_BITS> train_fb_idx;
+  reg<1> train_fb_hyst; // piped fb hyst for reconciliation
   reg<ALLOC_PC_BITS> train_pc;
   reg<MAX_TAG_WIDTH> train_ctag[NT]; // piped computed tag for allocation
 
   // Piped resolution values from previous update_cycle (block A's resolution)
   reg<MATCH_BITS> train_match1;
   reg<PRED_BITS> train_provider_pred;
-  reg<1> train_provider_weak;
+  reg<1> train_provider_weak; // newly-allocated weakness (hyst==0 & u==0) — for
+                              // meta
+  reg<1> train_provider_hyst_weak; // hyst-only weakness (hyst==0) — for
+                                   // pred/hyst update
   reg<1> train_altdiff;
 
   // Guard: skip training until piped resolution regs have been populated
@@ -363,6 +392,8 @@ struct TageAhead : predictor {
     }();
     prefetch_fb_idx = fb_idx;
     prefetch_fb = fb_ctr.read(fb_idx);
+    if constexpr (FB_RECONCILE)
+      prefetch_fb_hyst = fb_hyst.read(fb_idx);
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
 
     // Crit path: just read precomputed prediction from reg
@@ -423,6 +454,8 @@ struct TageAhead : predictor {
     // Save current_* into train_* before shift (block A's data for training)
     static_loop<NT>([&]<u64 I>() {
       train_idx[I] = current_idx[I];
+      train_pred[I] =
+          current_pred[I]; // per-table pred for per-table wrong signals
       train_hyst[I] = current_hyst[I];
       train_u[I] = current_u[I];
       train_ctag[I] = current_ctag[I];
@@ -433,6 +466,8 @@ struct TageAhead : predictor {
     });
     train_fb = current_fb;
     train_fb_idx = current_fb_idx;
+    if constexpr (FB_RECONCILE)
+      train_fb_hyst = current_fb_hyst;
     train_pc = current_pc;
 
     static_loop<NT>([&]<u64 I>() {
@@ -448,6 +483,8 @@ struct TageAhead : predictor {
     });
     current_fb = prefetch_fb;
     current_fb_idx = prefetch_fb_idx;
+    if constexpr (FB_RECONCILE)
+      current_fb_hyst = prefetch_fb_hyst;
     current_pc = prefetch_pc;
 
 #ifdef TAGE_MONITOR
@@ -456,39 +493,57 @@ struct TageAhead : predictor {
 
     // Precompute secondary tag for next block
     if constexpr (USE_SEC_TAG) {
-      block_end_info.next_pc.fanout(
-          hard<3>{}); // curr_sec_tag + meta_idx + hist path_bits
-      curr_sec_tag = val<SEC_TAG_BITS>{block_end_info.next_pc >> 2};
+      // curr_sec_tag + meta_idx + hist path_bits; NP>1 adds mux_sel read
+      block_end_info.next_pc.fanout(hard<3 + (NUM_PATHS > 1 ? 1 : 0)>{});
+      curr_sec_tag =
+          SecTagHashFn::template apply<SEC_TAG_BITS>(block_end_info.next_pc);
+      // NP=1: train_sec_hit(NT) consumed before resolution fanout restores
+      // credits. NP>1: train_sec_hit(NT) + alloc write(1); mux_sel bypasses
+      // reg.
+      if constexpr (NUM_PATHS > 1)
+        curr_sec_tag.fanout(hard<NT + 1>{}); // train_sec_hit + alloc
+      // NP=1 fanout deferred to resolution section (matches original pattern)
     } else {
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     }
 
     // ================================================================
+    // Meta pipeline: shift FIRST, then write [0].
+    // Fixes stale-value bug where meta_pipe[META_PIPE-1] reads the
+    // new RAM value instead of the properly delayed old value.
+    // ================================================================
+    for (u64 i = META_PIPE - 1; i > 0; i--) {
+      meta_pipe[i] = meta_pipe[i - 1];
+      meta_idx_pipe[i] = meta_idx_pipe[i - 1];
+    }
+    {
+      auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
+      meta_pipe[0] = meta_ctr.read(meta_idx);
+      meta_idx_pipe[0] = meta_idx;
+    }
+    val<1> meta_use_alt =
+        val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
+#ifdef TIMING_DEBUG
+    dbg_meta_use_alt = meta_use_alt;
+#endif
+
+    // ================================================================
     // Provider / altpred resolution via bitmask + one_hot
     //
-    // We cannot reassign val<N> (private operator=), so we avoid
-    // accumulation loops. Instead:
-    //   1. Compute per-table hit bits → arr<val<1>, NT>
-    //   2. Concat into val<NT+1> with fallback as MSB always-hit
-    //   3. one_hot() → lowest set bit = longest-history hit = provider
-    //   4. one_hot() on remainder → alt
-    //   5. Replicate one-hot bits to PRED_BITS width, AND with each
-    //      table's prediction, fold_or → extract provider/alt pred
+    // NUM_PATHS > 1 (paper: Cai/Deshmukh/Patt ISCA'25 Sec 4.2):
+    //   Run NUM_PATHS independent parallel chains. Each chain compares
+    //   stored sec_tag against a compile-time constant (0, 1, ...).
+    //   Each chain independently finds its own provider and alt.
+    //   Final select with curr_sec_tag is a regular MUX OFF crit path.
+    //
+    // NUM_PATHS == 1: single chain with runtime curr_sec_tag comparison
+    //   in full_hits (original behavior, curr_sec_tag on crit path).
     // ================================================================
 
-    // 2. Per-table hit: primary tag matched (off crit path) AND
-    //    optionally stored secondary tag matches curr_sec_tag
-    if constexpr (USE_SEC_TAG)
-      curr_sec_tag.fanout(hard<NT>{}); // compared once per table
-    arr<val<1>, NT> full_hits = [&](u64 i) {
-      if constexpr (USE_SEC_TAG) {
-        return val<1>{current_tag_hit[i]} &
-               (val<SEC_TAG_BITS>{current_sec[i]} ==
-                val<SEC_TAG_BITS>{curr_sec_tag});
-      } else {
-        return val<1>{current_tag_hit[i]};
-      }
-    };
+    // Save old prediction (block B) before scatter overwrites with B+1.
+    branch_dir.fanout(
+        hard<4>{}); // badpred + true_block + hist_input + actual_dir
+    arr<val<1>, N> old_pred = [&](u64 i) -> val<1> { return val<1>{pred[i]}; };
 
 #ifdef TAGE_MONITOR
     for (u64 i = 0; i < NT; i++) {
@@ -500,149 +555,195 @@ struct TageAhead : predictor {
       } else {
         mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
       }
-      // Feature 7: tag collision check
       mon.record_collision_check(
           i, static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]}),
           static_cast<u64>(current_tag_hit[i]));
     }
 #endif
 
+    // -- Resolve one chain: full_hits → match → provider/alt → final pred --
+    auto resolve_chain = [&](arr<val<1>, NT> full_hits) {
+      val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
+      match.fanout(hard<2>{});
+      val<MATCH_BITS> match1 = match.one_hot();
+      match1.fanout(hard<3>{}); // make_array + XOR + train/mux
+      val<MATCH_BITS> match2 = (match ^ match1).one_hot();
+      match2.fanout(hard<2>{}); // make_array + has_alt
+
+      arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
+        if (i < NT)
+          return val<PRED_BITS>{current_pred[i]};
+        return val<PRED_BITS>{current_fb};
+      };
+
+      arr<val<1>, NT + 1> m1_bits = match1.make_array(val<1>{});
+      arr<val<1>, NT + 1> m2_bits = match2.make_array(val<1>{});
+      m1_bits.fanout(hard<6>{});
+      m2_bits.fanout(hard<2>{});
+
+      arr<val<PRED_BITS>, NT + 1> pmask = [&](u64 i) {
+        return m1_bits[i].replicate(hard<PRED_BITS>{}).concat() &
+               table_preds[i];
+      };
+      arr<val<PRED_BITS>, NT + 1> amask = [&](u64 i) {
+        return m2_bits[i].replicate(hard<PRED_BITS>{}).concat() &
+               table_preds[i];
+      };
+      val<PRED_BITS> pp = pmask.fold_or();
+      val<PRED_BITS> ap = amask.fold_or();
+
+      // Hyst-only weakness: provider's hyst==0.
+      // Gates pred/hyst counter updates — a useful entry (u>0) that's
+      // mispredicting with weak hyst should still get its pred flipped.
+      // Tage.hpp equivalent: g_weak = primary & badpred & (hyst==0).
+      arr<val<1>, NT + 1> hyst_weak_arr = [&](u64 i) -> val<1> {
+        if (i < NT)
+          return m1_bits[i] & val<1>{val<std::max(u64(1), HYST_WIDTH)>{
+                                         current_hyst[i]} == hard<0>{}};
+        return val<1>{0};
+      };
+      val<1> phw = hyst_weak_arr.fold_or();
+
+      // Newly-allocated weakness: hyst==0 AND u==0.
+      // Gates meta use_alt decision — only trust alt over provider when the
+      // provider entry looks freshly allocated (weak counter, no proven
+      // utility). Tage.hpp equivalent: newly_alloc = (match1 & coldctr) != 0.
+      arr<val<1>, NT + 1> newly_alloc_arr = [&](u64 i) -> val<1> {
+        if (i < NT)
+          return m1_bits[i] &
+                 val<1>{val<std::max(u64(1), HYST_WIDTH)>{current_hyst[i]} ==
+                        hard<0>{}} &
+                 val<1>{val<U_WIDTH>{current_u[i]} == hard<0>{}};
+        return val<1>{0};
+      };
+      val<1> pw = newly_alloc_arr.fold_or();
+      val<1> ha = (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
+      val<1> ua = pw & meta_use_alt & ha;
+      val<PRED_BITS> fp = select(ua, ap, pp);
+
+      pp.fanout(hard<3>{}); // altdiff + train/mux + select already consumed
+      ap.fanout(hard<2>{});
+      val<1> ad = (pp ^ ap) != hard<0>{};
+
+      return std::tuple{std::move(fp), std::move(match1), std::move(match2),
+                        std::move(pp), std::move(pw),     std::move(phw),
+                        std::move(ad), std::move(ua)};
+    };
+
+    // Run resolution chain(s) and select active result
+    auto [final_pred, match1, match2, provider_pred, provider_weak,
+          provider_hyst_weak, altdiff, use_alt] = [&]() {
+      if constexpr (NUM_PATHS > 1) {
+        // Multi-chain reads: regs are read NUM_PATHS times each.
+        // No explicit fanout needed — regs handle multiple reads.
+
+        // Chain 0: stored sec_tag == 0 (compile-time constant)
+        arr<val<1>, NT> fh0 = [&](u64 i) {
+          return val<1>{current_tag_hit[i]} &
+                 (val<SEC_TAG_BITS>{current_sec[i]} == hard<0>{});
+        };
+        auto [fp0, m1_0, m2_0, pp0, pw0, phw0, ad0, ua0] = resolve_chain(fh0);
+
+        // Chain 1: stored sec_tag == 1 (compile-time constant)
+        arr<val<1>, NT> fh1 = [&](u64 i) {
+          return val<1>{current_tag_hit[i]} &
+                 (val<SEC_TAG_BITS>{current_sec[i]} == hard<1>{});
+        };
+        auto [fp1, m1_1, m2_1, pp1, pw1, phw1, ad1, ua1] = resolve_chain(fh1);
+
+        // Number of fields muxed through the NP select: fp, m1, m2, pp,
+        // pw (newly_alloc), phw (hyst_weak), ad (altdiff), ua (use_alt).
+        static constexpr u64 MUX_FIELDS = 8;
+
+        if constexpr (NUM_PATHS == 2) {
+          // 2-to-1 mux: derive sel directly from next_pc (bypass reg chain)
+          val<1> sec_sel = val<1>{SecTagHashFn::template apply<SEC_TAG_BITS>(
+              block_end_info.next_pc)};
+          sec_sel.fanout(hard<MUX_FIELDS>{});
+          return std::tuple{
+              select(sec_sel, fp1, fp0),   select(sec_sel, m1_1, m1_0),
+              select(sec_sel, m2_1, m2_0), select(sec_sel, pp1, pp0),
+              select(sec_sel, pw1, pw0),   select(sec_sel, phw1, phw0),
+              select(sec_sel, ad1, ad0),   select(sec_sel, ua1, ua0)};
+        } else if constexpr (NUM_PATHS == 4) {
+          // Chains 2-3
+          arr<val<1>, NT> fh2 = [&](u64 i) {
+            return val<1>{current_tag_hit[i]} &
+                   (val<SEC_TAG_BITS>{current_sec[i]} == hard<2>{});
+          };
+          auto [fp2, m1_2, m2_2, pp2, pw2, phw2, ad2, ua2] = resolve_chain(fh2);
+
+          arr<val<1>, NT> fh3 = [&](u64 i) {
+            return val<1>{current_tag_hit[i]} &
+                   (val<SEC_TAG_BITS>{current_sec[i]} == hard<3>{});
+          };
+          auto [fp3, m1_3, m2_3, pp3, pw3, phw3, ad3, ua3] = resolve_chain(fh3);
+
+          // 4-to-1 mux tree: derive sel directly from next_pc (bypass reg)
+          val<SEC_TAG_BITS> sec_idx =
+              SecTagHashFn::template apply<SEC_TAG_BITS>(
+                  block_end_info.next_pc);
+          val<1> lo = sec_idx & hard<1>{};
+          val<1> hi = (sec_idx >> 1) & hard<1>{};
+          lo.fanout(hard<MUX_FIELDS * 2>{}); // each field needs lo for 2 pairs
+          hi.fanout(hard<MUX_FIELDS>{});     // each field needs hi for final
+
+          auto mux4 = [&](auto a, auto b, auto c, auto d) {
+            auto ab = select(lo, b, a);
+            auto cd = select(lo, d, c);
+            return select(hi, cd, ab);
+          };
+          return std::tuple{
+              mux4(fp0, fp1, fp2, fp3),     mux4(m1_0, m1_1, m1_2, m1_3),
+              mux4(m2_0, m2_1, m2_2, m2_3), mux4(pp0, pp1, pp2, pp3),
+              mux4(pw0, pw1, pw2, pw3),     mux4(phw0, phw1, phw2, phw3),
+              mux4(ad0, ad1, ad2, ad3),     mux4(ua0, ua1, ua2, ua3)};
+        }
+      } else {
+        // Single chain: original behavior
+        if constexpr (USE_SEC_TAG)
+          curr_sec_tag.fanout(hard<NT>{}); // NT full_hits reads + alloc
+        arr<val<1>, NT> full_hits = [&](u64 i) {
+          if constexpr (USE_SEC_TAG) {
+            return val<1>{current_tag_hit[i]} &
+                   (val<SEC_TAG_BITS>{current_sec[i]} ==
+                    val<SEC_TAG_BITS>{curr_sec_tag});
+          } else {
+            return val<1>{current_tag_hit[i]};
+          }
+        };
+        return resolve_chain(full_hits);
+      }
+    }();
+
 #ifdef TIMING_DEBUG
-    dbg_full_hits = full_hits[0];
-#endif
-
-    // 3. Fallback — ahead-pipelined, already in current_fb from pipe shift.
-    val<PRED_BITS> fb_pred = val<PRED_BITS>{current_fb};
-
-#ifdef TIMING_DEBUG
-    dbg_fb_pred = val<1>{fb_pred};
-#endif
-
-    // 4. Build match bitmask.
-    //    Bit layout of val<NT+1>:
-    //      bit 0     = table 0 (longest history)
-    //      bit NT-1  = table NT-1 (shortest history)
-    //      bit NT    = fallback (always 1)
-    //    one_hot() returns lowest set bit → longest-history hit = provider.
-    //    Second one_hot() on (match ^ match1) → alt provider.
-    val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
-    match.fanout(hard<2>{}); // one_hot + XOR
-    val<MATCH_BITS> match1 = match.one_hot();
-    match1.fanout(hard<3>{}); // make_array + XOR with match + alloc_base
-    val<MATCH_BITS> match2 = (match ^ match1).one_hot();
-    match2.fanout(hard<2>{}); // make_array + has_alt mask
-
-#ifdef TIMING_DEBUG
-    dbg_match = val<1>{match};
+    dbg_full_hits = val<1>{final_pred}; // timing proxy
+    dbg_fb_pred = val<1>{final_pred};   // timing proxy
+    dbg_match = val<1>{match1};         // timing proxy
     dbg_match1 = val<1>{match1};
     dbg_match2 = val<1>{match2};
-#endif
-
-    // 5. Prediction array: one PRED_BITS-wide entry per table + fallback.
-    //    table_preds[0..NT-1] = TAGE tables, table_preds[NT] = fallback.
-    arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
-      if (i < NT)
-        return val<PRED_BITS>{current_pred[i]};
-      return val<PRED_BITS>{fb_pred};
-    };
-
-    // 6. Extract provider and alt predictions.
-    //    For each table: replicate its one-hot match bit to PRED_BITS width,
-    //    AND with that table's prediction. Since match1 is one-hot, exactly
-    //    one table contributes non-zero bits. fold_or collapses to that pred.
-    arr<val<1>, NT + 1> m1_bits = match1.make_array(val<1>{});
-    arr<val<1>, NT + 1> m2_bits = match2.make_array(val<1>{});
-    m1_bits.fanout(hard<6>{});
-    m2_bits.fanout(hard<2>{});
-
-    arr<val<PRED_BITS>, NT + 1> provider_masked = [&](u64 i) {
-      return m1_bits[i].replicate(hard<PRED_BITS>{}).concat() & table_preds[i];
-    };
-    arr<val<PRED_BITS>, NT + 1> alt_masked = [&](u64 i) {
-      return m2_bits[i].replicate(hard<PRED_BITS>{}).concat() & table_preds[i];
-    };
-    val<PRED_BITS> provider_pred = provider_masked.fold_or();
-    val<PRED_BITS> alt_pred = alt_masked.fold_or();
-
-#ifdef TIMING_DEBUG
     dbg_provider_pred = val<1>{provider_pred};
-    dbg_alt_pred = val<1>{alt_pred};
-#endif
-
-    // 7. Provider weakness: newly allocated entry = hyst==0 AND u==0.
-    //    Only check the provider table (mask by match1 bit). Fallback
-    //    (index NT) is never considered "weak".
-    arr<val<1>, NT + 1> weak_arr = [&](u64 i) -> val<1> {
-      if (i < NT)
-        return m1_bits[i] &
-               val<1>{val<std::max(u64(1), HYST_WIDTH)>{current_hyst[i]} ==
-                      hard<0>{}} &
-               val<1>{val<U_WIDTH>{current_u[i]} == hard<0>{}};
-      return val<1>{0};
-    };
-    val<1> provider_weak = weak_arr.fold_or();
-
-    // 8. has_alt: does the alt match point to a TAGE table (not fallback)?
-    //    Mask out the fallback bit (MSB) and check if anything remains.
-    val<1> has_alt =
-        (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
-
-#ifdef TIMING_DEBUG
+    dbg_alt_pred = val<1>{provider_pred}; // timing proxy
     dbg_provider_weak = provider_weak;
-    dbg_has_alt = has_alt;
-#endif
-
-    // 9. Meta counter: predicts whether to trust a newly-allocated provider
-    //    or fall back to alt. Read from PC-indexed RAM, shifted through a
-    //    META_PIPE-stage pipeline. Sign bit of oldest stage decides.
-    auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
-    meta_pipe[0] = meta_ctr.read(meta_idx);
-    meta_idx_pipe[0] = meta_idx;
-    for (u64 i = META_PIPE - 1; i > 0; i--) {
-      meta_pipe[i] = meta_pipe[i - 1];
-      meta_idx_pipe[i] = meta_idx_pipe[i - 1];
-    }
-    val<1> meta_use_alt =
-        val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
-
-#ifdef TIMING_DEBUG
-    dbg_meta_use_alt = meta_use_alt;
-#endif
-
-    // 10. Final prediction mux.
-    //     If provider is newly allocated AND meta says use alt AND
-    //     alt is a real TAGE hit (not just fallback) → use alt_pred.
-    //     Otherwise → provider_pred (which is fallback if no TAGE hit,
-    //     since match1 falls through to the fallback bit).
-    val<1> use_alt = provider_weak & meta_use_alt & has_alt;
-    val<PRED_BITS> final_pred = select(use_alt, alt_pred, provider_pred);
-
-#ifdef TIMING_DEBUG
+    dbg_has_alt = provider_weak; // timing proxy
     dbg_use_alt = use_alt;
     dbg_final_pred = val<1>{final_pred};
 #endif
 
-    // 11. Save old prediction (block B) before scatter overwrites with B+1.
-    branch_dir.fanout(
-        hard<4>{}); // badpred + true_block + hist_input + actual_dir
-    arr<val<1>, N> old_pred = [&](u64 i) -> val<1> { return val<1>{pred[i]}; };
-
-    // 12. Scatter PRED_BITS into per-branch prediction regs.
-    //     pred[0] = LSB = branch 0's prediction, pred[I] = bit I.
+    // Scatter PRED_BITS into per-branch prediction regs.
     static_loop<N>([&]<u64 I>() { pred[I] = final_pred >> I; });
 
 #ifdef TAGE_MONITOR
-    // Record resolution for each branch in this block
     for (u64 r = 0; r < num_branch; r++) {
       bool meta_overrode =
-          static_cast<u64>(provider_weak) && static_cast<u64>(has_alt);
+          static_cast<u64>(provider_weak) &&
+          ((static_cast<u64>(match2) & ((1ULL << NT) - 1)) != 0);
       bool meta_chose = static_cast<u64>(use_alt);
       bool pred_taken = (static_cast<u64>(final_pred) >> r) & 1;
       mon.record_prediction(r, static_cast<u64>(match1),
                             static_cast<u64>(match2), meta_overrode, meta_chose,
                             pred_taken);
     }
-    // Feature 5: Record provider entry usage for lifetime tracking
     {
       u64 m1v = static_cast<u64>(match1);
       u64 prov = decltype(mon)::decode_provider(m1v);
@@ -673,18 +774,19 @@ struct TageAhead : predictor {
     val<MATCH_BITS> t_match1 = train_match1;
     arr<val<1>, NT + 1> t_m1 = t_match1.make_array(val<1>{});
     val<PRED_BITS> t_pp = train_provider_pred;
-    val<1> t_pw = train_provider_weak;
+    val<1> t_pw = train_provider_weak; // newly-alloc (hyst==0 & u==0) — meta
+    val<1> t_phw =
+        train_provider_hyst_weak; // hyst-only (hyst==0) — pred/hyst update
     val<1> t_ad = train_altdiff;
 
     // Save current resolution → train regs (for NEXT cycle's training)
-    alt_pred.fanout(hard<2>{});
-    val<1> altdiff = (provider_pred ^ alt_pred) != hard<0>{};
     train_match1 = match1;
     train_provider_pred = provider_pred;
     train_provider_weak = provider_weak;
+    train_provider_hyst_weak = provider_hyst_weak;
     train_altdiff = altdiff;
 #ifdef TIMING_DEBUG
-    dbg_altdiff = val<1>{altdiff};
+    dbg_altdiff = altdiff;
 #endif
 
     // Read train_valid BEFORE setting it to 1 (regs may be immediate-write)
@@ -739,16 +841,21 @@ struct TageAhead : predictor {
 
     // Provider wrong on any branch? (uses piped provider_pred)
     t_pp.fanout(hard<2>{});
-    actual_dir.fanout(hard<NT + 1>{});
+    // any_provider_wrong(1) + per-table table_wrong in loop(NT) + fb_changed(1)
+    actual_dir.fanout(hard<NT + 2>{});
     val<1> any_provider_wrong = (t_pp ^ actual_dir) != hard<0>{};
+    // Now only consumed by: meta update(1) + alloc trigger if TAGE_WRONG(1)
     any_provider_wrong.fanout(
-        hard<3 * NT + 1 +
-             (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? 1 : 0)>{});
+        hard<1 + (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG
+                      ? 1
+                      : 1)>{}); // patch for now to avoid
+                                // diddling fo1()
 #ifdef TIMING_DEBUG
     dbg_actual_dir = val<1>{actual_dir};
     dbg_any_prov_wrong = any_provider_wrong;
 #endif
-    t_pw.fanout(hard<NT + 1>{});
+    t_pw.fanout(hard<2>{});       // meta gate + meta update direction
+    t_phw.fanout(hard<NT + 1>{}); // per-table pred/hyst update gate
     t_m1.fanout(hard<6>{});
     t_ad.fanout(hard<NT + 1>{});
 
@@ -794,7 +901,20 @@ struct TageAhead : predictor {
     notumask.fanout(hard<2>{});
     val<NT> postmask = alloc_base & gated_triggermask;
     postmask.fanout(hard<2>{});
-    val<NT> candallocmask = postmask & notumask;
+    val<NT> candallocmask = [&]() {
+      val<NT> base = postmask & notumask;
+      if constexpr (USE_SEC_TAG) {
+        // Allocation promotion (Cai/Deshmukh/Patt ISCA'25 Sec 4.3):
+        // Skip entries with same primary tag but different sec_tag (siblings).
+        // Promotes allocation to the next higher table.
+        arr<val<1>, NT> not_sibling = [&](u64 i) -> val<1> {
+          return ~(val<1>{train_tag_hit[i]} & ~val<1>{train_sec_hit[i]});
+        };
+        return base & not_sibling.concat();
+      } else {
+        return base;
+      }
+    }();
     candallocmask.fanout(hard<2>{});
 
     // 3d. Target policy (may skip closest candidates)
@@ -855,17 +975,49 @@ struct TageAhead : predictor {
         if (static_cast<u64>(postmask) == 0)
           mon.record_alloc_blocked(); // fallback was provider, no candidates
         mon.record_alloc_cascade(prov_idx, at);
+        if constexpr (USE_SEC_TAG) {
+          u64 sibling = 0;
+          for (u64 i = 0; i < NT; i++)
+            if (static_cast<u64>(train_tag_hit[i]) &&
+                !static_cast<u64>(train_sec_hit[i]))
+              sibling |= (u64(1) << i);
+          sibling &= static_cast<u64>(postmask); // only above provider
+          if (sibling)
+            mon.record_alloc_sibling_skip(sibling);
+        }
       }
     }
 #endif
 
-    // ---- Step 4: Fallback update (mispredict + fallback is provider only)
-    // ----
+    // ---- Step 4: Fallback update ----
+    // 4a. Direct update: mispredict + fallback is provider → write actual_dir.
     val<1> fb_changed = actual_dir != val<PRED_BITS>{train_fb};
     val<1> fb_gate = do_train & t_m1[NT] & mispredict & fb_changed;
     execute_if(fb_gate, [&]() {
       fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir);
     });
+
+    // 4b. Reconciliation (Tage.hpp P1/P2 pattern): when TAGE and fb disagree
+    // persistently (fb_hyst weak), overwrite fb with TAGE's prediction.
+    // Also update fb_hyst every cycle to track agreement.
+    if constexpr (FB_RECONCILE) {
+      val<1> fb_not_provider = ~t_m1[NT];
+      val<1> fb_tage_disagree = (val<PRED_BITS>{train_fb} ^ t_pp) != hard<0>{};
+      val<1> fb_hyst_weak = ~val<1>{train_fb_hyst};
+
+      // Overwrite fb pred when hyst weak and they disagree (non-provider only;
+      // provider case handled above by fb_gate)
+      val<1> reconcile_gate =
+          do_train & fb_not_provider & fb_hyst_weak & fb_tage_disagree;
+      execute_if(reconcile_gate,
+                 [&]() { fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, t_pp); });
+
+      // Update fb_hyst: 1 if agree, 0 if disagree — tracks recent consensus.
+      execute_if(do_train, [&]() {
+        fb_hyst.write(val<FB_IDX_BITS>{train_fb_idx}, ~fb_tage_disagree);
+      });
+    }
+
 #ifdef TAGE_MONITOR
     if (static_cast<u64>(fb_gate))
       mon.record_fb_write(static_cast<u64>(val<FB_IDX_BITS>{train_fb_idx}));
@@ -886,21 +1038,32 @@ struct TageAhead : predictor {
 
     // ---- Merged per-table writes (one write per RAM per table) ----
     // For each table: alloc takes priority over update. Mux selects data.
+    // Uses per-table wrong signal (this table's own prediction vs actual)
+    // instead of blanket any_provider_wrong. For the provider table these
+    // are identical; for non-provider tables this enables future per-table
+    // update policies (e.g. partial update).
     train_pc.fanout(hard<NT>{});
     static_loop<NT>([&]<u64 I>() {
       auto &t = std::get<I>(tables);
       val<1> do_alloc = allocate[I];
 
-      // pred_ram: alloc writes actual_dir, update writes actual_dir → same data
-      val<1> do_pred_update = t_m1[I] & t_pw & any_provider_wrong;
+      // Per-table wrong: does THIS table's stored pred disagree with actual?
+      val<1> table_wrong =
+          (val<PRED_BITS>{train_pred[I]} ^ actual_dir) != hard<0>{};
+
+      // pred_ram: alloc writes actual_dir, update writes actual_dir → same
+      // data. Gated on hyst-only weakness (t_phw), not newly-alloc (t_pw). A
+      // useful entry (u>0) with weak hyst that's wrong should still flip.
+      val<1> do_pred_update = t_m1[I] & t_phw & table_wrong;
       execute_if(do_train & (do_alloc | do_pred_update), [&]() {
         t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, actual_dir, hard<0>{});
       });
 
-      // hyst_ram: alloc writes 0, update writes new_hyst → mux on do_alloc
+      // hyst_ram: alloc writes 0, update writes new_hyst → mux on do_alloc.
+      // Direction based on this table's own prediction accuracy.
       constexpr u64 HW = std::max(u64(1), HYST_WIDTH);
       auto old_hyst = val<HW>{train_hyst[I]};
-      auto new_hyst = ta_update_ctr(old_hyst, ~any_provider_wrong);
+      auto new_hyst = ta_update_ctr(old_hyst, ~table_wrong);
       auto hyst_data = select(do_alloc, val<HW>{0}, new_hyst);
       val<1> do_hyst_update = t_m1[I] & (new_hyst != old_hyst);
       execute_if(do_train & (do_alloc | do_hyst_update), [&]() {
@@ -925,8 +1088,9 @@ struct TageAhead : predictor {
       }
 #endif
 
-      // u_ram: combined provider update + allocation + uclear + decay
-      val<U_WIDTH> base_newu = val<U_WIDTH>{~any_provider_wrong} &
+      // u_ram: combined provider update + allocation + uclear + decay.
+      // Uses per-table wrong signal: u set when THIS table predicted correctly.
+      val<U_WIDTH> base_newu = val<U_WIDTH>{~table_wrong} &
                                val<U_WIDTH>{~allocate[I]} &
                                val<U_WIDTH>{~uclear[I]};
       val<1> base_u_write = (t_m1[I] & t_ad) | allocate[I] | uclear[I];

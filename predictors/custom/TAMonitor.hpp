@@ -100,6 +100,8 @@ struct TAMonitor {
     u64 alloc_success = 0;
     u64 alloc_fail = 0;
     u64 alloc_blocked = 0; // mispredict but fallback was provider (no candidate)
+    u64 alloc_sibling_skip = 0;              // candidates skipped (sibling promotion)
+    std::array<u64, NUM_TABLES> alloc_sibling_per_table{}; // per-table sibling skips
     std::array<u64, NUM_TABLES> alloc_per_table{};
     // Cascade: alloc_from_provider[i] = allocations when Ti was provider
     std::array<u64, NUM_TABLES + 1> alloc_from_provider{};
@@ -330,6 +332,18 @@ struct TAMonitor {
   void record_alloc_blocked() {
     cum.alloc_blocked++;
     win.alloc_blocked++;
+  }
+
+  void record_alloc_sibling_skip(u64 sibling_mask) {
+    auto record = [&](Counters &c) {
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        if (sibling_mask & (u64(1) << i)) {
+          c.alloc_sibling_skip++;
+          c.alloc_sibling_per_table[i]++;
+        }
+    };
+    record(cum);
+    record(win);
   }
 
   void record_alloc_cascade(u64 provider_idx, u64 allocate_mask) {
@@ -665,11 +679,18 @@ struct TAMonitor {
        << "  Success: " << c.alloc_success << " ("
        << pct(c.alloc_success, c.alloc_attempts) << "%)"
        << "  Fail: " << c.alloc_fail
-       << "  Blocked: " << c.alloc_blocked << "\n";
+       << "  Blocked: " << c.alloc_blocked
+       << "  Sibling skips: " << c.alloc_sibling_skip << "\n";
     os << "  Per table:";
     for (u64 i = 0; i < NUM_TABLES; i++)
       os << " T" << i << "=" << c.alloc_per_table[i];
     os << "\n";
+    if (c.alloc_sibling_skip > 0) {
+      os << "  Sibling per table:";
+      for (u64 i = 0; i < NUM_TABLES; i++)
+        os << " T" << i << "=" << c.alloc_sibling_per_table[i];
+      os << "\n";
+    }
     os << "  Unique branch PCs: " << unique_branch_pcs.size() << "\n";
 
     // Allocation cascade
