@@ -225,10 +225,7 @@ struct TageAhead : predictor {
   // Piped resolution values from previous update_cycle (block A's resolution)
   reg<MATCH_BITS> train_match1;
   reg<PRED_BITS> train_provider_pred;
-  reg<1> train_provider_weak; // newly-allocated weakness (hyst==0 & u==0) — for
-                              // meta
-  reg<1> train_provider_hyst_weak; // hyst-only weakness (hyst==0) — for
-                                   // pred/hyst update
+  reg<1> train_provider_weak; // newly-allocated weakness (hyst==0 & u==0) — meta
   reg<1> train_altdiff;
 
   // Guard: skip training until piped resolution regs have been populated
@@ -286,6 +283,8 @@ struct TageAhead : predictor {
   reg<1> dbg_gh_fanout;     // gh after fanout in update_cycle
   reg<1> dbg_fold_compute;  // compute_update result timing
   reg<1> dbg_fold_apply;    // after apply_update (fold write)
+  reg<1> dbg_fold_early_write; // fold write in num_branch==0 path
+  reg<1> dbg_fold_read_in_compute; // folded reg read inside compute_update
   // Resolution gaps
   reg<1> dbg_altdiff;        // provider_pred ^ alt_pred
   reg<1> dbg_actual_dir;     // branch_dir scatter
@@ -308,6 +307,8 @@ struct TageAhead : predictor {
   reg<1> dbg_decay_fire[NT];   // decay_fire per table
   reg<1> dbg_decay_merged[NT]; // merged u value per table
   reg<1> dbg_epoch_fire;       // epoch trigger
+  reg<1> dbg_next_pc;          // raw next_pc timing from block_end_info
+  reg<1> dbg_curr_sec_tag;     // curr_sec_tag after hash
 #endif
 
 #ifdef TAGE_MONITOR
@@ -470,41 +471,35 @@ struct TageAhead : predictor {
       train_fb_hyst = current_fb_hyst;
     train_pc = current_pc;
 
-    static_loop<NT>([&]<u64 I>() {
-      current_tag[I] = prefetch_tag[I];
-      current_tag_hit[I] = prefetch_tag_hit[I];
-      current_pred[I] = prefetch_pred[I];
-      if constexpr (USE_SEC_TAG)
-        current_sec[I] = prefetch_sec[I];
-      current_idx[I] = prefetch_idx[I];
-      current_hyst[I] = prefetch_hyst[I];
-      current_u[I] = prefetch_u[I];
-      current_ctag[I] = prefetch_ctag[I];
-    });
-    current_fb = prefetch_fb;
-    current_fb_idx = prefetch_fb_idx;
-    if constexpr (FB_RECONCILE)
-      current_fb_hyst = prefetch_fb_hyst;
-    current_pc = prefetch_pc;
-
 #ifdef TAGE_MONITOR
     mon.shift_block_pc();
 #endif
 
     // Precompute secondary tag for next block
-    if constexpr (USE_SEC_TAG) {
-      // curr_sec_tag + meta_idx + hist path_bits; NP>1 adds mux_sel read
-      block_end_info.next_pc.fanout(hard<3 + (NUM_PATHS > 1 ? 1 : 0)>{});
-      curr_sec_tag =
-          SecTagHashFn::template apply<SEC_TAG_BITS>(block_end_info.next_pc);
-      // NP=1: train_sec_hit(NT) consumed before resolution fanout restores
-      // credits. NP>1: train_sec_hit(NT) + alloc write(1); mux_sel bypasses
-      // reg.
-      if constexpr (NUM_PATHS > 1)
-        curr_sec_tag.fanout(hard<NT + 1>{}); // train_sec_hit + alloc
-      // NP=1 fanout deferred to resolution section (matches original pattern)
-    } else {
+    // Use a local val to bypass the reg's transparent-latch penalty (119ps).
+    // The reg is only needed for cross-cycle reads; same-cycle resolution
+    // uses sec_tag_now directly.
+    if constexpr (!USE_SEC_TAG)
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
+    else
+      block_end_info.next_pc.fanout(hard<3 + (NUM_PATHS > 1 ? 1 : 0)>{});
+    auto sec_tag_now = [&]() {
+      if constexpr (USE_SEC_TAG)
+        return SecTagHashFn::template apply<SEC_TAG_BITS>(
+            block_end_info.next_pc);
+      else
+        return hard<0>{};
+    }();
+    if constexpr (USE_SEC_TAG) {
+      curr_sec_tag = sec_tag_now; // store for next-cycle use
+#ifdef TIMING_DEBUG
+      dbg_next_pc = val<1>{block_end_info.next_pc};
+      dbg_curr_sec_tag = val<1>{sec_tag_now};
+#endif
+      // Fanout on sec_tag_now (the val), not the reg
+      if constexpr (NUM_PATHS > 1)
+        sec_tag_now.fanout(hard<NT + 1>{}); // train_sec_hit + alloc
+      // NP=1 fanout deferred to resolution section (matches original pattern)
     }
 
     // ================================================================
@@ -551,7 +546,7 @@ struct TageAhead : predictor {
         mon.record_tag_lookup(
             i, static_cast<u64>(current_tag_hit[i]),
             static_cast<u64>(val<SEC_TAG_BITS>{current_sec[i]} ==
-                             val<SEC_TAG_BITS>{curr_sec_tag}));
+                             val<SEC_TAG_BITS>{sec_tag_now}));
       } else {
         mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
       }
@@ -562,13 +557,26 @@ struct TageAhead : predictor {
 #endif
 
     // -- Resolve one chain: full_hits → match → provider/alt → final pred --
+    // Critical path: full_hits → match → one_hot → m1_bits → pw → ua → select
+    // hyst_weak (phw) is NOT computed here — it's training-only, so it's
+    // computed from piped regs in the training section to stay off crit path.
     auto resolve_chain = [&](arr<val<1>, NT> full_hits) {
       val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
-      match.fanout(hard<2>{});
+      match.fanout(hard<2>{}); // one_hot + XOR
       val<MATCH_BITS> match1 = match.one_hot();
       match1.fanout(hard<3>{}); // make_array + XOR + train/mux
-      val<MATCH_BITS> match2 = (match ^ match1).one_hot();
-      match2.fanout(hard<2>{}); // make_array + has_alt
+      // Remainder: all tables above provider. Computed once, reused for
+      // both match2 (alt pred extraction) and has_alt (existence check).
+      val<MATCH_BITS> remainder = match ^ match1;
+      remainder.fanout(hard<2>{}); // one_hot + has_alt
+      val<MATCH_BITS> match2 = remainder.one_hot();
+      match2.fanout(hard<2>{}); // make_array (alt pred extraction)
+
+      // has_alt: does any TAGE table remain after removing provider?
+      // Computed from remainder directly — avoids match2.one_hot()
+      // serial stage on the critical path to use_alt → final_pred.
+      val<1> ha =
+          (remainder & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
 
       arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
         if (i < NT)
@@ -592,18 +600,6 @@ struct TageAhead : predictor {
       val<PRED_BITS> pp = pmask.fold_or();
       val<PRED_BITS> ap = amask.fold_or();
 
-      // Hyst-only weakness: provider's hyst==0.
-      // Gates pred/hyst counter updates — a useful entry (u>0) that's
-      // mispredicting with weak hyst should still get its pred flipped.
-      // Tage.hpp equivalent: g_weak = primary & badpred & (hyst==0).
-      arr<val<1>, NT + 1> hyst_weak_arr = [&](u64 i) -> val<1> {
-        if (i < NT)
-          return m1_bits[i] & val<1>{val<std::max(u64(1), HYST_WIDTH)>{
-                                         current_hyst[i]} == hard<0>{}};
-        return val<1>{0};
-      };
-      val<1> phw = hyst_weak_arr.fold_or();
-
       // Newly-allocated weakness: hyst==0 AND u==0.
       // Gates meta use_alt decision — only trust alt over provider when the
       // provider entry looks freshly allocated (weak counter, no proven
@@ -617,21 +613,24 @@ struct TageAhead : predictor {
         return val<1>{0};
       };
       val<1> pw = newly_alloc_arr.fold_or();
-      val<1> ha = (match2 & val<MATCH_BITS>{(u64(1) << NT) - 1}) != hard<0>{};
       val<1> ua = pw & meta_use_alt & ha;
-      val<PRED_BITS> fp = select(ua, ap, pp);
 
+      // Final select is NOT done here — it's fused with the per-branch
+      // scatter outside, using 1-bit selects to avoid PRED_BITS-wide
+      // replication of ua (saves ~45ps ctrl-to-out delay).
       ap.fanout(hard<2>{});
       val<1> ad = (pp ^ ap) != hard<0>{};
 
-      return std::tuple{std::move(fp), std::move(match1), std::move(match2),
-                        std::move(pp), std::move(pw),     std::move(phw),
+      return std::tuple{std::move(match1), std::move(match2),
+                        std::move(pp), std::move(ap), std::move(pw),
                         std::move(ad), std::move(ua)};
     };
 
-    // Run resolution chain(s) and select active result
-    auto [final_pred, match1, match2, provider_pred, provider_weak,
-          provider_hyst_weak, altdiff, use_alt] = [&]() {
+    // Run resolution chain(s) and select active result.
+    // Returns {match1, match2, pp, ap, pw, ad, ua} — final select is
+    // deferred to per-branch 1-bit scatter below.
+    auto [match1, match2, provider_pred, alt_pred, provider_weak,
+          altdiff, use_alt] = [&]() {
       if constexpr (NUM_PATHS > 1) {
         // Multi-chain reads: regs are read NUM_PATHS times each.
         // No explicit fanout needed — regs handle multiple reads.
@@ -641,18 +640,17 @@ struct TageAhead : predictor {
           return val<1>{current_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{current_sec[i]} == hard<0>{});
         };
-        auto [fp0, m1_0, m2_0, pp0, pw0, phw0, ad0, ua0] = resolve_chain(fh0);
+        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] = resolve_chain(fh0);
 
         // Chain 1: stored sec_tag == 1 (compile-time constant)
         arr<val<1>, NT> fh1 = [&](u64 i) {
           return val<1>{current_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{current_sec[i]} == hard<1>{});
         };
-        auto [fp1, m1_1, m2_1, pp1, pw1, phw1, ad1, ua1] = resolve_chain(fh1);
+        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] = resolve_chain(fh1);
 
-        // Number of fields muxed through the NP select: fp, m1, m2, pp,
-        // pw (newly_alloc), phw (hyst_weak), ad (altdiff), ua (use_alt).
-        static constexpr u64 MUX_FIELDS = 8;
+        // Fields muxed through NP select: m1, m2, pp, ap, pw, ad, ua.
+        static constexpr u64 MUX_FIELDS = 7;
 
         if constexpr (NUM_PATHS == 2) {
           // 2-to-1 mux: derive sel directly from next_pc (bypass reg chain)
@@ -660,9 +658,9 @@ struct TageAhead : predictor {
               block_end_info.next_pc)};
           sec_sel.fanout(hard<MUX_FIELDS>{});
           return std::tuple{
-              select(sec_sel, fp1, fp0),   select(sec_sel, m1_1, m1_0),
+              select(sec_sel, m1_1, m1_0),
               select(sec_sel, m2_1, m2_0), select(sec_sel, pp1, pp0),
-              select(sec_sel, pw1, pw0),   select(sec_sel, phw1, phw0),
+              select(sec_sel, ap1, ap0),   select(sec_sel, pw1, pw0),
               select(sec_sel, ad1, ad0),   select(sec_sel, ua1, ua0)};
         } else if constexpr (NUM_PATHS == 4) {
           // Chains 2-3
@@ -670,13 +668,13 @@ struct TageAhead : predictor {
             return val<1>{current_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{current_sec[i]} == hard<2>{});
           };
-          auto [fp2, m1_2, m2_2, pp2, pw2, phw2, ad2, ua2] = resolve_chain(fh2);
+          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] = resolve_chain(fh2);
 
           arr<val<1>, NT> fh3 = [&](u64 i) {
             return val<1>{current_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{current_sec[i]} == hard<3>{});
           };
-          auto [fp3, m1_3, m2_3, pp3, pw3, phw3, ad3, ua3] = resolve_chain(fh3);
+          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] = resolve_chain(fh3);
 
           // 4-to-1 mux tree: derive sel directly from next_pc (bypass reg)
           val<SEC_TAG_BITS> sec_idx =
@@ -693,20 +691,20 @@ struct TageAhead : predictor {
             return select(hi, cd, ab);
           };
           return std::tuple{
-              mux4(fp0, fp1, fp2, fp3),     mux4(m1_0, m1_1, m1_2, m1_3),
+              mux4(m1_0, m1_1, m1_2, m1_3),
               mux4(m2_0, m2_1, m2_2, m2_3), mux4(pp0, pp1, pp2, pp3),
-              mux4(pw0, pw1, pw2, pw3),     mux4(phw0, phw1, phw2, phw3),
+              mux4(ap0, ap1, ap2, ap3),     mux4(pw0, pw1, pw2, pw3),
               mux4(ad0, ad1, ad2, ad3),     mux4(ua0, ua1, ua2, ua3)};
         }
       } else {
         // Single chain: original behavior
         if constexpr (USE_SEC_TAG)
-          curr_sec_tag.fanout(hard<NT>{}); // NT full_hits reads + alloc
+          sec_tag_now.fanout(hard<NT>{}); // NT full_hits reads + alloc
         arr<val<1>, NT> full_hits = [&](u64 i) {
           if constexpr (USE_SEC_TAG) {
             return val<1>{current_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{current_sec[i]} ==
-                    val<SEC_TAG_BITS>{curr_sec_tag});
+                    val<SEC_TAG_BITS>{sec_tag_now});
           } else {
             return val<1>{current_tag_hit[i]};
           }
@@ -715,22 +713,26 @@ struct TageAhead : predictor {
       }
     }();
 
+    // Per-branch 1-bit select fused with scatter — avoids PRED_BITS-wide
+    // replication of use_alt, saving ctrl-to-out delay on the select mux.
+    static_loop<N>([&]<u64 I>() {
+      pred[I] = select(use_alt, val<1>{alt_pred >> I},
+                        val<1>{provider_pred >> I});
+    });
+
 #ifdef TIMING_DEBUG
-    dbg_full_hits = val<1>{final_pred}; // timing proxy
-    dbg_fb_pred = val<1>{final_pred};   // timing proxy
-    dbg_match = val<1>{match1};         // timing proxy
+    dbg_full_hits = val<1>{pred[0]}; // timing proxy
+    dbg_fb_pred = val<1>{pred[0]};   // timing proxy
+    dbg_match = val<1>{match1};      // timing proxy
     dbg_match1 = val<1>{match1};
     dbg_match2 = val<1>{match2};
     dbg_provider_pred = val<1>{provider_pred};
-    dbg_alt_pred = val<1>{provider_pred}; // timing proxy
+    dbg_alt_pred = val<1>{alt_pred};
     dbg_provider_weak = provider_weak;
     dbg_has_alt = provider_weak; // timing proxy
     dbg_use_alt = use_alt;
-    dbg_final_pred = val<1>{final_pred};
+    dbg_final_pred = val<1>{pred[0]};
 #endif
-
-    // Scatter PRED_BITS into per-branch prediction regs.
-    static_loop<N>([&]<u64 I>() { pred[I] = final_pred >> I; });
 
 #ifdef TAGE_MONITOR
     for (u64 r = 0; r < num_branch; r++) {
@@ -738,7 +740,7 @@ struct TageAhead : predictor {
           static_cast<u64>(provider_weak) &&
           ((static_cast<u64>(match2) & ((1ULL << NT) - 1)) != 0);
       bool meta_chose = static_cast<u64>(use_alt);
-      bool pred_taken = (static_cast<u64>(final_pred) >> r) & 1;
+      bool pred_taken = static_cast<u64>(pred[r]);
       mon.record_prediction(r, static_cast<u64>(match1),
                             static_cast<u64>(match2), meta_overrode, meta_chose,
                             pred_taken);
@@ -748,10 +750,9 @@ struct TageAhead : predictor {
       u64 prov = decltype(mon)::decode_provider(m1v);
       if (prov < NT) {
         u64 prov_index = static_cast<u64>(val<MAX_IDX_BITS>{current_idx[prov]});
-        u64 fp = static_cast<u64>(final_pred);
         u64 nc = 0;
         for (u64 r = 0; r < num_branch; r++)
-          if (((fp >> r) & 1) == static_cast<u64>(branch_dir[r]))
+          if (static_cast<u64>(pred[r]) == static_cast<u64>(branch_dir[r]))
             nc++;
         mon.record_provider_entry(prov, prov_index, num_branch, nc);
       }
@@ -774,15 +775,24 @@ struct TageAhead : predictor {
     arr<val<1>, NT + 1> t_m1 = t_match1.make_array(val<1>{});
     val<PRED_BITS> t_pp = train_provider_pred;
     val<1> t_pw = train_provider_weak; // newly-alloc (hyst==0 & u==0) — meta
-    val<1> t_phw =
-        train_provider_hyst_weak; // hyst-only (hyst==0) — pred/hyst update
     val<1> t_ad = train_altdiff;
+
+    // Hyst-only weakness: computed from piped regs (not resolution chain)
+    // to keep it off the resolution critical path. Gates pred/hyst counter
+    // updates — a useful entry (u>0) with weak hyst should still flip.
+    // Tage.hpp equivalent: g_weak = primary & badpred & (hyst==0).
+    constexpr u64 HW_T = std::max(u64(1), HYST_WIDTH);
+    arr<val<1>, NT + 1> t_hyst_weak_arr = [&](u64 i) -> val<1> {
+      if (i < NT)
+        return t_m1[i] & val<1>{val<HW_T>{train_hyst[i]} == hard<0>{}};
+      return val<1>{0};
+    };
+    val<1> t_phw = t_hyst_weak_arr.fold_or();
 
     // Save current resolution → train regs (for NEXT cycle's training)
     train_match1 = match1;
     train_provider_pred = provider_pred;
     train_provider_weak = provider_weak;
-    train_provider_hyst_weak = provider_hyst_weak;
     train_altdiff = altdiff;
 #ifdef TIMING_DEBUG
     dbg_altdiff = altdiff;
@@ -802,6 +812,9 @@ struct TageAhead : predictor {
         t.fold_idx.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
         t.fold_tag.update(gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits);
       });
+#ifdef TIMING_DEBUG
+      dbg_fold_early_write = val<1>{std::get<0>(tables).fold_idx.get()};
+#endif
       if constexpr (USE_GSHARE)
         fb_fold.update(gh, hard<GS_HIST>{}, path_bits);
       gh.update(path_bits);
@@ -1077,7 +1090,7 @@ struct TageAhead : predictor {
                         val<t.tag_width>{train_ctag[I]});
         if constexpr (USE_SEC_TAG)
           t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                          val<SEC_TAG_BITS>{curr_sec_tag});
+                          val<SEC_TAG_BITS>{sec_tag_now});
       });
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_train & do_alloc)) {
@@ -1285,6 +1298,11 @@ struct TageAhead : predictor {
     // both paths resolve in parallel, mux adds ~10ps constant overhead.
     static_loop<NT>([&]<u64 I>() {
       auto &t = std::get<I>(tables);
+#ifdef TIMING_DEBUG
+      if constexpr (I == 0) {
+        dbg_fold_read_in_compute = val<1>{t.fold_idx.get()};
+      }
+#endif
       auto new_idx = t.fold_idx.compute_update(
           gh, hard<TableCfg::HIST_LEN[I]>{}, hist_input);
       auto new_tag = t.fold_tag.compute_update(
@@ -1307,6 +1325,28 @@ struct TageAhead : predictor {
       fb_fold.apply_update(new_fb, true_block);
     }
     gh.update(hist_input, true_block);
+
+    // ---- Pipeline shift: prefetch → current ----
+    // Placed after fold_apply/gh.update so that the fold writes complete
+    // before prefetch_* timing propagates into current_*. Resolution reads
+    // current_* before this write (gets previous cycle's value at time 0),
+    // removing predict1's fold timing from the resolution critical path.
+    static_loop<NT>([&]<u64 I>() {
+      current_tag[I] = prefetch_tag[I];
+      current_tag_hit[I] = prefetch_tag_hit[I];
+      current_pred[I] = prefetch_pred[I];
+      if constexpr (USE_SEC_TAG)
+        current_sec[I] = prefetch_sec[I];
+      current_idx[I] = prefetch_idx[I];
+      current_hyst[I] = prefetch_hyst[I];
+      current_u[I] = prefetch_u[I];
+      current_ctag[I] = prefetch_ctag[I];
+    });
+    current_fb = prefetch_fb;
+    current_fb_idx = prefetch_fb_idx;
+    if constexpr (FB_RECONCILE)
+      current_fb_hyst = prefetch_fb_hyst;
+    current_pc = prefetch_pc;
     // std::cerr << "=== EXIT update_cycle ===\n";
   }
 };

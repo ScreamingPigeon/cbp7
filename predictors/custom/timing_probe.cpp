@@ -28,7 +28,9 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
         worst_current = std::max(worst_current, pp.current_sec[i].time());
     }
     d("pipe_shift (current_*)", worst_current);
-    d("curr_sec_tag", pp.curr_sec_tag.time());
+    d("next_pc (raw)", pp.dbg_next_pc.time());
+    d("curr_sec_tag (after hash)", pp.dbg_curr_sec_tag.time());
+    d("curr_sec_tag (reg)", pp.curr_sec_tag.time());
 
     // Resolution chain
     d("full_hits", pp.dbg_full_hits.time());
@@ -90,7 +92,9 @@ void harcom_superuser::timing_debug(predictor &p, uint64_t next_time) {
     d("p1_return (predict1)", pp.dbg_p1_return.time());
     d("hist_input (update)", pp.dbg_hist_input.time());
     d("gh[0] (update)", pp.dbg_gh_fanout.time());
+    d("fold_read_in_compute[0]", pp.dbg_fold_read_in_compute.time());
     d("fold_compute[0] (update)", pp.dbg_fold_compute.time());
+    d("fold_early_write[0]", pp.dbg_fold_early_write.time());
     d("fold_apply[0] (update)", pp.dbg_fold_apply.time());
 
     // Final output
