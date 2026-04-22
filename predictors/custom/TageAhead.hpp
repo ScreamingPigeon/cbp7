@@ -802,8 +802,10 @@ struct TageAhead : predictor {
 
     // Per-branch 1-bit scatter: split pp/ap into per-bit arrays to reduce
     // fanout on the wide values (fanout(3) + N×fo1 vs fanout(N+2) on each).
+    provider_pred.fanout(hard<2>{}); // make_array below + train reg save (line ~882)
+    use_alt.fanout(hard<N>{});       // N reads in static_loop below
     arr<val<1>, PRED_BITS> pp_bits = provider_pred.make_array(val<1>{});
-    arr<val<1>, PRED_BITS> ap_bits = alt_pred.make_array(val<1>{});
+    arr<val<1>, PRED_BITS> ap_bits = std::move(alt_pred).make_array(val<1>{});
     static_loop<N>([&]<u64 I>() {
       pred[I] = select(use_alt, ap_bits[I].fo1(), pp_bits[I].fo1());
     });
@@ -878,10 +880,10 @@ struct TageAhead : predictor {
     val<1> t_phw = t_hyst_weak_arr.fold_or();
 
     // Save current resolution → train regs (for NEXT cycle's training)
-    train_match1 = match1;
+    train_match1 = match1.fo1();
     train_provider_pred = provider_pred;
-    train_provider_weak = provider_weak;
-    train_altdiff = altdiff;
+    train_provider_weak = provider_weak.fo1();
+    train_altdiff = altdiff.fo1();
 #ifdef TIMING_DEBUG
     dbg_altdiff = altdiff;
 #endif
