@@ -108,14 +108,15 @@ struct ta_folded_gh {
     // Write a precomputed fold value into the register
     void apply_update(val<F> new_val)
     {
-        folded = new_val;
+        folded = new_val.fo1();
     }
 
     // Unconditional write with enable mux — avoids execute_if gate timing.
     // When enable=1: write new_val. When enable=0: hold current value.
     void apply_update(val<F> new_val, val<1> enable)
     {
-        folded = select(enable, new_val, folded);
+        folded.fanout(hard<2>{}); // hold-value read in select below (single use)
+        folded = select(enable.fo1(), new_val.fo1(), folded);
     }
 
     // Combined compute + apply (convenience, same as original folded_gh::update)
@@ -485,7 +486,7 @@ struct DefaultDecayThresh {
 struct DefaultEpochTrigger {
   template <u64 AW, u64 PW>
   static val<1> should_fire(val<AW> /*acc_ctr*/, val<PW> alloc_ctr) {
-    return alloc_ctr == hard<alloc_ctr.maxval>{};
+    return alloc_ctr.fo1() == hard<alloc_ctr.maxval>{};
   }
 };
 
@@ -581,6 +582,7 @@ struct ta_rwram {
     // noconflict=1: no read this cycle, write immediately.
     // noconflict=0: buffer write, flush when bank is free.
     auto [localaddr, bankid] = split_addr(addr.fo1());
+    localaddr.fanout(hard<B + 1>{}); // B selects in loop + buffered write_localaddr
     data.fanout(hard<B + 1>{}); // B bank writes + buffered write_data
     noconflict.fanout(hard<B + 2>{}); // B bank selects + mask + buffered gate
     val<B> banksel = bankid.fo1().decode().concat();
@@ -595,6 +597,10 @@ struct ta_rwram {
     arr<val<1>, B> current_write_split = current_write.make_array(val<1>{});
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     current_write_split.fanout(hard<3>{}); // execute_if cond + 2 selects
+    write_bank.fanout(hard<2>{}); // make_array(1) + buffered_done &(1)
+    read_bank.fanout(hard<2>{}); // make_array(1) + buffered_done |(1)
+    write_localaddr.fanout(hard<B>{}); // select in each of B execute_if lambdas
+    write_data.fanout(hard<B>{}); // select in each of B execute_if lambdas
     arr<val<1>, B> write_bank_split = write_bank.make_array(val<1>{});
     arr<val<1>, B> read_bank_split = read_bank.make_array(val<1>{});
     for (u64 i = 0; i < B; i++) {
@@ -611,7 +617,10 @@ struct ta_rwram {
     // buffer the current write if not done
     val<1> buffered_done =
         (write_bank & (current_write | read_bank)) == hard<0>{};
-    execute_if(buffered_done.fo1() | ~noconflict, [&]() {
+    val<1> buffered_gate = buffered_done.fo1() | ~noconflict;
+    // NOTE: @prakhar @claude validate hardcoded fanout
+    buffered_gate.fanout(hard<3>{}); // write_bank(1) + write_localaddr(1) + write_data(1)
+    execute_if(buffered_gate, [&]() {
       write_bank = banksel & ~noconflict_mask;
       execute_if(~noconflict, [&]() {
         write_localaddr = localaddr;
