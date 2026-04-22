@@ -333,7 +333,8 @@ struct TageAhead : predictor {
     mon.shadow_block_pc = static_cast<u64>(inst_pc);
 #endif
     inst_pc.fanout(
-        hard<2 * NT + 1>{}); // 2 reads per table (>>2, >>4) + fb (>>2)
+        hard<2 * NT + 2>{}); // 2 reads per table (>>2, >>4) + fb (>>2)
+                              // + prefetch_pc (>>2)
 
 #ifdef TIMING_DEBUG
     dbg_inst_pc = val<1>{inst_pc};
@@ -359,6 +360,8 @@ struct TageAhead : predictor {
     //   only gates the output latch, so removing it has zero area/power impact.
     static_loop<NT>([&]<u64 I>() {
       auto &t = std::get<I>(tables);
+      t.fold_idx.fanout(hard<2>{}); // get() + compute_update
+      t.fold_tag.fanout(hard<2>{}); // get() + compute_update
       auto fold_idx_val = t.fold_idx.get();
       auto idx = fold_idx_val.fo1() ^ val<t.IDX_BITS>{inst_pc >> 2};
       idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
@@ -391,6 +394,7 @@ struct TageAhead : predictor {
     // USE_GSHARE: index = PC ^ folded_history; bimodal: index = PC
     auto fb_idx = [&]() {
       if constexpr (USE_GSHARE) {
+        fb_fold.fanout(hard<2>{}); // get() + compute_update
         auto fb_fold_val = fb_fold.get();
         return val<FB_IDX_BITS>{inst_pc >> 2} ^ fb_fold_val.fo1();
       } else
@@ -515,7 +519,8 @@ struct TageAhead : predictor {
     if constexpr (!USE_SEC_TAG)
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     else
-      block_end_info.next_pc.fanout(hard<3 + (NUM_PATHS > 1 ? 1 : 0)>{});
+      // +1 for sec_tag_alloc duplicate hash (split to reduce crit-path fanout)
+      block_end_info.next_pc.fanout(hard<4 + (NUM_PATHS > 1 ? 1 : 0)>{});
     auto sec_tag_now = [&]() {
       if constexpr (USE_SEC_TAG)
         return SecTagHashFn::template apply<SEC_TAG_BITS>(
@@ -523,16 +528,26 @@ struct TageAhead : predictor {
       else
         return hard<0>{};
     }();
+    // Separate alloc hash: same computation, independent val with its own
+    // fanout tree. Keeps alloc's NT writes off sec_tag_now's critical-path
+    // buffer tree (hard<NT+1>=3 FO2 vs old hard<2*NT+1>=4 FO2).
+    auto sec_tag_alloc = [&]() {
+      if constexpr (USE_SEC_TAG)
+        return SecTagHashFn::template apply<SEC_TAG_BITS>(
+            block_end_info.next_pc);
+      else
+        return hard<0>{};
+    }();
     if constexpr (USE_SEC_TAG) {
+      // Critical-path fanout: reg write (1) + full_hits comparisons (NT) = NT+1
+      sec_tag_now.fanout(hard<NT + 1>{});
       curr_sec_tag = sec_tag_now; // store for next-cycle use
+      // Alloc-path fanout: NT sec_ram writes (off critical path)
+      sec_tag_alloc.fanout(hard<NT>{});
 #ifdef TIMING_DEBUG
       dbg_next_pc = val<1>{block_end_info.next_pc};
       dbg_curr_sec_tag = val<1>{sec_tag_now};
 #endif
-      // Fanout on sec_tag_now (the val), not the reg
-      if constexpr (NUM_PATHS > 1)
-        sec_tag_now.fanout(hard<NT + 1>{}); // train_sec_hit + alloc
-      // NP=1 fanout deferred to resolution section (matches original pattern)
     }
 
     // ================================================================
@@ -739,8 +754,7 @@ struct TageAhead : predictor {
         }
       } else {
         // Single chain: original behavior
-        if constexpr (USE_SEC_TAG)
-          sec_tag_now.fanout(hard<NT>{}); // NT full_hits reads + alloc
+        // sec_tag_now fanout already declared above (covers all reads)
         arr<val<1>, NT> full_hits = [&](u64 i) {
           if constexpr (USE_SEC_TAG) {
             return val<1>{prefetch_tag_hit[i]} &
@@ -1132,7 +1146,7 @@ struct TageAhead : predictor {
                         val<t.tag_width>{train_ctag[I]});
         if constexpr (USE_SEC_TAG)
           t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                          val<SEC_TAG_BITS>{sec_tag_now});
+                          val<SEC_TAG_BITS>{sec_tag_alloc});
       });
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_train & do_alloc)) {
