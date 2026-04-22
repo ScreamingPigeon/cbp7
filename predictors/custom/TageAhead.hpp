@@ -585,6 +585,11 @@ struct TageAhead : predictor {
     // meta_idx_pipe[META_PIPE-1] read once in training
     val<1> meta_use_alt =
         val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
+    // When NUM_PATHS > 1, resolve_chain is called NUM_PATHS times, each reading
+    // meta_use_alt. fo1() would set read_credit=-1 permanently on the first call
+    // so we use lvalue reads (fanout credits) for multi-chain configs.
+    if constexpr (NUM_PATHS >= 2)
+      meta_use_alt.fanout(hard<NUM_PATHS>{});
 #ifdef TIMING_DEBUG
     dbg_meta_use_alt = meta_use_alt;
 #endif
@@ -698,7 +703,13 @@ struct TageAhead : predictor {
       val<1> pw = (val<NT>{match1 >> 1} & pw_mask.fo1()) != hard<0>{};
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       pw.fanout(hard<2>{}); // ua computation + train_provider_weak save
-      val<1> ua = pw & meta_use_alt.fo1() & ha.fo1();
+      // meta_use_alt: fo1() only safe for NUM_PATHS==1 (single chain call).
+      // For NUM_PATHS>1 use lvalue copy (fanout declared above).
+      auto mua = [&]() -> val<1> {
+        if constexpr (NUM_PATHS == 1) return meta_use_alt.fo1();
+        else return val<1>{meta_use_alt};
+      }();
+      val<1> ua = pw & mua.fo1() & ha.fo1();
       // ua: N scatter reads
       ua.fanout(hard<N>{});
 

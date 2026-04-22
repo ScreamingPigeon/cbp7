@@ -331,6 +331,14 @@ def compute_tag_widths(cfg: dict) -> list[int]:
         if n <= 1:
             return [hi]
         return [hi - (hi - lo) * i // (n - 1) for i in range(n)]
+    elif tag_fn == "LogTag":
+        # LogTag<BASE, SCALE>: BASE + SCALE*(n-1-i)/4
+        scale = max(1, tag // 4)
+        return [tag + scale * (n - 1 - i) // 4 for i in range(n)]
+    elif tag_fn == "StepTag":
+        split = max(1, n // 2)
+        lo = max(1, tag - 2)
+        return [tag if i < split else lo for i in range(n)]
     else:
         return [tag] * n
 
@@ -355,6 +363,20 @@ def config_to_predictor_string(cfg: dict) -> str:
     tag_fn = cfg.get("tc_tag_fn", "__default__")
     if tag_fn == "__default__":
         tag_fn = f"ta::GradedTag<{tag},{max(1, tag-1)}>"
+    elif tag_fn == "UniformTag":
+        tag_fn = f"ta::UniformTag<{tag}>"
+    elif tag_fn == "LogTag":
+        # LogTag<BASE, SCALE>: BASE + SCALE*level/4, level = n-1-i
+        # Use SCALE = tag//4 so range spans ~TAG to ~1.25*TAG
+        scale = max(1, tag // 4)
+        tag_fn = f"ta::LogTag<{tag},{scale}>"
+    elif tag_fn == "StepTag":
+        # StepTag<TAG_HI, TAG_LO, SPLIT>: first SPLIT tables get TAG_HI, rest get TAG_LO
+        # Split at midpoint; hi=TAG, lo=max(1, TAG-2)
+        n = cfg["tc_num_tables"]
+        split = max(1, n // 2)
+        lo = max(1, tag - 2)
+        tag_fn = f"ta::StepTag<{tag},{lo},{split}>"
 
     size_fn = cfg.get("tc_size_fn", "__default__")
     if size_fn == "__default__" or size_fn == "GeoSize":
@@ -443,8 +465,12 @@ DEFAULT_SWEEP = {
 }
 
 
+# Size functors that use tc_size_ratio; all others ignore it
+RATIO_USING_SIZE_FNS = {"__default__", "GeoSize", "InvGeoSize"}
+
 def generate_configs(sweep_cfg: dict) -> list[dict]:
-    """Generate cross-product of sweep dimensions over base config."""
+    """Generate cross-product of sweep dimensions over base config,
+    filtering redundant combos (e.g. ratio>1 for functors that ignore it)."""
     base = dict(sweep_cfg["base"])
     sweep_dims = sweep_cfg["sweep"]
 
@@ -454,11 +480,21 @@ def generate_configs(sweep_cfg: dict) -> list[dict]:
     keys = list(sweep_dims.keys())
     value_lists = [sweep_dims[k] for k in keys]
 
+    seen_ids = set()
     configs = []
     for combo in itertools.product(*value_lists):
         cfg = dict(base)
         for k, v in zip(keys, combo):
             cfg[k] = v
+
+        # Normalize: functors that don't use ratio → canonicalize ratio to 1
+        if cfg.get("tc_size_fn") not in RATIO_USING_SIZE_FNS:
+            cfg["tc_size_ratio"] = 1
+
+        cid = config_id(cfg)
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
         configs.append(cfg)
 
     return configs
@@ -542,6 +578,7 @@ def timing_check(binary: Path, sweep_cfg: dict) -> tuple[float, list[dict]]:
 
     worst_p2 = 0.0
     results = []
+    good_runs = 0
     for t in traces:
         tp = TRACE_DIR / t
         if not tp.exists():
@@ -552,6 +589,10 @@ def timing_check(binary: Path, sweep_cfg: dict) -> tuple[float, list[dict]]:
             continue
         worst_p2 = max(worst_p2, data["p2_latency"])
         results.append(data)
+        good_runs += 1
+    # If every run crashed, treat as timing failure with sentinel P2
+    if good_runs == 0 and results:
+        worst_p2 = 999.0
     return worst_p2, results
 
 
