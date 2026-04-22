@@ -12,6 +12,8 @@ using namespace hcm;
 template<u64 N, typename T>
 [[nodiscard]] val<N,T> ta_update_ctr(val<N,T> ctr, val<1> incr)
 {
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    // 6 reads: ==maxval, ==minval, +1, -1, select(ctr), select(ctr)
     ctr.fanout(hard<6>{});
     val<N,T> incsat = select(ctr==hard<ctr.maxval>{},ctr,val<N,T>{ctr+1});
     val<N,T> decsat = select(ctr==hard<ctr.minval>{},ctr,val<N,T>{ctr-1});
@@ -491,7 +493,8 @@ struct DefaultEpochTrigger {
 struct DefaultSecTagHash {
   template <u64 SEC_TAG_BITS>
   static val<SEC_TAG_BITS> apply(val<64> pc) {
-    return val<SEC_TAG_BITS>{pc >> 2};
+    // pc is a by-value copy (read_credit=0); use fo1() for the single read
+    return val<SEC_TAG_BITS>{pc.fo1() >> 2};
   }
 };
 
@@ -499,6 +502,8 @@ struct DefaultSecTagHash {
 struct XorSecTagHash {
   template <u64 SEC_TAG_BITS>
   static val<SEC_TAG_BITS> apply(val<64> pc) {
+    // pc is a by-value copy (read_credit=0); two reads — declare fanout
+    pc.fanout(hard<2>{});
     return val<SEC_TAG_BITS>{pc >> 2} ^ val<SEC_TAG_BITS>{pc >> (2 + SEC_TAG_BITS)};
   }
 };
@@ -545,10 +550,12 @@ struct ta_rwram {
   // Split full address into (local_addr, bank_id).
   auto split_addr(val<A> addr) {
     if constexpr (BANK_SHIFT == 0) {
-      return hcm::split<L, BANK_BITS>(addr);
+      return hcm::split<L, BANK_BITS>(addr.fo1()); // split reads once
     } else if constexpr (BANK_SHIFT + BANK_BITS == A) {
+      addr.fanout(hard<2>{}); // truncate + shift
       return std::pair{val<L>{addr}, val<BANK_BITS>{addr >> BANK_SHIFT}};
     } else {
+      addr.fanout(hard<3>{}); // lo + bankid(>>) + hi(>>)
       val<BANK_SHIFT> lo = addr;
       val<BANK_BITS> bankid = addr >> BANK_SHIFT;
       val<A - BANK_SHIFT - BANK_BITS> hi = addr >> (BANK_SHIFT + BANK_BITS);
@@ -559,9 +566,10 @@ struct ta_rwram {
 
   val<N> read(val<A> addr) {
     auto [localaddr, bankid] = split_addr(addr.fo1());
-    localaddr.fanout(hard<B>{});
+    localaddr.fanout(hard<B>{}); // B bank reads
     arr<val<1>, B> banksel = bankid.fo1().decode();
-    banksel.fanout(hard<2>{});
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    banksel.fanout(hard<2>{}); // execute_if + concat
     arr<val<N>, B> data = [&](u64 i) -> val<N> {
       return execute_if(banksel[i], [&]() { return bank[i].read(localaddr); });
     };
@@ -573,16 +581,20 @@ struct ta_rwram {
     // noconflict=1: no read this cycle, write immediately.
     // noconflict=0: buffer write, flush when bank is free.
     auto [localaddr, bankid] = split_addr(addr.fo1());
-    data.fanout(hard<B + 1>{});
-    noconflict.fanout(hard<B + 2>{});
+    data.fanout(hard<B + 1>{}); // B bank writes + buffered write_data
+    noconflict.fanout(hard<B + 2>{}); // B bank selects + mask + buffered gate
     val<B> banksel = bankid.fo1().decode().concat();
-    banksel.fanout(hard<2>{});
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    banksel.fanout(hard<2>{}); // current_write AND + buffered write_bank
     val<B> noconflict_mask = noconflict.replicate(hard<B>{}).concat();
-    noconflict_mask.fanout(hard<2>{});
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    noconflict_mask.fanout(hard<2>{}); // current_write AND + buffered ~noconflict
     val<B> current_write = banksel & noconflict_mask;
-    current_write.fanout(hard<3>{});
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    current_write.fanout(hard<3>{}); // make_array + buffered OR + read_bank OR
     arr<val<1>, B> current_write_split = current_write.make_array(val<1>{});
-    current_write_split.fanout(hard<3>{});
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    current_write_split.fanout(hard<3>{}); // execute_if cond + 2 selects
     arr<val<1>, B> write_bank_split = write_bank.make_array(val<1>{});
     arr<val<1>, B> read_bank_split = read_bank.make_array(val<1>{});
     for (u64 i = 0; i < B; i++) {

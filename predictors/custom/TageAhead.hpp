@@ -334,7 +334,7 @@ struct TageAhead : predictor {
 #endif
     inst_pc.fanout(
         hard<2 * NT + 2>{}); // 2 reads per table (>>2, >>4) + fb (>>2)
-                              // + prefetch_pc (>>2)
+                             // + prefetch_pc (>>2)
 
 #ifdef TIMING_DEBUG
     dbg_inst_pc = val<1>{inst_pc};
@@ -360,13 +360,16 @@ struct TageAhead : predictor {
     //   only gates the output latch, so removing it has zero area/power impact.
     static_loop<NT>([&]<u64 I>() {
       auto &t = std::get<I>(tables);
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       t.fold_idx.fanout(hard<2>{}); // get() + compute_update
       t.fold_tag.fanout(hard<2>{}); // get() + compute_update
       auto fold_idx_val = t.fold_idx.get();
       auto idx = fold_idx_val.fo1() ^ val<t.IDX_BITS>{inst_pc >> 2};
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
       auto fold_tag_val = t.fold_tag.get();
       auto computed_tag = fold_tag_val.fo1() ^ val<t.tag_width>{inst_pc >> 4};
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       computed_tag.fanout(hard<2>{}); // tag comparison + prefetch_ctag write
 
 #ifdef TIMING_DEBUG
@@ -377,6 +380,7 @@ struct TageAhead : predictor {
 #endif
 
       auto stored_tag = t.tag_ram.read(idx);
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       stored_tag.fanout(hard<2>{});
       prefetch_tag[I] = stored_tag;
       prefetch_tag_hit[I] =
@@ -394,12 +398,17 @@ struct TageAhead : predictor {
     // USE_GSHARE: index = PC ^ folded_history; bimodal: index = PC
     auto fb_idx = [&]() {
       if constexpr (USE_GSHARE) {
+        // NOTE: @prakhar @claude ensure hardcoded fanout is correct
         fb_fold.fanout(hard<2>{}); // get() + compute_update
         auto fb_fold_val = fb_fold.get();
         return val<FB_IDX_BITS>{inst_pc >> 2} ^ fb_fold_val.fo1();
       } else
         return val<FB_IDX_BITS>{inst_pc >> 2};
     }();
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    fb_idx.fanout(
+        hard<2 + (FB_RECONCILE ? 1 : 0)>{}); // prefetch_fb_idx + fb_ctr.read [+
+                                             // fb_hyst.read]
     prefetch_fb_idx = fb_idx;
     prefetch_fb = fb_ctr.read(fb_idx);
     if constexpr (FB_RECONCILE)
@@ -462,51 +471,56 @@ struct TageAhead : predictor {
     // reach here)
 
     // Save current_* into train_* before shift (block A's data for training)
+    // curr_sec_tag read NT times (once per table) in the loop below
+    if constexpr (USE_SEC_TAG)
+      curr_sec_tag.fanout(hard<NT>{});
     static_loop<NT>([&]<u64 I>() {
-      train_idx[I] = current_idx[I];
+      train_idx[I] = current_idx[I].fo1();
       train_pred[I] =
-          current_pred[I]; // per-table pred for per-table wrong signals
-      train_hyst[I] = current_hyst[I];
-      train_u[I] = current_u[I];
-      train_ctag[I] = current_ctag[I];
-      train_tag_hit[I] = current_tag_hit[I];
+          current_pred[I].fo1(); // per-table pred for per-table wrong signals
+      train_hyst[I] = current_hyst[I].fo1();
+      train_u[I] = current_u[I].fo1();
+      train_ctag[I] = current_ctag[I].fo1();
+      train_tag_hit[I] = current_tag_hit[I].fo1();
       if constexpr (USE_SEC_TAG)
-        train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I]} ==
+        train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I].fo1()} ==
                             val<SEC_TAG_BITS>{curr_sec_tag});
     });
-    train_fb = current_fb;
-    train_fb_idx = current_fb_idx;
+    train_fb = current_fb.fo1();
+    train_fb_idx = current_fb_idx.fo1();
     if constexpr (FB_RECONCILE)
-      train_fb_hyst = current_fb_hyst;
-    train_pc = current_pc;
+      train_fb_hyst = current_fb_hyst.fo1();
+    train_pc = current_pc.fo1();
 
     // Fanout on prefetch_* regs: read twice (shift + resolution chain bypass)
     static_loop<NT>([&]<u64 I>() {
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       prefetch_tag_hit[I].fanout(hard<2>{}); // shift + full_hits
       prefetch_pred[I].fanout(hard<2>{});    // shift + table_preds
       prefetch_hyst[I].fanout(hard<2>{});    // shift + weak_mask
       prefetch_u[I].fanout(hard<2>{});       // shift + weak_mask
       if constexpr (USE_SEC_TAG)
-        prefetch_sec[I].fanout(hard<2>{});   // shift + full_hits
+        prefetch_sec[I].fanout(hard<2>{}); // shift + full_hits
     });
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     prefetch_fb.fanout(hard<2>{}); // shift + table_preds
 
     static_loop<NT>([&]<u64 I>() {
-      current_tag[I] = prefetch_tag[I];
+      current_tag[I] = prefetch_tag[I].fo1();
       current_tag_hit[I] = prefetch_tag_hit[I];
       current_pred[I] = prefetch_pred[I];
       if constexpr (USE_SEC_TAG)
         current_sec[I] = prefetch_sec[I];
-      current_idx[I] = prefetch_idx[I];
+      current_idx[I] = prefetch_idx[I].fo1();
       current_hyst[I] = prefetch_hyst[I];
       current_u[I] = prefetch_u[I];
-      current_ctag[I] = prefetch_ctag[I];
+      current_ctag[I] = prefetch_ctag[I].fo1();
     });
     current_fb = prefetch_fb;
-    current_fb_idx = prefetch_fb_idx;
+    current_fb_idx = prefetch_fb_idx.fo1();
     if constexpr (FB_RECONCILE)
-      current_fb_hyst = prefetch_fb_hyst;
-    current_pc = prefetch_pc;
+      current_fb_hyst = prefetch_fb_hyst.fo1();
+    current_pc = prefetch_pc.fo1();
 
 #ifdef TAGE_MONITOR
     mon.shift_block_pc();
@@ -517,6 +531,7 @@ struct TageAhead : predictor {
     // The reg is only needed for cross-cycle reads; same-cycle resolution
     // uses sec_tag_now directly.
     if constexpr (!USE_SEC_TAG)
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     else
       // +1 for sec_tag_alloc duplicate hash (split to reduce crit-path fanout)
@@ -556,14 +571,18 @@ struct TageAhead : predictor {
     // new RAM value instead of the properly delayed old value.
     // ================================================================
     for (u64 i = META_PIPE - 1; i > 0; i--) {
-      meta_pipe[i] = meta_pipe[i - 1];
-      meta_idx_pipe[i] = meta_idx_pipe[i - 1];
+      meta_pipe[i] = meta_pipe[i - 1].fo1();
+      meta_idx_pipe[i] = meta_idx_pipe[i - 1].fo1();
     }
     {
       auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
+      meta_idx.fanout(hard<2>{}); // meta_ctr.read + meta_idx_pipe[0] write
       meta_pipe[0] = meta_ctr.read(meta_idx);
       meta_idx_pipe[0] = meta_idx;
     }
+    // meta_pipe[META_PIPE-1] read twice: meta_use_alt + old_meta in training
+    meta_pipe[META_PIPE - 1].fanout(hard<2>{});
+    // meta_idx_pipe[META_PIPE-1] read once in training
     val<1> meta_use_alt =
         val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
 #ifdef TIMING_DEBUG
@@ -617,12 +636,16 @@ struct TageAhead : predictor {
         return val<1>{val<HW>{prefetch_hyst[i]} == hard<0>{}} &
                val<1>{val<U_WIDTH>{prefetch_u[i]} == hard<0>{}};
       };
-      return w.concat();
+      return std::move(w).concat(); // rvalue → fo1 per element (each used once)
     }();
+    // weak_mask read once per resolve_chain call (NUM_PATHS calls total)
+    if constexpr (NUM_PATHS >= 2)
+      weak_mask.fanout(hard<NUM_PATHS>{});
 
     auto resolve_chain = [&](arr<val<1>, NT> full_hits) {
-      val<MATCH_BITS> match = concat(val<1>{1}, full_hits.concat());
-      match.fanout(hard<2>{}); // one_hot + ha
+      val<MATCH_BITS> match = concat(val<1>{1}, std::move(full_hits).concat());
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+      match.fanout(hard<3>{}); // ha(>>1) + one_hot + remainder(^match1)
 
       // has_alt: true iff any TAGE table matched. If so, provider is a
       // table and fallback (always bit 0) is below it as alt.
@@ -630,10 +653,12 @@ struct TageAhead : predictor {
       val<1> ha = (match >> 1) != hard<0>{};
 
       val<MATCH_BITS> match1 = match.one_hot();
-      // make_array + XOR(remainder) + pw + train_match1 save
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+      // make_array + XOR(remainder) + pw(>>1) + train_match1 save
       match1.fanout(hard<4>{});
       val<MATCH_BITS> remainder = match ^ match1;
       val<MATCH_BITS> match2 = remainder.fo1().one_hot();
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       match2.fanout(hard<2>{}); // make_array (alt pred extraction)
 
       arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
@@ -641,6 +666,7 @@ struct TageAhead : predictor {
           return val<PRED_BITS>{prefetch_pred[i]};
         return val<PRED_BITS>{prefetch_fb};
       };
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       table_preds.fanout(hard<2>{}); // pmask + amask
 
       arr<val<1>, NT + 1> m1_bits = match1.make_array(val<1>{});
@@ -654,8 +680,9 @@ struct TageAhead : predictor {
         return m2_bits[i].fo1().replicate(hard<PRED_BITS>{}).concat() &
                table_preds[i];
       };
-      val<PRED_BITS> pp = pmask.fold_or();
-      val<PRED_BITS> ap = amask.fold_or();
+      val<PRED_BITS> pp = std::move(pmask).fold_or();
+      val<PRED_BITS> ap = std::move(amask).fold_or();
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       // pp: make_array + ad XOR + train_provider_pred save
       pp.fanout(hard<3>{});
       // ap: make_array + ad XOR
@@ -664,7 +691,12 @@ struct TageAhead : predictor {
       // Provider weakness: AND match1's table bits with precomputed
       // weak_mask, then check nonzero. Single gate after match1 instead
       // of fold_or over NT+1 terms.
-      val<1> pw = (val<NT>{match1 >> 1} & weak_mask) != hard<0>{};
+      auto pw_mask = [&]() -> val<NT> {
+        if constexpr (NUM_PATHS == 1) return weak_mask.fo1();
+        else return weak_mask;
+      }();
+      val<1> pw = (val<NT>{match1 >> 1} & pw_mask.fo1()) != hard<0>{};
+      // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       pw.fanout(hard<2>{}); // ua computation + train_provider_weak save
       val<1> ua = pw & meta_use_alt.fo1() & ha.fo1();
       // ua: N scatter reads
@@ -696,14 +728,14 @@ struct TageAhead : predictor {
           return val<1>{prefetch_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<0>{});
         };
-        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] = resolve_chain(fh0);
+        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] = resolve_chain(std::move(fh0));
 
         // Chain 1: stored sec_tag == 1 (compile-time constant)
         arr<val<1>, NT> fh1 = [&](u64 i) {
           return val<1>{prefetch_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<1>{});
         };
-        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] = resolve_chain(fh1);
+        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] = resolve_chain(std::move(fh1));
 
         // Fields muxed through NP select: m1, m2, pp, ap, pw, ad, ua.
         static constexpr u64 MUX_FIELDS = 7;
@@ -724,13 +756,13 @@ struct TageAhead : predictor {
             return val<1>{prefetch_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<2>{});
           };
-          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] = resolve_chain(fh2);
+          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] = resolve_chain(std::move(fh2));
 
           arr<val<1>, NT> fh3 = [&](u64 i) {
             return val<1>{prefetch_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<3>{});
           };
-          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] = resolve_chain(fh3);
+          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] = resolve_chain(std::move(fh3));
 
           // 4-to-1 mux tree: derive sel directly from next_pc (bypass reg)
           val<SEC_TAG_BITS> sec_idx =
@@ -764,7 +796,7 @@ struct TageAhead : predictor {
             return val<1>{prefetch_tag_hit[i]};
           }
         };
-        return resolve_chain(full_hits);
+        return resolve_chain(std::move(full_hits));
       }
     }();
 
@@ -908,6 +940,7 @@ struct TageAhead : predictor {
                                 }}.concat();
 
     // Provider wrong on any branch? (uses piped provider_pred)
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     t_pp.fanout(hard<2>{});
     // any_provider_wrong(1) + per-table table_wrong in loop(NT) + fb_changed(1)
     actual_dir.fanout(hard<NT + 2>{});
@@ -922,8 +955,10 @@ struct TageAhead : predictor {
     dbg_actual_dir = val<1>{actual_dir};
     dbg_any_prov_wrong = any_provider_wrong;
 #endif
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     t_pw.fanout(hard<2>{});       // meta gate + meta update direction
     t_phw.fanout(hard<NT + 1>{}); // per-table pred/hyst update gate
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     t_m1.fanout(hard<6>{});
     t_ad.fanout(hard<NT + 1>{});
 
@@ -966,8 +1001,10 @@ struct TageAhead : predictor {
       return val<U_WIDTH>{train_u[i]} == hard<0>{};
     };
     val<NT> notumask = u_zero.concat();
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     notumask.fanout(hard<2>{});
     val<NT> postmask = alloc_base & gated_triggermask;
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     postmask.fanout(hard<2>{});
     val<NT> candallocmask = [&]() {
       val<NT> base = postmask & notumask;
@@ -983,6 +1020,7 @@ struct TageAhead : predictor {
         return base;
       }
     }();
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     candallocmask.fanout(hard<2>{});
 
     // 3d. Target policy (may skip closest candidates)
@@ -993,8 +1031,10 @@ struct TageAhead : predictor {
     // 3e. Final allocation decision (one-hot or two-hot)
     arr<val<1>, NT> allocate = [&]() -> arr<val<1>, NT> {
       if constexpr (AllocCfg::MAX_ALLOC >= 2) {
+        // NOTE: @prakhar @claude ensure hardcoded fanout is correct
         collamask.fanout(hard<3>{});
         val<NT> pick1 = collamask.one_hot();
+        // NOTE: @prakhar @claude ensure hardcoded fanout is correct
         pick1.fanout(hard<3>{});
         val<NT> pick2 = [&]() -> val<NT> {
           val<NT> basic2 = (collamask ^ pick1).one_hot();
@@ -1013,6 +1053,7 @@ struct TageAhead : predictor {
         return alloc_target_rev.reverse().make_array(val<1>{});
       }
     }();
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     allocate.fanout(hard<6>{});
     val<NT> alloc_target = [&]() {
       arr<val<1>, NT> a = allocate;
@@ -1021,6 +1062,7 @@ struct TageAhead : predictor {
     val<1> noalloc = (candallocmask == hard<0>{});
     val<NT> uclearmask = postmask & noalloc.replicate(hard<NT>{}).concat();
     arr<val<1>, NT> uclear = uclearmask.make_array(val<1>{});
+    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     uclear.fanout(hard<2>{});
 #ifdef TIMING_DEBUG
     dbg_alloc_base = val<1>{alloc_base};
@@ -1096,7 +1138,7 @@ struct TageAhead : predictor {
     auto new_meta = ta_update_ctr(old_meta, any_provider_wrong);
     val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
     execute_if(meta_gate, [&]() {
-      meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1]}, new_meta,
+      meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1].fo1()}, new_meta,
                      hard<0>{});
     });
 #ifdef TIMING_DEBUG
@@ -1260,8 +1302,7 @@ struct TageAhead : predictor {
               (((provider_bits >> FARALLOC_DIST) | allocmask1).one_hot() ^
                allocmask1) == hard<0>{};
           // Two-step update: first normal, then extra decrement if far
-          auto step1 =
-              ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
+          auto step1 = ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
           return ta_update_ctr(step1, ~(faralloc & any_alloc));
         } else {
           return ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
