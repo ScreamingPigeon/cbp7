@@ -693,17 +693,33 @@ using TATableAt =
     TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I],
             CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS>;
 
+// Build a reversed index sequence: <N-1, N-2, ..., 1, 0>
+template <typename Seq> struct ReverseSeq;
+template <u64... Is>
+struct ReverseSeq<std::index_sequence<Is...>> {
+  static constexpr u64 N = sizeof...(Is);
+  using type = std::index_sequence<(N - 1 - Is)...>;
+};
+
 // Build a tuple of TATable types
+// When REVERSE=true, RAMs are declared in reverse order (T(NT-1) first)
+// to influence HARCOM floorplan placement.
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, typename Seq>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, bool REVERSE, typename Seq>
 struct TAMakeTableTuple;
 
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, u64... Is>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, bool REVERSE, u64... Is>
 struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                        SEC_TAG_BITS, N, SHARED_HYS, std::index_sequence<Is...>> {
-  using type = std::tuple<TATableAt<Cfg, Is, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                                    SEC_TAG_BITS, N, SHARED_HYS>...>;
+                        SEC_TAG_BITS, N, SHARED_HYS, REVERSE, std::index_sequence<Is...>> {
+  // Storage indices: reversed when REVERSE=true so biggest-first tables
+  // get their RAMs declared first, influencing floorplan placement.
+  static constexpr u64 NT = sizeof...(Is);
+  static constexpr auto storage_idx(u64 i) { return REVERSE ? (NT - 1 - i) : i; }
+
+  using type = std::tuple<TATableAt<Cfg, (REVERSE ? NT - 1 - Is : Is), CTR_WIDTH,
+                                    HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N,
+                                    SHARED_HYS>...>;
 };
 
 // ============================================================================

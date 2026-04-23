@@ -113,6 +113,10 @@ struct TAMonitor {
     u64 decay_fire_count = 0;
     u64 epoch_reset_count = 0;
 
+    // Per-rank (branch position within block) prediction accuracy
+    std::array<u64, N> rank_total{};
+    std::array<u64, N> rank_correct{};
+
     // Pressure counters (sampled each update_cycle with branches)
     u64 acc_ctr_sum = 0;
     u64 alloc_ctr_sum = 0;
@@ -134,6 +138,9 @@ struct TAMonitor {
   Counters win;
   u64 window_num = 0;
   bool header_printed = false;
+
+  // Per-table actual sizes (set by predictor, may differ from MAX_TABLE_ENTRIES)
+  std::array<u64, NUM_TABLES> table_sizes{};
 
   // Table occupancy tracking (cumulative only — snapshots)
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> tage_occupied{};
@@ -178,6 +185,12 @@ struct TAMonitor {
   u64 shadow_block_pc = 0;   // set in predict1
   u64 current_block_pc = 0;  // shifted in update_cycle
   u64 train_block_pc = 0;    // shifted in update_cycle
+
+  // Per-branch PC pipeline (shadow_pc set by record_branch_info, piped through)
+  std::array<u64, N> current_pcs{};
+  u64 current_num_branch = 0;
+  std::array<u64, N> train_pcs{};
+  u64 train_num_branch = 0;
 
   // ======== Recording methods ========
 
@@ -273,6 +286,11 @@ struct TAMonitor {
           if (correct) c.meta_chose_pri_correct++;
         }
       }
+
+      if (rank < N) {
+        c.rank_total[rank]++;
+        if (correct) c.rank_correct[rank]++;
+      }
     };
     record(cum);
     record(win);
@@ -358,10 +376,16 @@ struct TAMonitor {
     record(win);
   }
 
+  // Mask index to actual table size (tables may be smaller than MAX_TABLE_ENTRIES)
+  u64 mask_index(u64 table, u64 index) const {
+    return table_sizes[table] > 0 ? (index & (table_sizes[table] - 1)) : index;
+  }
+
   // Table occupancy — called on allocation writes
   void record_tage_write(u64 table, u64 index) {
-    if (table < NUM_TABLES && index < MAX_TABLE_ENTRIES &&
-        !tage_occupied[table].test(index)) {
+    if (table >= NUM_TABLES) return;
+    index = mask_index(table, index);
+    if (index < MAX_TABLE_ENTRIES && !tage_occupied[table].test(index)) {
       tage_occupied[table].set(index);
       tage_unique_entries[table]++;
     }
@@ -377,15 +401,22 @@ struct TAMonitor {
   }
 
   // Block PC pipeline shift (call at start of update_cycle)
-  void shift_block_pc() {
+  void shift_block_pc(u64 num_branch) {
     train_block_pc = current_block_pc;
+    train_pcs = current_pcs;
+    train_num_branch = current_num_branch;
     current_block_pc = shadow_block_pc;
+    for (u64 i = 0; i < num_branch && i < N; i++)
+      current_pcs[i] = shadow_pc[i];
+    current_num_branch = num_branch;
   }
 
   // Feature 5: Record provider entry usage (call once per block during resolution)
   void record_provider_entry(u64 table, u64 index, u64 num_branches,
                               u64 num_correct) {
-    if (table < NUM_TABLES && index < MAX_TABLE_ENTRIES) {
+    if (table >= NUM_TABLES) return;
+    index = mask_index(table, index);
+    if (index < MAX_TABLE_ENTRIES) {
       auto &e = entry_life[table][index];
       if (e.valid) {
         e.pred_count += num_branches;
@@ -395,15 +426,19 @@ struct TAMonitor {
   }
 
   // Feature 7+9: Tag collision check (call per table during resolution)
-  void record_collision_check(u64 table, u64 index, bool tag_hit) {
-    if (!tag_hit || index >= MAX_TABLE_ENTRIES) return;
+  // lookup_pc: the PC used to compute the index (block PC for this lookup)
+  void record_collision_check(u64 table, u64 index, bool tag_hit,
+                               u64 lookup_pc) {
+    if (!tag_hit || table >= NUM_TABLES) return;
+    index = mask_index(table, index);
+    if (index >= MAX_TABLE_ENTRIES) return;
     entry_ever_hit[table].set(index);
     win_entry_ever_hit[table].set(index);
     auto record_coll = [&](Counters &c) {
       c.per_table_coll_checks[table]++;
       c.collision_checks++;
       auto &e = entry_life[table][index];
-      if (e.valid && e.stored_pc != 0 && e.stored_pc != current_block_pc) {
+      if (e.valid && e.stored_pc != 0 && e.stored_pc != lookup_pc) {
         c.per_table_coll_hits[table]++;
         c.collision_hits++;
       }
@@ -414,6 +449,8 @@ struct TAMonitor {
 
   // Feature 5+7+8: Record allocation (call per table on allocation write)
   void record_entry_alloc_diag(u64 table, u64 index) {
+    if (table >= NUM_TABLES) return;
+    index = mask_index(table, index);
     if (index >= MAX_TABLE_ENTRIES) return;
     auto &e = entry_life[table][index];
     // Eviction stats for old entry
@@ -434,9 +471,11 @@ struct TAMonitor {
     e.correct_count = 0;
     e.stored_pc = train_block_pc;
     e.valid = true;
-    // Feature 8: per-PC alloc tracking (both cumulative and window)
-    pc_diag[train_block_pc].alloc_count++;
-    win_pc_diag[train_block_pc].alloc_count++;
+    // Feature 8: per-PC alloc tracking — credit all branches in training block
+    for (u64 i = 0; i < train_num_branch && i < N; i++) {
+      pc_diag[train_pcs[i]].alloc_count++;
+      win_pc_diag[train_pcs[i]].alloc_count++;
+    }
   }
 
   // u-bit write
@@ -719,14 +758,15 @@ struct TAMonitor {
     os << "  Table  | Size  | Occupied |  Occ% | EverHit | Used% | Accuracy | Allocs\n";
     os << "  -------+-------+----------+-------+---------+-------+----------+-------\n";
     for (u64 i = 0; i < NUM_TABLES; i++) {
+      u64 tsize = table_sizes[i] > 0 ? table_sizes[i] : MAX_TABLE_ENTRIES;
       u64 ever_hit = entry_ever_hit[i].count();
       os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
-         << std::setw(6) << MAX_TABLE_ENTRIES << " |" << std::setw(9)
+         << std::setw(6) << tsize << " |" << std::setw(9)
          << tage_unique_entries[i] << " |" << std::setw(5)
-         << pct(tage_unique_entries[i], MAX_TABLE_ENTRIES) << "%"
+         << pct(tage_unique_entries[i], tsize) << "%"
          << " |" << std::setw(8) << ever_hit
          << " |" << std::setw(5)
-         << pct(ever_hit, MAX_TABLE_ENTRIES) << "%"
+         << pct(ever_hit, tsize) << "%"
          << " |" << std::setw(7)
          << pct(c.provider_correct[i], c.provider_count[i]) << "%"
          << " |" << std::setw(7) << c.alloc_per_table[i] << "\n";
@@ -944,6 +984,20 @@ struct TAMonitor {
         }
         os << std::setw(8) << (count > 0 ? double(total_alloc) / count : 0)
            << "\n";
+      }
+    }
+
+    // Per-rank prediction accuracy
+    {
+      os << "\n--- Per-Rank Branch Accuracy ---\n";
+      os << "  Rank | Branches  | Correct   | Accuracy\n";
+      os << "  -----+-----------+-----------+---------\n";
+      for (u64 r = 0; r < N; r++) {
+        if (c.rank_total[r] == 0) break;
+        os << "  " << std::setw(4) << r << " |" << std::setw(10)
+           << c.rank_total[r] << " |" << std::setw(10) << c.rank_correct[r]
+           << " |" << std::setw(7)
+           << pct(c.rank_correct[r], c.rank_total[r]) << "%\n";
       }
     }
 
