@@ -318,7 +318,6 @@ clean:
 	rm -f $(BUILD_DIR)/test-tage-compile $(BUILD_DIR)/quick_a $(BUILD_DIR)/quick_b
 	rm -f $(BUILD_DIR)/timing-probe-*
 	rm -f $(PREDICTOR_MK)
-	rm -rf out/*
 
 # Clean individual targets: make clean-cbp, clean-monitor, clean-profile, clean-out
 clean-cbp:
@@ -330,4 +329,3 @@ clean-profile:
 clean-reference:
 	rm -f $(BUILD_DIR)/reference
 clean-out:
-	rm -rf out/*

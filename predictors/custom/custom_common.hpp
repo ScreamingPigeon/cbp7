@@ -566,7 +566,7 @@ struct ta_rwram {
   }
 
   val<N> read(val<A> addr) {
-    auto [localaddr, bankid] = split_addr(addr.fo1());
+    auto [localaddr, bankid] = split_addr(addr.fo1().connect(bank[0]));
     localaddr.fanout(hard<B>{}); // B bank reads
     arr<val<1>, B> banksel = bankid.fo1().decode();
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
@@ -578,10 +578,13 @@ struct ta_rwram {
     return data.fo1().fold_or();
   }
 
-  void write(val<A> addr, val<N> data, val<1> noconflict) {
+  void write(val<A> addr, val<N> data, val<1> nc) {
     // noconflict=1: no read this cycle, write immediately.
     // noconflict=0: buffer write, flush when bank is free.
-    auto [localaddr, bankid] = split_addr(addr.fo1());
+    // Connect narrow noconflict (1-bit) to bank[0] so operations happen
+    // at the bank location, reducing wire distance.
+    auto noconflict = nc.fo1().connect(bank[0]);
+    auto [localaddr, bankid] = split_addr(addr.fo1().connect(bank[0]));
     localaddr.fanout(hard<B + 1>{}); // B selects in loop + buffered write_localaddr
     data.fanout(hard<B + 1>{}); // B bank writes + buffered write_data
     noconflict.fanout(hard<B + 2>{}); // B bank selects + mask + buffered gate
