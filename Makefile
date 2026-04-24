@@ -32,7 +32,7 @@ REGION_SHIFT ?= 12
 PRED_HASH := $(shell echo '$(PREDICTOR_TYPE)|$(EXTRA_COMMON_FLAGS)|$(EXTRA_CBP_FLAGS)' | md5sum | cut -c1-8)
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report timing-probe run-timing-probe debug-print run-debug-print psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report debug-print run-debug-print cbp-1c cbp-2c cbp-both quick-eval-1c quick-eval-2c quick-eval-both debug-print-1c debug-print-2c run-debug-print-1c run-debug-print-2c psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -48,8 +48,13 @@ help:
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
 	@echo "  make cbp-monitor                Build+run with TAGE monitor (output to MONITOR_OUT)"
+	@echo "  make cbp-1c / cbp-2c            Build 1-cycle / 2-cycle competition configs"
+	@echo "  make cbp-both                   Build both competition configs"
+	@echo "  make quick-eval-1c / -2c        Evaluate 1-cycle / 2-cycle on representative traces"
+	@echo "  make quick-eval-both            Build+evaluate both configs side by side"
 	@echo "  make debug-print                Build with DEBUG_PRINT (signal timing dumps)"
 	@echo "  make run-debug-print            Build+run debug print (warmup=2, measure=2)"
+	@echo "  make run-debug-print-1c / -2c   Debug print for 1-cycle / 2-cycle configs"
 	@echo "  make quick-eval                 Run current predictor on 20 representative traces"
 	@echo "  make quick-eval-all             Compare PRED_A vs PRED_B on representative traces"
 	@echo "  make trace-analyze              Build trace analysis tool"
@@ -208,6 +213,44 @@ $(BUILD_DIR)/test-tage-compile: tests/test_tage_compile.cpp predictors/custom/Ta
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -Itrace_files -o $@ $< -lz
 
 test-tage-compile: $(BUILD_DIR)/test-tage-compile
+
+# ---- Competition track builds: 1-cycle and 2-cycle ----
+cbp-1c: | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/cbp-1c cbp.cpp -lz -DPREDICTOR='TageAhead1C'
+
+cbp-2c: | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/cbp-2c cbp.cpp -lz -DPREDICTOR='TageAhead2C'
+
+cbp-both: cbp-1c cbp-2c
+
+quick-eval-1c: cbp-1c
+	scripts/quick_eval.sh ./$(BUILD_DIR)/cbp-1c $(TRACE_DIR) out/quick_1c $(QUICK_JOBS)
+
+quick-eval-2c: cbp-2c
+	scripts/quick_eval.sh ./$(BUILD_DIR)/cbp-2c $(TRACE_DIR) out/quick_2c $(QUICK_JOBS)
+
+quick-eval-both: | $(BUILD_DIR)
+	@echo "=== Building 1-cycle ==="
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/cbp-1c cbp.cpp -lz -DPREDICTOR='TageAhead1C'
+	@echo "=== Building 2-cycle ==="
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/cbp-2c cbp.cpp -lz -DPREDICTOR='TageAhead2C'
+	@echo "=== Evaluating 1-cycle ==="
+	scripts/quick_eval.sh ./$(BUILD_DIR)/cbp-1c $(TRACE_DIR) out/quick_1c $(QUICK_JOBS)
+	@echo ""
+	@echo "=== Evaluating 2-cycle ==="
+	scripts/quick_eval.sh ./$(BUILD_DIR)/cbp-2c $(TRACE_DIR) out/quick_2c $(QUICK_JOBS)
+
+debug-print-1c: | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -DDEBUG_PRINT $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/debug-print-1c cbp.cpp -lz -DPREDICTOR='TageAhead1C'
+
+debug-print-2c: | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -DDEBUG_PRINT $(EXTRA_CBP_FLAGS) -Itrace_files -o $(BUILD_DIR)/debug-print-2c cbp.cpp -lz -DPREDICTOR='TageAhead2C'
+
+run-debug-print-1c: debug-print-1c
+	./$(BUILD_DIR)/debug-print-1c $(TRACE) $(TRACE_NAME) 2 $(DEBUG_PRINT_MEASURE) 2>&1
+
+run-debug-print-2c: debug-print-2c
+	./$(BUILD_DIR)/debug-print-2c $(TRACE) $(TRACE_NAME) 2 $(DEBUG_PRINT_MEASURE) 2>&1
 
 # Quick evaluation on representative trace subset (20 traces)
 QUICK_JOBS ?= $(shell nproc)

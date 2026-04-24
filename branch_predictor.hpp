@@ -18,12 +18,27 @@
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args> using perceptron = experiment_perceptron<Args...>;
 
+// ============================================================================
+// Competition configs: 1-cycle and 2-cycle tracks
+// ============================================================================
+
+// 1-cycle config: 14 tables, 1024 uniform, P2 ≈ 0.99
+using TageAhead1C = TageAhead<
+    TATableConfig<14, 1024, 11, 4, 500, 1,
+                  ta::HistSeries::GEOMETRIC,
+                  ta::UniformTag<11>,
+                  ta::UniformSize<1024>>>;
+
+// 2-cycle config: 28 tables, StepSize 4096/2048 split@24, P2 ≈ 1.91
+// 106K entries, 24 tables at 4096 + 4 at 2048, MAXH=1000
+using TageAhead2C = TageAhead<
+    TATableConfig<28, 2048, 12, 4, 1000, 2,
+                  ta::HistSeries::GEOMETRIC,
+                  ta::UniformTag<12>,
+                  ta::StepSize<4096, 2048, 24>>>;
+
 #ifdef PREDICTOR
 using branch_predictor = PREDICTOR;
 #else
-// using branch_predictor = bimodal<>;
-// using branch_predictor = gshare<>;
-// using branch_predictor = tage<>;
-using branch_predictor = TageDirectBim<>;
-// using branch_predictor = experiment_perceptron<>;
+using branch_predictor = TageAhead1C;
 #endif

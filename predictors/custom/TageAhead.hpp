@@ -14,10 +14,10 @@ using namespace hcm;
 // ============================================================================
 
 template <u64 N = 12, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 4,
-          u64 MAXH = 500, u64 SIZE_RATIO = 1,
+          u64 MAXH = 500, u64 SIZE_RATIO = 4,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
-          typename TagFn = ta::StepTag<TAG, TAG - 3, N / 2>,
-          typename SizeFn = ta::UniformSize<SIZE>>
+          typename TagFn = ta::UniformTag<TAG>,
+          typename SizeFn = ta::GeoSize<SIZE, SIZE_RATIO>>
 struct TATableConfig {
   static constexpr u64 NUM_TABLES = N;
   static constexpr u64 MINHIST = MINH;
@@ -73,8 +73,8 @@ template <
     // ---- Allocation policy ----
     typename AllocCfg = TADefaultAllocConfig,
     // ---- Global pressure counters ----
-    u64 ACC_WIDTH = 4,   // accuracy counter width
-    u64 ALLOC_WIDTH = 4, // alloc pressure counter width
+    u64 ACC_WIDTH = 16,   // accuracy counter width
+    u64 ALLOC_WIDTH = 16, // alloc pressure counter width
     // ---- Probabilistic u-bit decay ----
     bool DECAY_ENABLE = false, DecayMiss DECAY_MISS = DecayMiss::TAG_OR_SEC,
     DecayOp DECAY_OP = DecayOp::DECREMENT,
