@@ -1317,8 +1317,9 @@ struct TageAhead : predictor {
     // 4a. Direct update: mispredict + fallback is provider → write actual_dir.
     // train_fb:      1 read (FB_RECONCILE=false), 2 reads (FB_RECONCILE=true)
     // train_fb_idx:  1 read (FB_RECONCILE=false), 3 reads (FB_RECONCILE=true)
-    // train_fb_hyst: 0 reads (FB_RECONCILE=false), 1 read (FB_RECONCILE=true)
+    // train_fb_hyst: 0 reads (FB_RECONCILE=false), 2 reads (FB_RECONCILE=true)
     if constexpr (FB_RECONCILE) {
+      train_fb_hyst.fanout(hard<2>{}); // fb_hyst_weak + silent update check
       train_fb.fanout(
           hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
       train_fb_idx.fanout(
@@ -1363,8 +1364,11 @@ struct TageAhead : predictor {
                  [&]() { fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, t_pp); });
 
       // Update fb_hyst: 1 if agree, 0 if disagree — tracks recent consensus.
-      execute_if(do_train, [&]() {
-        fb_hyst.write(val<FB_IDX_BITS>{train_fb_idx}, ~fb_tage_disagree);
+      // Silent update elimination: skip write when new == old.
+      val<1> new_fb_hyst = ~fb_tage_disagree;
+      val<1> fb_hyst_changed = new_fb_hyst != val<1>{train_fb_hyst};
+      execute_if(do_train & fb_hyst_changed, [&]() {
+        fb_hyst.write(val<FB_IDX_BITS>{train_fb_idx}, new_fb_hyst);
       });
     }
 
@@ -1409,6 +1413,8 @@ struct TageAhead : predictor {
       // pred_ram: alloc writes actual_dir, update writes actual_dir → same
       // data. Gated on hyst-only weakness (t_phw), not newly-alloc (t_pw). A
       // useful entry (u>0) with weak hyst that's wrong should still flip.
+      // Silent: do_pred_update already requires table_wrong (pred != actual),
+      // so non-alloc writes only fire when value changes.
       val<1> do_pred_update = t_m1[I] & t_phw & table_wrong;
       // NOTE: @prakhar @claude validate hardcoded fanout
       val<1> gate_pred = do_train & (do_alloc | do_pred_update.fo1());
@@ -1475,7 +1481,9 @@ struct TageAhead : predictor {
           U_MISP == UMispPolicy::DECREMENT || U_CLEAR == UClearPolicy::DECREMENT;
       // u_inc: ==maxval(1) + select_true(1) + +1(1) = 3
       // u_dec: ==0(1) + select_true(1) + -1(1) = 3
-      old_u.fanout(hard<3 + (NEED_DEC ? 3 : 0)>{});
+      // u_inc: ==maxval(1)+select(1)++1(1)=3; u_dec: ==0(1)+select(1)+-1(1)=3
+      // +1 for silent update check (base_newu != old_u) in non-decay path
+      old_u.fanout(hard<3 + (NEED_DEC ? 3 : 0) + (DECAY_ENABLE ? 0 : 1)>{});
       auto u_inc = select(old_u == hard<old_u.maxval>{}, old_u,
                           val<U_WIDTH>{old_u + 1});
       auto u_dec = [&]() {
@@ -1517,13 +1525,15 @@ struct TageAhead : predictor {
       }();
       val<1> base_u_write = (u_correct | u_wrong) | allocate[I] | uclear[I];
       base_u_write.fanout(
-          hard<2>{}); // !DECAY: pair(1); DECAY: select(1)+merged_write(1)
+          hard<2>{}); // !DECAY: changed(1); DECAY: select(1)+merged_write(1)
 
-      // Probabilistic decay: on tag/sec miss, LFSR < threshold → decay u
+      // Probabilistic decay: on tag/sec miss, random < threshold → decay u
+      // Silent update elimination: only write when new != old (both paths).
       auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
         if constexpr (!DECAY_ENABLE) {
-          return {std::move(base_newu),
-                  base_u_write}; // move: fo1 path (credit >= 0 ok)
+          base_newu.fanout(hard<2>{}); // != old_u (1) + return (1)
+          val<1> base_changed = base_newu != old_u;
+          return {base_newu, base_u_write & base_changed};
         } else {
           constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
 
