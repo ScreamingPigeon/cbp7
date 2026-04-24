@@ -457,87 +457,36 @@ int main(int argc, char **argv) {
   }
   std::cout << std::endl;
 
-  // 7. Secondary tag hash evaluation
-  // For each predecessor, evaluate candidate hash functions on raw next_pc.
-  // Metric: for each hash, what fraction of transitions land on the dominant
-  // successor per hash bucket? Higher = better discrimination.
-  // A perfect hash maps each unique successor to a unique bucket.
+  // 7. Secondary tag hash evaluation — systematic sweep by width
+  // For each width W (1..6 bits), test:
+  //   a) All contiguous bit slices PC[lo+W-1:lo] (lo starts at bit 2)
+  //   b) XOR folds: PC[lo+W-1:lo] ^ PC[lo2+W-1:lo2] for non-overlapping pairs
+  // Metric: weighted coverage among multi-successor predecessors.
   {
     struct HashFn {
-      const char *name;
+      std::string name;
       uint64_t bits;
       std::function<uint64_t(uint64_t)> fn;
     };
-    std::vector<HashFn> hashes = {
-      {"PC[2]       (1b)", 1, [](uint64_t pc) { return (pc >> 2) & 0x1; }},
-      {"PC[3:2]     (2b)", 2, [](uint64_t pc) { return (pc >> 2) & 0x3; }},
-      {"PC[4:2]     (3b)", 3, [](uint64_t pc) { return (pc >> 2) & 0x7; }},
-      {"PC[5:2]     (4b)", 4, [](uint64_t pc) { return (pc >> 2) & 0xF; }},
-      {"PC[7:2]     (6b)", 6, [](uint64_t pc) { return (pc >> 2) & 0x3F; }},
-      {"PC[4:2]^[7:5] (3b)", 3, [](uint64_t pc) {
-        return ((pc >> 2) ^ (pc >> 5)) & 0x7;
-      }},
-      {"PC[4:2]^[10:8](3b)", 3, [](uint64_t pc) {
-        return ((pc >> 2) ^ (pc >> 8)) & 0x7;
-      }},
-      {"PC[4:2]^[13:11](3b)", 3, [](uint64_t pc) {
-        return ((pc >> 2) ^ (pc >> 11)) & 0x7;
-      }},
-      {"PC[5:2]^[9:6] (4b)", 4, [](uint64_t pc) {
-        return ((pc >> 2) ^ (pc >> 6)) & 0xF;
-      }},
-      {"PC[7:2]^[13:8](6b)", 6, [](uint64_t pc) {
-        return ((pc >> 2) ^ (pc >> 8)) & 0x3F;
-      }},
+
+    // Evaluate a hash function across all predecessors
+    struct HashResult {
+      std::string name;
+      uint64_t bits;
+      double coverage_all;   // % over all transitions
+      double coverage_multi; // % over multi-successor transitions
+      double collision_rate; // % collisions among multi-successor
     };
 
-    std::cout << "--- 7. Secondary tag hash evaluation ---" << std::endl;
-    std::cout << "  Metric: weighted coverage = fraction of transitions where" << std::endl;
-    std::cout << "  the hash bucket's dominant successor matches the actual." << std::endl;
-    std::cout << "  (Higher = better discrimination. 100% = perfect hash.)" << std::endl;
-    std::cout << std::endl;
-
-    // For predecessors with >1 unique successor (the interesting case)
-    uint64_t all_transitions = 0;
-    uint64_t multi_succ_preds = 0;
-    uint64_t multi_succ_transitions = 0;
-    for (auto &[pred, entry] : predecessor_map) {
-      all_transitions += entry.total;
-      if (entry.raw_successors.size() > 1) {
-        multi_succ_preds++;
-        multi_succ_transitions += entry.total;
-      }
-    }
-    std::cout << "  Predecessors with >1 successor: " << multi_succ_preds
-              << " (" << std::setprecision(1)
-              << 100.0 * multi_succ_preds / predecessor_map.size()
-              << "% of all)" << std::endl;
-    std::cout << "  Transitions from multi-succ preds: " << multi_succ_transitions
-              << std::endl << std::endl;
-
-    std::cout << std::setw(25) << "Hash"
-              << std::setw(12) << "Coverage"
-              << std::setw(12) << "MultiCov"
-              << std::setw(12) << "Collisions"
-              << std::endl;
-    std::cout << std::setw(25) << ""
-              << std::setw(12) << "(all)"
-              << std::setw(12) << "(multi)"
-              << std::setw(12) << "(multi)"
-              << std::endl;
-    std::cout << "  " << std::string(57, '-') << std::endl;
-
-    for (auto &h : hashes) {
+    auto evaluate_hash = [&](const HashFn &h) -> HashResult {
       uint64_t covered_all = 0, total_all = 0;
       uint64_t covered_multi = 0, total_multi = 0;
-      uint64_t collisions = 0; // cases where 2+ successors map to same bucket
+      uint64_t collisions = 0;
 
       for (auto &[pred, entry] : predecessor_map) {
-        // bucket → {successor → count}
         std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> buckets;
         for (auto &[next_pc, count] : entry.raw_successors) {
-          uint64_t bucket = h.fn(next_pc);
-          buckets[bucket][next_pc] += count;
+          buckets[h.fn(next_pc)][next_pc] += count;
         }
 
         uint64_t pred_covered = 0;
@@ -562,46 +511,117 @@ int main(int argc, char **argv) {
         }
       }
 
-      std::cout << std::setw(25) << h.name
-                << std::setw(10) << std::setprecision(2)
-                << 100.0 * covered_all / total_all << "%"
-                << std::setw(10) << std::setprecision(2)
-                << 100.0 * covered_multi / total_multi << "%"
-                << std::setw(10) << std::setprecision(2)
-                << 100.0 * collisions / total_multi << "%"
-                << std::endl;
-    }
+      return {h.name, h.bits,
+              100.0 * covered_all / std::max(total_all, uint64_t(1)),
+              100.0 * covered_multi / std::max(total_multi, uint64_t(1)),
+              100.0 * collisions / std::max(total_multi, uint64_t(1))};
+    };
+
+    std::cout << "--- 7. Secondary tag hash evaluation (systematic sweep) ---" << std::endl;
+    std::cout << "  Metric: coverage = fraction of transitions where hash bucket's" << std::endl;
+    std::cout << "  dominant successor matches actual. Higher = better." << std::endl;
+    std::cout << "  PC bits numbered from LSB; bit 0,1 always zero (4-byte aligned)." << std::endl;
     std::cout << std::endl;
 
-    // Per-successor-count breakdown for the best candidates
-    std::cout << "  Breakdown by #successors (using PC[4:2], 3b):" << std::endl;
-    auto &ref_hash = hashes[2]; // PC[4:2]
-    std::map<uint64_t, std::pair<uint64_t, uint64_t>> by_nsucc; // nsucc → (covered, total)
+    // Stats
+    uint64_t all_transitions = 0;
+    uint64_t multi_succ_preds = 0;
+    uint64_t multi_succ_transitions = 0;
     for (auto &[pred, entry] : predecessor_map) {
-      uint64_t nsucc = entry.raw_successors.size();
-      std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> buckets;
-      for (auto &[next_pc, count] : entry.raw_successors) {
-        buckets[ref_hash.fn(next_pc)][next_pc] += count;
+      all_transitions += entry.total;
+      if (entry.raw_successors.size() > 1) {
+        multi_succ_preds++;
+        multi_succ_transitions += entry.total;
       }
-      uint64_t pred_covered = 0;
-      for (auto &[bucket, succs] : buckets) {
-        uint64_t max_count = 0;
-        for (auto &[succ, count] : succs)
-          max_count = std::max(max_count, count);
-        pred_covered += max_count;
+    }
+    std::cout << "  Predecessors with >1 successor: " << multi_succ_preds
+              << " (" << std::setprecision(1)
+              << 100.0 * multi_succ_preds / predecessor_map.size()
+              << "% of all)" << std::endl;
+    std::cout << "  Transitions from multi-succ preds: " << multi_succ_transitions
+              << std::endl << std::endl;
+
+    // Sweep each width
+    for (uint64_t W = 1; W <= 6; W++) {
+      uint64_t mask = (uint64_t(1) << W) - 1;
+      std::vector<HashResult> results;
+
+      // a) Contiguous slices: PC[lo+W-1:lo] for lo = 2..20
+      for (uint64_t lo = 2; lo <= 20; lo++) {
+        std::string name = "PC[" + std::to_string(lo + W - 1) + ":" + std::to_string(lo) + "]";
+        HashFn h{name, W, [lo, mask](uint64_t pc) { return (pc >> lo) & mask; }};
+        results.push_back(evaluate_hash(h));
       }
-      by_nsucc[nsucc].first += pred_covered;
-      by_nsucc[nsucc].second += entry.total;
+
+      // b) XOR folds: PC[a+W-1:a] ^ PC[b+W-1:b], non-overlapping, a < b
+      //    a starts at 2 (skip constant bits), b starts at a+W
+      for (uint64_t a = 2; a <= 14; a++) {
+        for (uint64_t b = a + W; b <= 20; b++) {
+          std::string name = "PC[" + std::to_string(a + W - 1) + ":" + std::to_string(a) +
+                             "]^[" + std::to_string(b + W - 1) + ":" + std::to_string(b) + "]";
+          HashFn h{name, W, [a, b, mask](uint64_t pc) {
+            return ((pc >> a) ^ (pc >> b)) & mask;
+          }};
+          results.push_back(evaluate_hash(h));
+        }
+      }
+
+      // c) 3-way XOR: PC[a]^[b]^[c], non-overlapping
+      if (W <= 4) {
+        for (uint64_t a = 2; a <= 10; a++) {
+          for (uint64_t b = a + W; b <= 14; b++) {
+            for (uint64_t c = b + W; c <= 20; c++) {
+              std::string name = "PC[" + std::to_string(a + W - 1) + ":" + std::to_string(a) +
+                                 "]^[" + std::to_string(b + W - 1) + ":" + std::to_string(b) +
+                                 "]^[" + std::to_string(c + W - 1) + ":" + std::to_string(c) + "]";
+              HashFn h{name, W, [a, b, c, mask](uint64_t pc) {
+                return ((pc >> a) ^ (pc >> b) ^ (pc >> c)) & mask;
+              }};
+              results.push_back(evaluate_hash(h));
+            }
+          }
+        }
+      }
+
+      // Sort by multi-successor coverage (descending)
+      std::sort(results.begin(), results.end(),
+                [](auto &a, auto &b) { return a.coverage_multi > b.coverage_multi; });
+
+      std::cout << "  === Width " << W << " bit" << (W > 1 ? "s" : "") << " ("
+                << (uint64_t(1) << W) << " buckets, " << results.size()
+                << " candidates) ===" << std::endl;
+      std::cout << std::setw(30) << "Hash"
+                << std::setw(10) << "AllCov"
+                << std::setw(10) << "MultiCov"
+                << std::setw(10) << "Collide"
+                << std::endl;
+      std::cout << "  " << std::string(56, '-') << std::endl;
+
+      // Show top 10 and bottom 3
+      uint64_t show_top = std::min(uint64_t(10), (uint64_t)results.size());
+      uint64_t show_bot = std::min(uint64_t(3), (uint64_t)results.size());
+      for (uint64_t i = 0; i < show_top; i++) {
+        auto &r = results[i];
+        std::cout << std::setw(30) << r.name
+                  << std::setw(8) << std::setprecision(2) << r.coverage_all << "%"
+                  << std::setw(8) << std::setprecision(2) << r.coverage_multi << "%"
+                  << std::setw(8) << std::setprecision(2) << r.collision_rate << "%"
+                  << std::endl;
+      }
+      if (results.size() > show_top + show_bot) {
+        std::cout << std::setw(30) << "..." << std::endl;
+      }
+      for (uint64_t i = std::max(show_top, (uint64_t)results.size() - show_bot);
+           i < results.size(); i++) {
+        auto &r = results[i];
+        std::cout << std::setw(30) << r.name
+                  << std::setw(8) << std::setprecision(2) << r.coverage_all << "%"
+                  << std::setw(8) << std::setprecision(2) << r.coverage_multi << "%"
+                  << std::setw(8) << std::setprecision(2) << r.collision_rate << "%"
+                  << std::endl;
+      }
+      std::cout << std::endl;
     }
-    std::cout << std::setw(10) << "#succs" << std::setw(10) << "preds"
-              << std::setw(12) << "coverage" << std::endl;
-    for (auto &[ns, cv] : by_nsucc) {
-      if (cv.second < all_transitions / 1000) continue; // skip tiny buckets
-      std::cout << std::setw(10) << ns << std::setw(10) << cv.second
-                << std::setw(10) << std::setprecision(2)
-                << 100.0 * cv.first / cv.second << "%" << std::endl;
-    }
-    std::cout << std::endl;
   }
 
   // 8. Hot branches (top 20)

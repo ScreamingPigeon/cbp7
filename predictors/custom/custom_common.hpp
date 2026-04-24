@@ -9,60 +9,56 @@ using namespace hcm;
 // update_ctr — saturating up-down counter
 // ============================================================================
 
-template<u64 N, typename T>
-[[nodiscard]] val<N,T> ta_update_ctr(val<N,T> ctr, val<1> incr)
-{
-    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
-    // 6 reads: ==maxval, ==minval, +1, -1, select(ctr), select(ctr)
-    ctr.fanout(hard<6>{});
-    val<N,T> incsat = select(ctr==hard<ctr.maxval>{},ctr,val<N,T>{ctr+1});
-    val<N,T> decsat = select(ctr==hard<ctr.minval>{},ctr,val<N,T>{ctr-1});
-    return select(incr.fo1(),incsat.fo1(),decsat.fo1());
+template <u64 N, typename T>
+[[nodiscard]] val<N, T> ta_update_ctr(val<N, T> ctr, val<1> incr) {
+  // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+  // 6 reads: ==maxval, ==minval, +1, -1, select(ctr), select(ctr)
+  ctr.fanout(hard<6>{});
+  val<N, T> incsat = select(ctr == hard<ctr.maxval>{}, ctr, val<N, T>{ctr + 1});
+  val<N, T> decsat = select(ctr == hard<ctr.minval>{}, ctr, val<N, T>{ctr - 1});
+  return select(incr.fo1(), incsat.fo1(), decsat.fo1());
 }
 
 // ============================================================================
 // ta_global_history — shift register updated by XOR with branch bits
 // ============================================================================
 
-template<u64 N>
-struct ta_global_history {
-    arr<reg<1>,N> h;
+template <u64 N> struct ta_global_history {
+  arr<reg<1>, N> h;
 
-    void update(valtype auto in)
-    {
-        auto input = in.fo1().make_array(val<1>{});
-        static_assert(input.size<=N);
-        for (u64 i=N-1; i>=input.size; i--) h[i] = h[i-1];
-        for (u64 i=input.size-1; i>=1; i--) h[i] = h[i-1] ^ input[i].fo1();
-        h[0] = input[0].fo1();
-    }
+  void update(valtype auto in) {
+    auto input = in.fo1().make_array(val<1>{});
+    static_assert(input.size <= N);
+    for (u64 i = N - 1; i >= input.size; i--)
+      h[i] = h[i - 1];
+    for (u64 i = input.size - 1; i >= 1; i--)
+      h[i] = h[i - 1] ^ input[i].fo1();
+    h[0] = input[0].fo1();
+  }
 
-    // Unconditional write with enable mux — avoids execute_if gate timing.
-    // When enable=1: shift and XOR in new input (normal update).
-    // When enable=0: hold current state (registers still written, mux selects old value).
-    void update(valtype auto in, val<1> enable)
-    {
-        auto input = in.fo1().make_array(val<1>{});
-        static_assert(input.size<=N);
-        enable.fanout(hard<N>{});
-        for (u64 i=N-1; i>=input.size; i--)
-            h[i] = select(enable, h[i-1], h[i]);
-        for (u64 i=input.size-1; i>=1; i--)
-            h[i] = select(enable, h[i-1] ^ input[i].fo1(), h[i]);
-        h[0] = select(enable, input[0].fo1(), h[0]);
-    }
+  // Unconditional write with enable mux — avoids execute_if gate timing.
+  // When enable=1: shift and XOR in new input (normal update).
+  // When enable=0: hold current state (registers still written, mux selects old
+  // value).
+  void update(valtype auto in, val<1> enable) {
+    auto input = in.fo1().make_array(val<1>{});
+    static_assert(input.size <= N);
+    enable.fanout(hard<N>{});
+    for (u64 i = N - 1; i >= input.size; i--)
+      h[i] = select(enable, h[i - 1], h[i]);
+    for (u64 i = input.size - 1; i >= 1; i--)
+      h[i] = select(enable, h[i - 1] ^ input[i].fo1(), h[i]);
+    h[0] = select(enable, input[0].fo1(), h[0]);
+  }
 
-    val<1>& operator[] (u64 i) { return h[i]; }
-    void fanout(hardval auto fo) { h.fanout(fo); }
+  val<1> &operator[](u64 i) { return h[i]; }
+  void fanout(hardval auto fo) { h.fanout(fo); }
 
-    // Per-bit fanout: set each bit's fanout from a constexpr array
-    template <auto const &FO_ARRAY>
-    void fanout_per_bit() {
-      static_assert(FO_ARRAY.size() == N);
-      static_loop<N>([&]<u64 I>() {
-        h[I].fanout(hard<FO_ARRAY[I]>{});
-      });
-    }
+  // Per-bit fanout: set each bit's fanout from a constexpr array
+  template <auto const &FO_ARRAY> void fanout_per_bit() {
+    static_assert(FO_ARRAY.size() == N);
+    static_loop<N>([&]<u64 I>() { h[I].fanout(hard<FO_ARRAY[I]>{}); });
+  }
 };
 
 // ============================================================================
@@ -77,54 +73,54 @@ struct ta_global_history {
 // timing from additive to max(fold_computation, gate_signal).
 // ============================================================================
 
-template<u64 F>
-struct ta_folded_gh {
-    static_assert(F!=0);
+template <u64 F> struct ta_folded_gh {
+  static_assert(F != 0);
 
-    reg<F> folded;
+  reg<F> folded;
 
-    val<F> get() { return folded; }
-    void fanout(hardval auto fo) { folded.fanout(fo); }
+  val<F> get() { return folded; }
+  void fanout(hardval auto fo) { folded.fanout(fo); }
 
-    // Compute new fold value without writing the register
-    template<u64 MAXL>
-    [[nodiscard]] inline val<F> compute_update(ta_global_history<MAXL> &gh, hardval auto ghlen, valtype auto in)
-    {
-        constexpr u64 inbits = std::min(F,std::min(in.size,ghlen.value));
-        val<inbits> input = in.fo1();
-        auto f = folded.make_array(val<1>{});
-        static_assert(f.size==F);
-        val<1> outbit = gh[ghlen-1];
-        u64 outpos = ghlen % F;
-        arr<val<1>,F> ff = [&](u64 i){
-            if (i==0) return (outpos==0)? f[F-1].fo1()^outbit.fo1() : f[F-1].fo1();
-            else return (outpos==i)? f[i-1].fo1()^outbit.fo1() : f[i-1].fo1();
-        };
-        auto x = input.fo1().make_array(val<1>{});
-        arr<val<1>,F> y = [&](u64 i){return (i<x.size)? x[i].fo1()^ff[i].fo1() : ff[i].fo1();};
-        return y.fo1().concat();
-    }
+  // Compute new fold value without writing the register
+  template <u64 MAXL>
+  [[nodiscard]] inline val<F> compute_update(ta_global_history<MAXL> &gh,
+                                             hardval auto ghlen,
+                                             valtype auto in) {
+    constexpr u64 inbits = std::min(F, std::min(in.size, ghlen.value));
+    val<inbits> input = in.fo1();
+    auto f = folded.make_array(val<1>{});
+    static_assert(f.size == F);
+    val<1> outbit = gh[ghlen - 1];
+    u64 outpos = ghlen % F;
+    arr<val<1>, F> ff = [&](u64 i) {
+      if (i == 0)
+        return (outpos == 0) ? f[F - 1].fo1() ^ outbit.fo1() : f[F - 1].fo1();
+      else
+        return (outpos == i) ? f[i - 1].fo1() ^ outbit.fo1() : f[i - 1].fo1();
+    };
+    auto x = input.fo1().make_array(val<1>{});
+    arr<val<1>, F> y = [&](u64 i) {
+      return (i < x.size) ? x[i].fo1() ^ ff[i].fo1() : ff[i].fo1();
+    };
+    return y.fo1().concat();
+  }
 
-    // Write a precomputed fold value into the register
-    void apply_update(val<F> new_val)
-    {
-        folded = new_val.fo1();
-    }
+  // Write a precomputed fold value into the register
+  void apply_update(val<F> new_val) { folded = new_val.fo1(); }
 
-    // Unconditional write with enable mux — avoids execute_if gate timing.
-    // When enable=1: write new_val. When enable=0: hold current value.
-    void apply_update(val<F> new_val, val<1> enable)
-    {
-        folded.fanout(hard<2>{}); // hold-value read in select below (single use)
-        folded = select(enable.fo1(), new_val.fo1(), folded);
-    }
+  // Unconditional write with enable mux — avoids execute_if gate timing.
+  // When enable=1: write new_val. When enable=0: hold current value.
+  void apply_update(val<F> new_val, val<1> enable) {
+    folded.fanout(hard<2>{}); // hold-value read in select below (single use)
+    folded = select(enable.fo1(), new_val.fo1(), folded);
+  }
 
-    // Combined compute + apply (convenience, same as original folded_gh::update)
-    template<u64 MAXL>
-    void update(ta_global_history<MAXL> &gh, hardval auto ghlen, valtype auto in)
-    {
-        apply_update(compute_update(gh, ghlen, in));
-    }
+  // Combined compute + apply (convenience, same as original folded_gh::update)
+  template <u64 MAXL>
+  void update(ta_global_history<MAXL> &gh, hardval auto ghlen,
+              valtype auto in) {
+    apply_update(compute_update(gh, ghlen, in));
+  }
 };
 
 // ============================================================================
@@ -135,6 +131,8 @@ enum class HistUpdate { PATH, DIR, BOTH };
 enum class DecayMiss { TAG, SEC, TAG_OR_SEC, TAG_AND_SEC };
 enum class DecayOp { DECREMENT, HALVE, CLEAR };
 enum class SiblingPolicy { NONE, ALL };
+// What happens to u-bit when provider mispredicts
+enum class UMispPolicy { UNTOUCHED, ZERO, DECREMENT };
 
 // ============================================================================
 // geometric_folds_ex — geometric_folds with templated update mode
@@ -145,8 +143,7 @@ enum class SiblingPolicy { NONE, ALL };
 //   update<BOTH>(dir_bit, path_bits)   — fold in concat(dir, path)
 // ============================================================================
 
-template<u64 NH, u64 MINH, u64 MAXH, u64... FOLDS>
-struct geometric_folds_ex {
+template <u64 NH, u64 MINH, u64 MAXH, u64... FOLDS> struct geometric_folds_ex {
   static_assert(NH >= 2);
   static constexpr u64 NF = sizeof...(FOLDS);
 
@@ -167,8 +164,7 @@ struct geometric_folds_ex {
   ta_global_history<MAXH> gh;
   std::array<std::tuple<ta_folded_gh<FOLDS>...>, NH> folds;
 
-  template<u64 J = 0>
-  auto get(u64 i) {
+  template <u64 J = 0> auto get(u64 i) {
     if (i >= NH) {
       std::cerr << "geometric_folds_ex: out of bound access\n";
       std::terminate();
@@ -178,9 +174,7 @@ struct geometric_folds_ex {
 
   void fanout(hardval auto fo) {
     for (u64 i = 0; i < NH; i++) {
-      static_loop<NF>([&]<u64 J>() {
-        std::get<J>(folds[i]).fanout(fo);
-      });
+      static_loop<NF>([&]<u64 J>() { std::get<J>(folds[i]).fanout(fo); });
     }
   }
 
@@ -197,25 +191,25 @@ struct geometric_folds_ex {
   }
 
   // update<PATH>(path_bits) — path only
-  template<HistUpdate M>
+  template <HistUpdate M>
   void update(valtype auto path_bits)
-    requires (M == HistUpdate::PATH)
+    requires(M == HistUpdate::PATH)
   {
     do_update(path_bits);
   }
 
   // update<DIR>(dir_bit) — direction only (1-bit)
-  template<HistUpdate M>
+  template <HistUpdate M>
   void update(val<1> dir_bit)
-    requires (M == HistUpdate::DIR)
+    requires(M == HistUpdate::DIR)
   {
     do_update(dir_bit);
   }
 
   // update<BOTH>(dir_bit, path_bits) — concat(dir, path)
-  template<HistUpdate M>
+  template <HistUpdate M>
   void update(val<1> dir_bit, valtype auto path_bits)
-    requires (M == HistUpdate::BOTH)
+    requires(M == HistUpdate::BOTH)
   {
     do_update(concat(dir_bit, path_bits));
   }
@@ -230,7 +224,8 @@ namespace ta {
 template <typename T, std::size_t N>
 constexpr std::array<T, N> uniform_array(T v) {
   std::array<T, N> a{};
-  for (std::size_t i = 0; i < N; i++) a[i] = v;
+  for (std::size_t i = 0; i < N; i++)
+    a[i] = v;
   return a;
 }
 
@@ -238,27 +233,33 @@ constexpr std::array<T, N> uniform_array(T v) {
 template <typename T, std::size_t N>
 constexpr std::array<T, N> split_array(T v_lo, T v_hi, std::size_t split) {
   std::array<T, N> a{};
-  for (std::size_t i = 0; i < N; i++) a[i] = (i < split) ? v_lo : v_hi;
+  for (std::size_t i = 0; i < N; i++)
+    a[i] = (i < split) ? v_lo : v_hi;
   return a;
 }
 
 constexpr u64 clog2(u64 x) {
   u64 r = 0, v = x - 1;
-  while (v > 0) { v >>= 1; r++; }
+  while (v > 0) {
+    v >>= 1;
+    r++;
+  }
   return r;
 }
 
 template <typename T, std::size_t N>
 constexpr T array_max(const std::array<T, N> &a) {
   T m = a[0];
-  for (std::size_t i = 1; i < N; i++) m = (a[i] > m) ? a[i] : m;
+  for (std::size_t i = 1; i < N; i++)
+    m = (a[i] > m) ? a[i] : m;
   return m;
 }
 
 template <typename T, std::size_t N>
 constexpr T array_min(const std::array<T, N> &a) {
   T m = a[0];
-  for (std::size_t i = 1; i < N; i++) m = (a[i] < m) ? a[i] : m;
+  for (std::size_t i = 1; i < N; i++)
+    m = (a[i] < m) ? a[i] : m;
   return m;
 }
 
@@ -270,7 +271,8 @@ template <std::size_t MAXHIST, std::size_t NT, auto const &HIST_LEN>
 constexpr std::array<u64, MAXHIST> gh_per_bit_fanout() {
   std::array<u64, MAXHIST> fo{};
   // Base: each bit is read by update() for shift (h[i-1]) and mux hold (h[i])
-  for (std::size_t i = 0; i < MAXHIST; i++) fo[i] = 3;
+  for (std::size_t i = 0; i < MAXHIST; i++)
+    fo[i] = 3;
   for (std::size_t t = 0; t < NT; t++) {
     u64 bit = HIST_LEN[t] - 1;
     fo[bit] += 2; // fold_idx + fold_tag read the outgoing bit
@@ -279,8 +281,10 @@ constexpr std::array<u64, MAXHIST> gh_per_bit_fanout() {
 }
 
 constexpr double constexpr_pow(double base, double exp) {
-  if (exp == 0.0) return 1.0;
-  if (base == 0.0) return 0.0;
+  if (exp == 0.0)
+    return 1.0;
+  if (base == 0.0)
+    return 0.0;
   return std::exp(exp * std::log(base));
 }
 
@@ -298,7 +302,8 @@ constexpr std::array<u64, N> geometric_hist(u64 min_h, u64 max_h) {
   double ratio = static_cast<double>(max_h) / static_cast<double>(min_h);
   for (std::size_t i = 0; i < N; i++) {
     double e = static_cast<double>(i) / static_cast<double>(N - 1);
-    u64 hl = static_cast<u64>(static_cast<double>(min_h) * constexpr_pow(ratio, e));
+    u64 hl =
+        static_cast<u64>(static_cast<double>(min_h) * constexpr_pow(ratio, e));
     hl = (hl > prev + 1) ? hl : prev + 1;
     h[N - 1 - i] = hl;
     prev = hl;
@@ -307,7 +312,8 @@ constexpr std::array<u64, N> geometric_hist(u64 min_h, u64 max_h) {
 }
 
 template <std::size_t N>
-constexpr std::array<u64, N> quadratic_hist(u64 minh, u64 maxh, u64 d = 2, u64 k = 1) {
+constexpr std::array<u64, N> quadratic_hist(u64 minh, u64 maxh, u64 d = 2,
+                                            u64 k = 1) {
   std::array<u64, N> h{};
   h[0] = minh;
   for (std::size_t n = 1; n < N; n++)
@@ -315,12 +321,16 @@ constexpr std::array<u64, N> quadratic_hist(u64 minh, u64 maxh, u64 d = 2, u64 k
   double raw_max = h[N - 1], raw_min = h[0];
   u64 prev = 0;
   for (std::size_t n = 0; n < N; n++) {
-    double t = (raw_max > raw_min) ? (double(h[n]) - raw_min) / (raw_max - raw_min) : 0.0;
+    double t = (raw_max > raw_min)
+                   ? (double(h[n]) - raw_min) / (raw_max - raw_min)
+                   : 0.0;
     u64 scaled = minh + u64(t * (maxh - minh));
     scaled = (scaled > prev + 1 || n == 0) ? scaled : prev + 1;
-    h[n] = scaled; prev = scaled;
+    h[n] = scaled;
+    prev = scaled;
   }
-  for (std::size_t i = 0; i < N / 2; i++) std::swap(h[i], h[N - 1 - i]);
+  for (std::size_t i = 0; i < N / 2; i++)
+    std::swap(h[i], h[N - 1 - i]);
   return h;
 }
 
@@ -333,7 +343,8 @@ constexpr std::array<u64, N> superexp_hist(u64 h0, double f, double m) {
     u64 next = u64(double(h[n - 1]) * mult + 0.5);
     h[n] = (next > h[n - 1] + 1) ? next : h[n - 1] + 1;
   }
-  for (std::size_t i = 0; i < N / 2; i++) std::swap(h[i], h[N - 1 - i]);
+  for (std::size_t i = 0; i < N / 2; i++)
+    std::swap(h[i], h[N - 1 - i]);
   return h;
 }
 
@@ -355,12 +366,16 @@ constexpr std::array<u64, N> ros_hist(u64 minh, u64 maxh, u64 d = 2, u64 k = 1,
   double raw_max = h[N - 1], raw_min = h[0];
   u64 prev = 0;
   for (std::size_t n = 0; n < N; n++) {
-    double t_val = (raw_max > raw_min) ? (double(h[n]) - raw_min) / (raw_max - raw_min) : 0.0;
+    double t_val = (raw_max > raw_min)
+                       ? (double(h[n]) - raw_min) / (raw_max - raw_min)
+                       : 0.0;
     u64 scaled = minh + u64(t_val * (maxh - minh));
     scaled = (scaled > prev + 1 || n == 0) ? scaled : prev + 1;
-    h[n] = scaled; prev = scaled;
+    h[n] = scaled;
+    prev = scaled;
   }
-  for (std::size_t i = 0; i < N / 2; i++) std::swap(h[i], h[N - 1 - i]);
+  for (std::size_t i = 0; i < N / 2; i++)
+    std::swap(h[i], h[N - 1 - i]);
   return h;
 }
 
@@ -374,7 +389,8 @@ template <u64 TAG> struct UniformTag {
 
 template <u64 TAG_LONG, u64 TAG_SHORT> struct GradedTag {
   constexpr u64 operator()(u64 i, u64 n) const {
-    if (n <= 1) return TAG_LONG;
+    if (n <= 1)
+      return TAG_LONG;
     return TAG_LONG - (TAG_LONG - TAG_SHORT) * i / (n - 1);
   }
 };
@@ -395,7 +411,8 @@ template <u64 BASE, u64 SCALE> struct LogTag {
 template <u64 N, typename TagFn>
 constexpr std::array<u64, N> generate_tag_widths(TagFn fn) {
   std::array<u64, N> t{};
-  for (u64 i = 0; i < N; i++) t[i] = fn(i, N);
+  for (u64 i = 0; i < N; i++)
+    t[i] = fn(i, N);
   return t;
 }
 
@@ -409,24 +426,28 @@ template <u64 SIZE> struct UniformSize {
 
 template <u64 SIZE, u64 RATIO> struct GeoSize {
   constexpr u64 operator()(u64 i, u64 n) const {
-    if (RATIO <= 1 || n <= 1) return SIZE;
+    if (RATIO <= 1 || n <= 1)
+      return SIZE;
     double t = double(i) / double(n - 1);
     double scale = constexpr_pow(double(RATIO), t - 0.5);
     u64 sz = u64(SIZE * scale);
     u64 result = 64;
-    while (result < sz) result *= 2;
+    while (result < sz)
+      result *= 2;
     return result;
   }
 };
 
 template <u64 SIZE, u64 RATIO> struct InvGeoSize {
   constexpr u64 operator()(u64 i, u64 n) const {
-    if (RATIO <= 1 || n <= 1) return SIZE;
+    if (RATIO <= 1 || n <= 1)
+      return SIZE;
     double t = double(n - 1 - i) / double(n - 1);
     double scale = constexpr_pow(double(RATIO), t - 0.5);
     u64 sz = u64(SIZE * scale);
     u64 result = 64;
-    while (result < sz) result *= 2;
+    while (result < sz)
+      result *= 2;
     return result;
   }
 };
@@ -439,11 +460,13 @@ template <u64 S_HI, u64 S_LO, u64 SPLIT> struct StepSize {
 
 template <u64 BASE_SIZE> struct SqrtHistSize {
   constexpr u64 operator()(u64 i, u64 n) const {
-    if (n <= 1) return BASE_SIZE;
+    if (n <= 1)
+      return BASE_SIZE;
     double scale = constexpr_pow(double(n - 1 - i + 1), 0.5);
     u64 sz = u64(BASE_SIZE * scale);
     u64 result = 64;
-    while (result < sz) result *= 2;
+    while (result < sz)
+      result *= 2;
     return result;
   }
 };
@@ -454,7 +477,8 @@ struct ConstBitsSize {
     u64 entry_bits = TAG + CTR + HYST + U;
     u64 entries = TOTAL_BITS / entry_bits;
     u64 result = 64;
-    while (result * 2 <= entries) result *= 2;
+    while (result * 2 <= entries)
+      result *= 2;
     return result;
   }
 };
@@ -462,7 +486,8 @@ struct ConstBitsSize {
 template <std::size_t N, typename SizeFn>
 constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
   std::array<u64, N> s{};
-  for (std::size_t i = 0; i < N; i++) s[i] = fn(i, N);
+  for (std::size_t i = 0; i < N; i++)
+    s[i] = fn(i, N);
   return s;
 }
 
@@ -472,8 +497,7 @@ constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
 
 // Generate a tuple of reg<W> with per-element widths from a constexpr array.
 // Usage: TALfsrTuple<LFSR_WIDTHS, std::make_index_sequence<NT>>::type
-template <auto const &Widths, typename Seq>
-struct TALfsrTuple;
+template <auto const &Widths, typename Seq> struct TALfsrTuple;
 
 template <auto const &Widths, u64... Is>
 struct TALfsrTuple<Widths, std::index_sequence<Is...>> {
@@ -501,20 +525,28 @@ struct DefaultEpochTrigger {
 
 // Default sec_tag hash: extract bits [2+SEC_TAG_BITS-1 : 2] from PC.
 struct DefaultSecTagHash {
-  template <u64 SEC_TAG_BITS>
-  static val<SEC_TAG_BITS> apply(val<64> pc) {
+  template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {
     // pc is a by-value copy (read_credit=0); use fo1() for the single read
     return val<SEC_TAG_BITS>{pc.fo1() >> 2};
   }
 };
 
+// PC[5:2] ^ PC[11:8] ^ PC[16:13]  — best 4-bit hash from block analyzer
+struct Xor3SecTagHash {
+  template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {
+    static_assert(SEC_TAG_BITS == 4, "Xor3SecTagHash is tuned for 4-bit sec_tag");
+    pc.fanout(hard<3>{});
+    return val<4>{pc >> 2} ^ val<4>{pc >> 8} ^ val<4>{pc >> 13};
+  }
+};
+
 // XOR-folded sec_tag hash: XOR two non-overlapping bit slices of PC.
 struct XorSecTagHash {
-  template <u64 SEC_TAG_BITS>
-  static val<SEC_TAG_BITS> apply(val<64> pc) {
+  template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {
     // pc is a by-value copy (read_credit=0); two reads — declare fanout
     pc.fanout(hard<2>{});
-    return val<SEC_TAG_BITS>{pc >> 2} ^ val<SEC_TAG_BITS>{pc >> (2 + SEC_TAG_BITS)};
+    return val<SEC_TAG_BITS>{pc >> 2} ^
+           val<SEC_TAG_BITS>{pc >> (2 + SEC_TAG_BITS)};
   }
 };
 
@@ -534,16 +566,15 @@ struct XorSecTagHash {
 //                0 = low bits select bank, K = bits [K, K+log2(B))
 // ============================================================================
 
-template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0>
-struct ta_rwram {
+template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
   static_assert(std::has_single_bit(M));
   static_assert(B >= 2 && B <= 64);
   static_assert(std::has_single_bit(B));
-  static constexpr u64 A = std::bit_width(M - 1);         // address bits
-  static constexpr u64 E = M / B;                          // entries per bank
+  static constexpr u64 A = std::bit_width(M - 1); // address bits
+  static constexpr u64 E = M / B;                 // entries per bank
   static_assert(E > 1);
-  static constexpr u64 L = std::bit_width(E - 1);          // local address bits
-  static constexpr u64 BANK_BITS = std::bit_width(B - 1);  // bank ID bits
+  static constexpr u64 L = std::bit_width(E - 1);         // local address bits
+  static constexpr u64 BANK_BITS = std::bit_width(B - 1); // bank ID bits
   static_assert(A == L + BANK_BITS);
   static_assert(BANK_SHIFT + BANK_BITS <= A);
 
@@ -594,7 +625,8 @@ struct ta_rwram {
     // at the bank location, reducing wire distance.
     auto noconflict = nc.fo1().connect(bank[0]);
     auto [localaddr, bankid] = split_addr(addr.fo1().connect(bank[0]));
-    localaddr.fanout(hard<B + 1>{}); // B selects in loop + buffered write_localaddr
+    localaddr.fanout(
+        hard<B + 1>{});         // B selects in loop + buffered write_localaddr
     data.fanout(hard<B + 1>{}); // B bank writes + buffered write_data
     noconflict.fanout(hard<B + 2>{}); // B bank selects + mask + buffered gate
     val<B> banksel = bankid.fo1().decode().concat();
@@ -602,36 +634,37 @@ struct ta_rwram {
     banksel.fanout(hard<2>{}); // current_write AND + buffered write_bank
     val<B> noconflict_mask = noconflict.replicate(hard<B>{}).concat();
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
-    noconflict_mask.fanout(hard<2>{}); // current_write AND + buffered ~noconflict
+    noconflict_mask.fanout(
+        hard<2>{}); // current_write AND + buffered ~noconflict
     val<B> current_write = banksel & noconflict_mask;
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     current_write.fanout(hard<3>{}); // make_array + buffered OR + read_bank OR
     arr<val<1>, B> current_write_split = current_write.make_array(val<1>{});
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     current_write_split.fanout(hard<3>{}); // execute_if cond + 2 selects
-    write_bank.fanout(hard<2>{}); // make_array(1) + buffered_done &(1)
-    read_bank.fanout(hard<2>{}); // make_array(1) + buffered_done |(1)
+    write_bank.fanout(hard<2>{});          // make_array(1) + buffered_done &(1)
+    read_bank.fanout(hard<2>{});           // make_array(1) + buffered_done |(1)
     write_localaddr.fanout(hard<B>{}); // select in each of B execute_if lambdas
-    write_data.fanout(hard<B>{}); // select in each of B execute_if lambdas
+    write_data.fanout(hard<B>{});      // select in each of B execute_if lambdas
     arr<val<1>, B> write_bank_split = write_bank.make_array(val<1>{});
     arr<val<1>, B> read_bank_split = read_bank.make_array(val<1>{});
     for (u64 i = 0; i < B; i++) {
-      execute_if(
-          current_write_split[i] |
-              (write_bank_split[i].fo1() & ~read_bank_split[i].fo1()),
-          [&]() {
-            val<L> a =
-                select(current_write_split[i], localaddr, write_localaddr);
-            val<N> d = select(current_write_split[i], data, write_data);
-            bank[i].write(a.fo1(), d.fo1());
-          });
+      execute_if(current_write_split[i] |
+                     (write_bank_split[i].fo1() & ~read_bank_split[i].fo1()),
+                 [&]() {
+                   val<L> a = select(current_write_split[i], localaddr,
+                                     write_localaddr);
+                   val<N> d = select(current_write_split[i], data, write_data);
+                   bank[i].write(a.fo1(), d.fo1());
+                 });
     }
     // buffer the current write if not done
     val<1> buffered_done =
         (write_bank & (current_write | read_bank)) == hard<0>{};
     val<1> buffered_gate = buffered_done.fo1() | ~noconflict;
     // NOTE: @prakhar @claude validate hardcoded fanout
-    buffered_gate.fanout(hard<3>{}); // write_bank(1) + write_localaddr(1) + write_data(1)
+    buffered_gate.fanout(
+        hard<3>{}); // write_bank(1) + write_localaddr(1) + write_data(1)
     execute_if(buffered_gate, [&]() {
       write_bank = banksel & ~noconflict_mask;
       execute_if(~noconflict, [&]() {
@@ -655,16 +688,14 @@ struct ta_rwram {
 // Pipeline regs (ahead[0]/[1]) are included per table.
 // ============================================================================
 
-template <u64 TABLE_SIZE,
-          u64 TAG_WIDTH,
-          u64 HIST_LEN,     // per-table history length
-          u64 CTR_WIDTH,    // per-lane prediction counter
-          u64 HYST_WIDTH,
-          u64 U_WIDTH,
-          u64 SEC_TAG_BITS,
-          u64 N,            // max branches per block (= lanes of pred)
-          bool SHARED_HYS = false,  // shared hyst: 2 entries share 1 counter
-          u64 TAG_RAM_WIDTH = TAG_WIDTH>  // RAM width for tag (uniform across tables)
+template <u64 TABLE_SIZE, u64 TAG_WIDTH,
+          u64 HIST_LEN,  // per-table history length
+          u64 CTR_WIDTH, // per-lane prediction counter
+          u64 HYST_WIDTH, u64 U_WIDTH, u64 SEC_TAG_BITS,
+          u64 N,                   // max branches per block (= lanes of pred)
+          bool SHARED_HYS = false, // shared hyst: 2 entries share 1 counter
+          u64 TAG_RAM_WIDTH =
+              TAG_WIDTH> // RAM width for tag (uniform across tables)
 struct TATable {
   static constexpr u64 IDX_BITS = ta::clog2(TABLE_SIZE);
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -677,7 +708,8 @@ struct TATable {
   static constexpr u64 sec_tag_bits = SEC_TAG_BITS;
   static constexpr u64 tag_ram_width = TAG_RAM_WIDTH;
 
-  // When SHARED_HYS=true, halve the hyst table: pairs of entries share one counter
+  // When SHARED_HYS=true, halve the hyst table: pairs of entries share one
+  // counter
   static constexpr u64 HYST_SIZE = SHARED_HYS ? (TABLE_SIZE / 2) : TABLE_SIZE;
   static constexpr u64 HYST_IDX_BITS = ta::clog2(std::max(u64(2), HYST_SIZE));
 
@@ -687,18 +719,17 @@ struct TATable {
                 "TAG_RAM_WIDTH must be >= TAG_WIDTH");
 
   // ---- RAMs (predict-path critical) ----
-  hcm::ram<val<TAG_RAM_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
-  ta_rwram<PRED_BITS, TABLE_SIZE, 2>      pred_ram{"ta_pred"};
+  hcm::ram<val<TAG_RAM_WIDTH>, TABLE_SIZE> tag_ram{"ta_tag"};
+  ta_rwram<PRED_BITS, TABLE_SIZE, 2> pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
   // ---- RAMs (update-only) ----
   hcm::zone ta_update_zone;
   ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
-  ta_rwram<U_WIDTH, TABLE_SIZE, 2>        u_ram{"ta_u"};
+  ta_rwram<U_WIDTH, TABLE_SIZE, 2> u_ram{"ta_u"};
 
   // ---- Per-table folded histories (fold into exact widths) ----
   ta_folded_gh<IDX_BITS> fold_idx;
   ta_folded_gh<TAG_WIDTH> fold_tag;
-
 };
 
 // Generate a TATable type from config arrays at index I
@@ -706,14 +737,12 @@ template <typename Cfg, u64 I, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
           u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS = false,
           u64 TAG_RAM_WIDTH = ta::array_max(Cfg::TAG_WIDTH)>
 using TATableAt =
-    TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I],
-            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
-            TAG_RAM_WIDTH>;
+    TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I], CTR_WIDTH,
+            HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS, TAG_RAM_WIDTH>;
 
 // Build a reversed index sequence: <N-1, N-2, ..., 1, 0>
 template <typename Seq> struct ReverseSeq;
-template <u64... Is>
-struct ReverseSeq<std::index_sequence<Is...>> {
+template <u64... Is> struct ReverseSeq<std::index_sequence<Is...>> {
   static constexpr u64 N = sizeof...(Is);
   using type = std::index_sequence<(N - 1 - Is)...>;
 };
@@ -727,16 +756,18 @@ struct TAMakeTableTuple;
 
 template <typename Cfg, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
           u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS, bool REVERSE, u64... Is>
-struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
-                        SEC_TAG_BITS, N, SHARED_HYS, REVERSE, std::index_sequence<Is...>> {
+struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N,
+                        SHARED_HYS, REVERSE, std::index_sequence<Is...>> {
   // Storage indices: reversed when REVERSE=true so biggest-first tables
   // get their RAMs declared first, influencing floorplan placement.
   static constexpr u64 NT = sizeof...(Is);
-  static constexpr auto storage_idx(u64 i) { return REVERSE ? (NT - 1 - i) : i; }
+  static constexpr auto storage_idx(u64 i) {
+    return REVERSE ? (NT - 1 - i) : i;
+  }
 
-  using type = std::tuple<TATableAt<Cfg, (REVERSE ? NT - 1 - Is : Is), CTR_WIDTH,
-                                    HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N,
-                                    SHARED_HYS>...>;
+  using type = std::tuple<
+      TATableAt<Cfg, (REVERSE ? NT - 1 - Is : Is), CTR_WIDTH, HYST_WIDTH,
+                U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS>...>;
 };
 
 // ============================================================================
@@ -745,16 +776,16 @@ struct TAMakeTableTuple<Cfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH,
 
 // Allocation trigger: what condition causes TAGE to attempt allocation
 enum class AllocTrigger {
-  MISPREDICT,   // final misprediction (default, conservative)
-  TAGE_WRONG,   // TAGE provider was wrong (even if meta corrected it)
-  ALWAYS,       // every update cycle (most aggressive)
+  MISPREDICT, // final misprediction (default, conservative)
+  TAGE_WRONG, // TAGE provider was wrong (even if meta corrected it)
+  ALWAYS,     // every update cycle (most aggressive)
 };
 
 // Allocation action: how to gate allocation when triggered
 enum class AllocAction {
-  STANDARD,     // allocate in tables above provider with u=0 (default)
-  FILTERED,     // probabilistically throttle by accuracy counter
-  THROTTLED,    // probabilistically throttle by alloc pressure counter
+  STANDARD,  // allocate in tables above provider with u=0 (default)
+  FILTERED,  // probabilistically throttle by accuracy counter
+  THROTTLED, // probabilistically throttle by alloc pressure counter
 };
 
 // ---- Allocation Target Policies (functors) ----
@@ -769,7 +800,7 @@ enum class AllocAction {
 // x & (x-1) clears the lowest set bit = skip closest candidate.
 
 struct ClosestTarget {
-  static constexpr const char* name() { return "Closest"; }
+  static constexpr const char *name() { return "Closest"; }
   template <u64 NT>
   static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8>) {
     return collamask;
@@ -777,26 +808,28 @@ struct ClosestTarget {
 };
 
 namespace target_detail {
-  template <u64 NT>
-  val<NT> clear_lsb(val<NT> x) {
-    x.fanout(hard<2>{});
-    return x & val<NT>(x - 1);
-  }
+template <u64 NT> val<NT> clear_lsb(val<NT> x) {
+  x.fanout(hard<2>{});
+  return x & val<NT>(x - 1);
+}
 
-  template <u64 SKIP, u64 NT>
-  val<NT> skip_n(val<NT> x) {
-    static_assert(SKIP <= 4, "skip_n: SKIP > 4 not supported");
-    if constexpr (SKIP == 0) return x;
-    else if constexpr (SKIP == 1) return clear_lsb(x);
-    else { val<NT> s = skip_n<SKIP - 1, NT>(x); return clear_lsb(s); }
+template <u64 SKIP, u64 NT> val<NT> skip_n(val<NT> x) {
+  static_assert(SKIP <= 4, "skip_n: SKIP > 4 not supported");
+  if constexpr (SKIP == 0)
+    return x;
+  else if constexpr (SKIP == 1)
+    return clear_lsb(x);
+  else {
+    val<NT> s = skip_n<SKIP - 1, NT>(x);
+    return clear_lsb(s);
   }
+}
 } // namespace target_detail
 
 // Deterministically skip SKIP closest candidates, always allocate further out
-template <u64 SKIP = 1>
-struct DeterministicSkipTarget {
+template <u64 SKIP = 1> struct DeterministicSkipTarget {
   static_assert(SKIP <= 4, "DeterministicSkipTarget: SKIP > 4 not supported");
-  static constexpr const char* name() { return "DetSkip"; }
+  static constexpr const char *name() { return "DetSkip"; }
   template <u64 NT>
   static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8>) {
     return target_detail::skip_n<SKIP, NT>(collamask);
@@ -804,12 +837,12 @@ struct DeterministicSkipTarget {
 };
 
 // Skip SKIP closest with static probability PROB/256
-template <u64 SKIP = 1, u64 PROB_256 = 64>
-struct StaticSkipTarget {
+template <u64 SKIP = 1, u64 PROB_256 = 64> struct StaticSkipTarget {
   static_assert(SKIP <= 4, "StaticSkipTarget: SKIP > 4 not supported");
-  static constexpr const char* name() { return "StaticSkip"; }
+  static constexpr const char *name() { return "StaticSkip"; }
   template <u64 NT>
-  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8> rng) {
+  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto,
+                       val<8> rng) {
     collamask.fanout(hard<2>{});
     val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
     return select(rng < hard<PROB_256>{}, skipped, collamask);
@@ -817,12 +850,12 @@ struct StaticSkipTarget {
 };
 
 // Skip probability scales with alloc pressure (high pressure = skip more)
-template <u64 SKIP = 1>
-struct AllocPressureSkipTarget {
+template <u64 SKIP = 1> struct AllocPressureSkipTarget {
   static_assert(SKIP <= 4, "AllocPressureSkipTarget: SKIP > 4 not supported");
-  static constexpr const char* name() { return "AllocPressSkip"; }
+  static constexpr const char *name() { return "AllocPressSkip"; }
   template <u64 NT>
-  static val<NT> apply(val<NT> collamask, valtype auto ap, valtype auto, val<8> rng) {
+  static val<NT> apply(val<NT> collamask, valtype auto ap, valtype auto,
+                       val<8> rng) {
     collamask.fanout(hard<2>{});
     val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
     return select(val<8>{ap} > rng, skipped, collamask);
@@ -830,12 +863,13 @@ struct AllocPressureSkipTarget {
 };
 
 // Skip probability scales with accuracy pressure (low accuracy = skip more)
-template <u64 SKIP = 1>
-struct AccuracyPressureSkipTarget {
-  static_assert(SKIP <= 4, "AccuracyPressureSkipTarget: SKIP > 4 not supported");
-  static constexpr const char* name() { return "AccPressSkip"; }
+template <u64 SKIP = 1> struct AccuracyPressureSkipTarget {
+  static_assert(SKIP <= 4,
+                "AccuracyPressureSkipTarget: SKIP > 4 not supported");
+  static constexpr const char *name() { return "AccPressSkip"; }
   template <u64 NT>
-  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto acp, val<8> rng) {
+  static val<NT> apply(val<NT> collamask, valtype auto, valtype auto acp,
+                       val<8> rng) {
     collamask.fanout(hard<2>{});
     val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
     return select(val<8>{acp} > rng, skipped, collamask);
@@ -848,7 +882,7 @@ struct TADefaultAllocConfig {
   static constexpr u64 MAX_ALLOC = 1;
   static constexpr bool NON_CONSECUTIVE = false;
   static constexpr AllocTrigger ALLOC_TRIGGER = AllocTrigger::MISPREDICT;
-  static constexpr AllocAction  ALLOC_ACTION  = AllocAction::STANDARD;
+  static constexpr AllocAction ALLOC_ACTION = AllocAction::STANDARD;
   using TARGET_POLICY = ClosestTarget;
 };
 

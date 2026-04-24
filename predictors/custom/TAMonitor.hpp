@@ -35,6 +35,33 @@ struct TAMonitor {
     u64 zero_use = 0; // evicted before serving any prediction
   };
 
+  // Thrashing stats per table (embedded in Counters for auto-windowing)
+  struct ThrashStats {
+    // Lifetime histogram: buckets [0-10), [10-100), [100-1K), [1K-10K), [10K+)
+    static constexpr u64 LIFE_BUCKETS = 5;
+    std::array<u64, LIFE_BUCKETS> life_hist{};  // all evictions
+    std::array<u64, LIFE_BUCKETS> life_useful{}; // evictions where pred_count>0 && correct>0
+    // Useful-entry eviction
+    u64 useful_evict = 0;      // evicted with pred_count>0 && correct_count>0
+    u64 useful_evict_preds = 0; // total preds lost from useful evictions
+    // Ping-pong: evicted entry had different PC + short lifetime
+    u64 pingpong = 0;
+    // Repeat-alloc: entry evicted within current window (lifetime < WINDOW_SIZE)
+    u64 repeat_alloc = 0;
+
+    static u64 life_bucket(u64 lifetime) {
+      if (lifetime < 10) return 0;
+      if (lifetime < 100) return 1;
+      if (lifetime < 1000) return 2;
+      if (lifetime < 10000) return 3;
+      return 4;
+    }
+    static const char *life_label(u64 b) {
+      static const char *labels[] = {"<10", "10-100", "100-1K", "1K-10K", "10K+"};
+      return labels[b];
+    }
+  };
+
   // Feature 1+2+3+8: Per-PC diagnostics
   struct PCDiag {
     u64 total = 0;
@@ -113,6 +140,11 @@ struct TAMonitor {
     u64 decay_fire_count = 0;
     u64 epoch_reset_count = 0;
 
+    // u-clear source breakdown (per-table)
+    std::array<u64, NUM_TABLES> uclear_alloc_fail{};   // genuine alloc failure
+    std::array<u64, NUM_TABLES> uclear_sibling{};      // sibling-triggered (should be 0)
+    std::array<u64, NUM_TABLES> uclear_epoch{};        // epoch bulk reset
+
     // Per-rank (branch position within block) prediction accuracy
     std::array<u64, N> rank_total{};
     std::array<u64, N> rank_correct{};
@@ -124,6 +156,9 @@ struct TAMonitor {
 
     // Feature 5: Lifetime stats per table
     std::array<LifetimeStats, NUM_TABLES> lifetime_stats{};
+
+    // Thrashing detection per table
+    std::array<ThrashStats, NUM_TABLES> thrash{};
 
     // Feature 7: Tag collision tracking
     u64 collision_checks = 0;
@@ -507,6 +542,17 @@ struct TAMonitor {
     win.epoch_reset_count++;
   }
 
+  // u-clear source: 0=alloc_fail, 1=sibling, 2=epoch
+  void record_uclear_source(u64 table, u64 source) {
+    auto record = [&](Counters &c) {
+      if (source == 0) c.uclear_alloc_fail[table]++;
+      else if (source == 1) c.uclear_sibling[table]++;
+      else c.uclear_epoch[table]++;
+    };
+    record(cum);
+    record(win);
+  }
+
   void record_sec_tag_check(u64 stored, u64 curr, u64 now) {
     auto record = [&](Counters &c) {
       c.sec_tag_checks++;
@@ -817,6 +863,30 @@ struct TAMonitor {
     }
     os << "  Decay fires: " << c.decay_fire_count
        << "  Epoch resets: " << c.epoch_reset_count << "\n";
+
+    // u-clear source breakdown
+    u64 total_uclear_af = 0, total_uclear_sib = 0, total_uclear_ep = 0;
+    for (u64 i = 0; i < NUM_TABLES; i++) {
+      total_uclear_af += c.uclear_alloc_fail[i];
+      total_uclear_sib += c.uclear_sibling[i];
+      total_uclear_ep += c.uclear_epoch[i];
+    }
+    if (total_uclear_af + total_uclear_sib + total_uclear_ep > 0) {
+      os << "\n  U-clear Source Breakdown:\n";
+      os << "  Table  | AllocFail | Sibling   | Epoch\n";
+      os << "  -------+-----------+-----------+-----------\n";
+      for (u64 i = 0; i < NUM_TABLES; i++) {
+        if (c.uclear_alloc_fail[i] + c.uclear_sibling[i] + c.uclear_epoch[i] == 0)
+          continue;
+        os << "  T" << i << std::setw(5 - (i >= 10 ? 1 : 0)) << "" << "|"
+           << std::setw(10) << c.uclear_alloc_fail[i] << " |"
+           << std::setw(10) << c.uclear_sibling[i] << " |"
+           << std::setw(10) << c.uclear_epoch[i] << "\n";
+      }
+      os << "  Total  |" << std::setw(10) << total_uclear_af << " |"
+         << std::setw(10) << total_uclear_sib << " |"
+         << std::setw(10) << total_uclear_ep << "\n";
+    }
 
     // Pressure
     if (c.pressure_samples > 0) {

@@ -60,11 +60,12 @@ template <
     u64 CTR_WIDTH = 1,          // prediction counter width per lane
     u64 HYST_WIDTH = 2,         // hysteresis width (separate from ctr)
     u64 U_WIDTH = 2,            // usefulness counter width
+    UMispPolicy U_MISP = UMispPolicy::UNTOUCHED, // u-bit on mispredict
     u64 FB_CAPACITY = 8192 / 2, // fallback table size (bimodal or gshare)
     bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
     u64 GS_HIST = 6,            // gshare history length (only when USE_GSHARE)
     u64 META_WIDTH = 4,         // meta counter width (provider vs alt)
-    u64 META_CAPACITY = 256,    // meta table entries
+    u64 META_CAPACITY = 1024,   // meta table entries
     u64 META_PIPE = 2,          // meta pipeline depth
     u64 LINEINST = 1024,        // line size in instructions
     bool SHARED_HYS = true,     // shared hyst: 2 entries share 1 counter
@@ -238,7 +239,7 @@ struct TageAhead : predictor {
   reg<1> train_fb_hyst; // piped fb hyst for reconciliation
   reg<ALLOC_PC_BITS> train_pc;
   reg<MAX_TAG_WIDTH> train_ctag[NT]; // piped computed tag for allocation
-  reg<SEC_TAG_BITS> train_sec_tag;  // piped sec_tag for allocation writes
+  reg<SEC_TAG_BITS> train_sec_tag;   // piped sec_tag for allocation writes
 
   // Piped resolution values from previous update_cycle (block A's resolution)
   reg<MATCH_BITS> train_match1;
@@ -526,7 +527,8 @@ struct TageAhead : predictor {
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     else
-      // sec_tag_now (1) + meta_idx (1) + hist path_bits (1) [+ multi-path sel (1)]
+      // sec_tag_now (1) + meta_idx (1) + hist path_bits (1) [+ multi-path sel
+      // (1)]
       block_end_info.next_pc.fanout(hard<3 + (NUM_PATHS > 1 ? 1 : 0)>{});
     auto sec_tag_now = [&]() {
       if constexpr (USE_SEC_TAG)
@@ -557,10 +559,14 @@ struct TageAhead : predictor {
           c.sec_tag_checks++;
           bool match_curr = mon_sec_hit[i]; // predict-time match
           bool match_now = (mon_saved_sec[i] == now_val);
-          if (match_curr) c.sec_tag_match_curr++;
-          if (match_now) c.sec_tag_match_now++;
-          if (match_curr && match_now) c.sec_tag_match_both++;
-          if (!match_curr && !match_now) c.sec_tag_match_neither++;
+          if (match_curr)
+            c.sec_tag_match_curr++;
+          if (match_now)
+            c.sec_tag_match_now++;
+          if (match_curr && match_now)
+            c.sec_tag_match_both++;
+          if (!match_curr && !match_now)
+            c.sec_tag_match_neither++;
         }
       }
     }
@@ -894,8 +900,8 @@ struct TageAhead : predictor {
     static_loop<NT>([&]<u64 I>() {
       train_hyst[I].fanout(
           hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
-      train_u[I].fanout(
-          hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
+      // u_zero(1) + base old_u(1) [+ decay old_u(1)]
+      train_u[I].fanout(hard<2 + (DECAY_ENABLE ? 1 : 0)>{});
       // sibling skip reads train_tag_hit/train_sec_hit for ALL tables
       // when SIBLING_POLICY==ALL (runtime lambda iterates all indices).
       // SIBLING_TABLE_FLOOR masks the result post-hoc, not the read.
@@ -1073,12 +1079,12 @@ struct TageAhead : predictor {
     };
     val<NT> notumask = u_zero.fo1().concat();
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
-    notumask.fanout(hard<2>{});
+    notumask.fanout(hard<2>{}); // candallocmask(1) + noalloc(1)
     val<NT> postmask = alloc_base.fo1() & gated_triggermask.fo1();
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
-    postmask.fanout(hard<2>{});
+    postmask.fanout(hard<3>{}); // candallocmask(1) + uclearmask(1) + noalloc(1)
     val<NT> candallocmask = [&]() {
-      val<NT> base = postmask & notumask.fo1();
+      val<NT> base = postmask & notumask;
       if constexpr (USE_SEC_TAG && SIBLING_POLICY == SiblingPolicy::ALL) {
         // Allocation promotion (Cai/Deshmukh/Patt ISCA'25 Sec 4.3):
         // Skip entries with same primary tag but different sec_tag (siblings).
@@ -1178,7 +1184,10 @@ struct TageAhead : predictor {
     }();
     alloc_target.fanout(hard<2>{}); // line 1395(!= hard<0>) + line
                                     // 1401(allocmask1, if FARALLOC_DIST>0)
-    val<1> noalloc = (candallocmask == hard<0>{});
+    // noalloc: only if there are truly no u=0 entries above provider.
+    // Sibling-skip is a deliberate no-op — don't penalize the set by
+    // clearing u-bits when the only u=0 slots were siblings.
+    val<1> noalloc = ((postmask & notumask) == hard<0>{});
     val<NT> uclearmask =
         postmask & noalloc.fo1().replicate(hard<NT>{}).concat();
     arr<val<1>, NT> uclear = uclearmask.fo1().make_array(val<1>{});
@@ -1207,6 +1216,22 @@ struct TageAhead : predictor {
           if (sibling)
             mon.record_alloc_sibling_skip(sibling);
         }
+      }
+      // u-clear source tracking: per-table breakdown
+      u64 ucm = static_cast<u64>(uclearmask);
+      u64 pm = static_cast<u64>(postmask);
+      u64 num = static_cast<u64>(notumask);
+      u64 cam = static_cast<u64>(candallocmask);
+      bool had_u0 = (pm & num) != 0;
+      bool had_cand = cam != 0;
+      for (u64 i = 0; i < NT; i++) {
+        if (ucm & (u64(1) << i))
+          mon.record_uclear_source(i, 0); // alloc_fail (genuine)
+        // Would-have-been sibling uclear: u=0 existed but candallocmask
+        // filtered it out (sibling skip). Under old code this triggered uclear.
+        if (!(ucm & (u64(1) << i)) && (pm & (u64(1) << i)) &&
+            had_u0 && !had_cand && static_cast<u64>(alloc_trigger))
+          mon.record_uclear_source(i, 1); // sibling (counterfactual)
       }
     }
 #endif
@@ -1301,8 +1326,8 @@ struct TageAhead : predictor {
       // Per-table wrong: does THIS table's stored pred disagree with actual?
       val<1> table_wrong =
           (val<PRED_BITS>{train_pred[I].fo1()} ^ actual_dir) != hard<0>{};
-      table_wrong.fanout(hard<3>{}); // 1251(do_pred_update) + 1260(~table_wrong
-                                     // new_hyst) + 1287(base_newu)
+      // do_pred_update(1) + new_hyst(1) + u_correct(1) [+ u_wrong(1) if !UNTOUCHED]
+      table_wrong.fanout(hard<3 + (U_MISP != UMispPolicy::UNTOUCHED ? 1 : 0)>{});
 
       // pred_ram: alloc writes actual_dir, update writes actual_dir → same
       // data. Gated on hyst-only weakness (t_phw), not newly-alloc (t_pw). A
@@ -1355,13 +1380,46 @@ struct TageAhead : predictor {
 #endif
 
       // u_ram: combined provider update + allocation + uclear + decay.
-      // Uses per-table wrong signal: u set when THIS table predicted correctly.
-      val<U_WIDTH> base_newu = val<U_WIDTH>{~table_wrong} &
-                               val<U_WIDTH>{~allocate[I]} &
-                               val<U_WIDTH>{~uclear[I]};
-      // base_newu: single use per branch → fo1/move at each site; no .fanout()
-      // needed
-      val<1> base_u_write = (t_m1[I] & t_ad) | allocate[I] | uclear[I];
+      // Standard TAGE: increment u when correct & alt differs, optionally
+      // modify on wrong. U_MISP controls wrong-prediction behavior:
+      //   UNTOUCHED: leave u alone (default, preserves accumulated usefulness)
+      //   ZERO:      clear u to 0 (aggressive, original buggy behavior)
+      //   DECREMENT: saturating decrement (gradual degradation)
+      val<1> u_correct = t_m1[I] & t_ad & ~table_wrong;
+      val<1> u_wrong = [&]() -> val<1> {
+        if constexpr (U_MISP == UMispPolicy::UNTOUCHED)
+          return hard<0>{};
+        else
+          return t_m1[I] & t_ad & table_wrong;
+      }();
+      val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
+      // u_inc: ==maxval(1) + select_true(1) + +1(1) = 3
+      // u_dec (DECREMENT only): ==0(1) + select_true(1) + -1(1) = 3
+      old_u.fanout(hard<3 + (U_MISP == UMispPolicy::DECREMENT ? 3 : 0)>{});
+      // Saturating increment/decrement for u-bit
+      auto u_inc = select(old_u == hard<old_u.maxval>{}, old_u,
+                          val<U_WIDTH>{old_u + 1});
+      val<U_WIDTH> base_newu = [&]() -> val<U_WIDTH> {
+        if constexpr (U_MISP == UMispPolicy::UNTOUCHED) {
+          // Only write on correct (increment) or alloc/uclear (zero)
+          return select(u_correct, u_inc,
+                        val<U_WIDTH>{~allocate[I]} & val<U_WIDTH>{~uclear[I]});
+        } else if constexpr (U_MISP == UMispPolicy::ZERO) {
+          // Correct → increment, wrong → zero, alloc/uclear → zero
+          return select(u_correct, u_inc,
+                        val<U_WIDTH>{~u_wrong} &
+                        val<U_WIDTH>{~allocate[I]} &
+                        val<U_WIDTH>{~uclear[I]});
+        } else { // DECREMENT
+          // Correct → increment, wrong → decrement, alloc/uclear → zero
+          auto u_dec = select(old_u == hard<0>{}, old_u,
+                              val<U_WIDTH>{old_u - 1});
+          return select(u_correct, u_inc,
+                 select(u_wrong, u_dec,
+                        val<U_WIDTH>{~allocate[I]} & val<U_WIDTH>{~uclear[I]}));
+        }
+      }();
+      val<1> base_u_write = (u_correct | u_wrong) | allocate[I] | uclear[I];
       base_u_write.fanout(
           hard<2>{}); // !DECAY: pair(1); DECAY: select(1)+merged_write(1)
 
@@ -1481,8 +1539,11 @@ struct TageAhead : predictor {
           static_loop<NT>([&]<u64 I>() { table<I>().u_ram.reset(); });
         });
 #ifdef TAGE_MONITOR
-        if (static_cast<u64>(epoch_fire))
+        if (static_cast<u64>(epoch_fire)) {
           mon.record_epoch_reset();
+          for (u64 i = 0; i < NT; i++)
+            mon.record_uclear_source(i, 2); // epoch
+        }
 #endif
         // Optionally reset counters on epoch fire
         if constexpr (EPOCH_RESET_ACC)
