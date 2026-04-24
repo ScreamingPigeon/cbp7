@@ -271,58 +271,6 @@ struct TageAhead : predictor {
   reg<META_WIDTH, i64> meta_pipe[META_PIPE];
   reg<META_IDX_BITS> meta_idx_pipe[META_PIPE];
 
-// ---- Timing debug taps (zero cost in normal builds) ----
-#ifdef TIMING_DEBUG
-  reg<1> dbg_full_hits;            // after per-table hit computation
-  reg<1> dbg_fb_pred;              // after fallback read
-  reg<1> dbg_match;                // after concat into match bitmask
-  reg<1> dbg_match1;               // after one_hot (provider)
-  reg<1> dbg_match2;               // after one_hot (alt)
-  reg<1> dbg_provider_pred;        // after replicate-mask-fold
-  reg<1> dbg_alt_pred;             // after replicate-mask-fold
-  reg<1> dbg_provider_weak;        // after weakness check
-  reg<1> dbg_has_alt;              // after has_alt mask
-  reg<1> dbg_meta_use_alt;         // after meta pipeline read
-  reg<1> dbg_use_alt;              // after final use_alt AND
-  reg<1> dbg_final_pred;           // after select mux
-  reg<1> dbg_mispredict;           // framework's is_mispredict
-  reg<1> dbg_true_block;           // true_block after computation
-  reg<1> dbg_inst_pc;              // inst_pc arrival in predict1
-  reg<1> dbg_fold_idx;             // worst fold_idx.get() across tables
-  reg<1> dbg_fold_tag;             // worst fold_tag.get() across tables
-  reg<1> dbg_p1_return;            // predict1 return value timing
-  reg<1> dbg_hist_input;           // hist_input timing in update_cycle
-  reg<1> dbg_gh_fanout;            // gh after fanout in update_cycle
-  reg<1> dbg_fold_compute;         // compute_update result timing
-  reg<1> dbg_fold_apply;           // after apply_update (fold write)
-  reg<1> dbg_fold_early_write;     // fold write in num_branch==0 path
-  reg<1> dbg_fold_read_in_compute; // folded reg read inside compute_update
-  // Resolution gaps
-  reg<1> dbg_altdiff;        // provider_pred ^ alt_pred
-  reg<1> dbg_actual_dir;     // branch_dir scatter
-  reg<1> dbg_any_prov_wrong; // t_pp ^ actual_dir
-  // Allocation chain
-  reg<1> dbg_alloc_base;    // t_match1 - 1
-  reg<1> dbg_notumask;      // u_zero concat
-  reg<1> dbg_candallocmask; // misp_alloc & notumask
-  reg<1> dbg_alloc_target;  // one_hot of candidates
-  reg<1> dbg_noalloc;       // candallocmask == 0
-  reg<1> dbg_uclearmask;    // u-clear fallback
-  // Train write chain (per-table)
-  reg<1> dbg_fb_write;       // fb_ctr.write gate
-  reg<1> dbg_meta_write;     // meta_ctr.write gate
-  reg<1> dbg_pred_write[NT]; // pred_ram.write gate per table
-  reg<1> dbg_hyst_write[NT]; // hyst_ram.write gate per table
-  reg<1> dbg_tag_write[NT];  // tag_ram.write gate per table
-  reg<1> dbg_u_write[NT];    // u_ram.write gate per table
-  // Decay (per-table)
-  reg<1> dbg_decay_fire[NT];   // decay_fire per table
-  reg<1> dbg_decay_merged[NT]; // merged u value per table
-  reg<1> dbg_epoch_fire;       // epoch trigger
-  reg<1> dbg_next_pc;          // raw next_pc timing from block_end_info
-  reg<1> dbg_curr_sec_tag;     // curr_sec_tag after hash
-#endif
-
 #ifdef TAGE_MONITOR
   TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY> mon;
   ~TageAhead() { mon.print_summary(); }
@@ -347,10 +295,6 @@ struct TageAhead : predictor {
     inst_pc.fanout(
         hard<2 * NT + 2>{}); // 2 reads per table (>>2, >>4) + fb (>>2)
                              // + prefetch_pc (>>2)
-
-#ifdef TIMING_DEBUG
-    dbg_inst_pc = val<1>{inst_pc};
-#endif
 
     // Ahead reads for next block — run unconditionally (no true_block gate).
     //
@@ -384,13 +328,6 @@ struct TageAhead : predictor {
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       computed_tag.fanout(hard<2>{}); // tag comparison + prefetch_ctag write
 
-#ifdef TIMING_DEBUG
-      if constexpr (I == 0) {
-        dbg_fold_idx = val<1>{t.fold_idx.get()};
-        dbg_fold_tag = val<1>{t.fold_tag.get()};
-      }
-#endif
-
       auto stored_tag = t.tag_ram.read(idx);
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       stored_tag.fanout(hard<2>{});
@@ -404,6 +341,22 @@ struct TageAhead : predictor {
       prefetch_idx[I] = idx;
       prefetch_hyst[I] = t.hyst_ram.read(val<t.HYST_IDX_BITS>{idx});
       prefetch_u[I] = t.u_ram.read(idx);
+
+#ifdef DEBUG_PRINT
+      if constexpr (I == 0) {
+        std::cerr << "\n────────────────────────────────────────\n";
+        std::cerr << "=== predict1 table[0] ===\n";
+        fold_idx_val.print("  fold_idx_val=", "\n", true, std::cerr);
+        idx.print("  idx=", "\n", true, std::cerr);
+        fold_tag_val.print("  fold_tag_val=", "\n", true, std::cerr);
+        computed_tag.print("  computed_tag=", "\n", true, std::cerr);
+        stored_tag.print("  stored_tag=", "\n", true, std::cerr);
+        val<1>{prefetch_tag_hit[I]}.print("  tag_hit=", "\n", true, std::cerr);
+        val<1>{prefetch_pred[I]}.print("  pred=", "\n", true, std::cerr);
+        val<1>{prefetch_hyst[I]}.print("  hyst=", "\n", true, std::cerr);
+        val<1>{prefetch_u[I]}.print("  u=", "\n", true, std::cerr);
+      }
+#endif
     });
 
     // Fallback ahead read (direct-mapped, no tag match needed)
@@ -427,6 +380,11 @@ struct TageAhead : predictor {
       prefetch_fb_hyst = fb_hyst.read(fb_idx);
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
 
+#ifdef DEBUG_PRINT
+    val<1>{prefetch_fb}.print("  fb_pred=", "\n", true, std::cerr);
+    fb_idx.print("  fb_idx=", "\n", true, std::cerr);
+#endif
+
     // Crit path: just read precomputed prediction from reg
     block_entry.fanout(hard<2 * LINEINST>{}); // read in line_end() across
                                               // predict + reuse + update_condbr
@@ -435,9 +393,6 @@ struct TageAhead : predictor {
     block_size = 1;
     num_branch = 0;
     reuse_prediction(~line_end());
-#ifdef TIMING_DEBUG
-    dbg_p1_return = val<1>{pred[num_branch]};
-#endif
     return pred[num_branch];
   }
   val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) {
@@ -575,10 +530,6 @@ struct TageAhead : predictor {
       curr_sec_tag = sec_tag_now; // store for next-cycle use
       // Alloc-path fanout: NT sec_ram writes (off critical path)
       sec_tag_alloc.fanout(hard<NT>{});
-#ifdef TIMING_DEBUG
-      dbg_next_pc = val<1>{block_end_info.next_pc};
-      dbg_curr_sec_tag = val<1>{sec_tag_now};
-#endif
     }
 
     // ================================================================
@@ -606,9 +557,6 @@ struct TageAhead : predictor {
     // call so we use lvalue reads (fanout credits) for multi-chain configs.
     if constexpr (NUM_PATHS >= 2)
       meta_use_alt.fanout(hard<NUM_PATHS>{});
-#ifdef TIMING_DEBUG
-    dbg_meta_use_alt = meta_use_alt;
-#endif
 
     // ================================================================
     // Provider / altpred resolution via bitmask + one_hot
@@ -846,18 +794,20 @@ struct TageAhead : predictor {
       pred[I] = select(use_alt, ap_bits[I].fo1(), pp_bits[I].fo1());
     });
 
-#ifdef TIMING_DEBUG
-    dbg_full_hits = val<1>{pred[0]}; // timing proxy
-    dbg_fb_pred = val<1>{pred[0]};   // timing proxy
-    dbg_match = val<1>{match1};      // timing proxy
-    dbg_match1 = val<1>{match1};
-    dbg_match2 = val<1>{match2};
-    dbg_provider_pred = val<1>{provider_pred};
-    dbg_alt_pred = val<1>{alt_pred};
-    dbg_provider_weak = provider_weak;
-    dbg_has_alt = provider_weak; // timing proxy
-    dbg_use_alt = use_alt;
-    dbg_final_pred = val<1>{pred[0]};
+#ifdef DEBUG_PRINT
+    std::cerr << "--- resolve_chain output ---\n";
+    match1.print("  match1=", "\n", true, std::cerr);
+    match2.print("  match2=", "\n", true, std::cerr);
+    provider_pred.print("  provider_pred=", "\n", true, std::cerr);
+    alt_pred.print("  alt_pred=", "\n", true, std::cerr);
+    provider_weak.print("  provider_weak=", "\n", true, std::cerr);
+    altdiff.print("  altdiff=", "\n", true, std::cerr);
+    use_alt.print("  use_alt=", "\n", true, std::cerr);
+    meta_use_alt.print("  meta_use_alt=", "\n", true, std::cerr);
+    weak_mask.print("  weak_mask=", "\n", true, std::cerr);
+    for (u64 i = 0; i < N; i++)
+      val<1>{pred[i]}.print(("  pred[" + std::to_string(i) + "]=").c_str(),
+                            "\n", true, std::cerr);
 #endif
 
 #ifdef TAGE_MONITOR
@@ -956,9 +906,6 @@ struct TageAhead : predictor {
     train_provider_pred = provider_pred;
     train_provider_weak = provider_weak.fo1();
     train_altdiff = altdiff.fo1();
-#ifdef TIMING_DEBUG
-    dbg_altdiff = altdiff;
-#endif
 
     // Read train_valid BEFORE setting it to 1 (regs may be immediate-write)
     val<1> do_train = train_valid.fo1();
@@ -977,9 +924,6 @@ struct TageAhead : predictor {
         t.fold_tag.apply_update(t.fold_tag.compute_update(
             gh, hard<TableCfg::HIST_LEN[I]>{}, path_bits));
       });
-#ifdef TIMING_DEBUG
-      dbg_fold_early_write = val<1>{table<0>().fold_idx.get()};
-#endif
       if constexpr (USE_GSHARE)
         fb_fold.apply_update(
             fb_fold.compute_update(gh, hard<GS_HIST>{}, path_bits));
@@ -997,6 +941,10 @@ struct TageAhead : predictor {
                       : 0)>{}); // extra_cycle + fb + true_block + dbg + acc_ctr
                                 // + (alloc if MISPREDICT)
     need_extra_cycle(mispredict);
+#ifdef DEBUG_PRINT
+    std::cerr << "--- update_cycle ---\n";
+    mispredict.print("  mispredict=", "\n", true, std::cerr);
+#endif
     do_train.fanout(
         hard<4 * NT + 2 + (FB_RECONCILE ? 2 : 0)>{}); // fb + meta + 4 per table
                                                       // [+ reconcile + fb_hyst]
@@ -1031,10 +979,6 @@ struct TageAhead : predictor {
                       ? 1
                       : 1)>{}); // patch for now to avoid
                                 // diddling fo1()
-#ifdef TIMING_DEBUG
-    dbg_actual_dir = val<1>{actual_dir};
-    dbg_any_prov_wrong = any_provider_wrong;
-#endif
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     t_pw.fanout(hard<2>{});       // meta gate + meta update direction
     t_phw.fanout(hard<NT + 1>{}); // per-table pred/hyst update gate
@@ -1182,14 +1126,6 @@ struct TageAhead : predictor {
     arr<val<1>, NT> uclear = uclearmask.fo1().make_array(val<1>{});
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
     uclear.fanout(hard<2>{});
-#ifdef TIMING_DEBUG
-    dbg_alloc_base = val<1>{alloc_base};
-    dbg_notumask = val<1>{notumask};
-    dbg_candallocmask = val<1>{candallocmask};
-    dbg_alloc_target = val<1>{alloc_target};
-    dbg_noalloc = noalloc;
-    dbg_uclearmask = val<1>{uclearmask};
-#endif
 
 #ifdef TAGE_MONITOR
     {
@@ -1290,10 +1226,6 @@ struct TageAhead : predictor {
       meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1].fo1()},
                      new_meta, hard<0>{});
     });
-#ifdef TIMING_DEBUG
-    dbg_fb_write = fb_gate;
-    dbg_meta_write = meta_gate;
-#endif
 
     // ---- Merged per-table writes (one write per RAM per table) ----
     // For each table: alloc takes priority over update. Mux selects data.
@@ -1445,16 +1377,6 @@ struct TageAhead : predictor {
           mon.record_decay_fire();
       }
 #endif
-#ifdef TIMING_DEBUG
-      dbg_pred_write[I] = do_train & (do_alloc | do_pred_update);
-      dbg_hyst_write[I] = do_train & (do_alloc | do_hyst_update);
-      dbg_tag_write[I] = do_train & do_alloc;
-      dbg_u_write[I] = do_train & u_write;
-      if constexpr (DECAY_ENABLE) {
-        dbg_decay_fire[I] = u_write & ~base_u_write;
-        dbg_decay_merged[I] = val<1>{newu};
-      }
-#endif
     });
 
     // ---- Global pressure counter updates ----
@@ -1500,9 +1422,6 @@ struct TageAhead : predictor {
         execute_if(epoch_fire, [&]() {
           static_loop<NT>([&]<u64 I>() { table<I>().u_ram.reset(); });
         });
-#ifdef TIMING_DEBUG
-        dbg_epoch_fire = epoch_fire;
-#endif
 #ifdef TAGE_MONITOR
         if (static_cast<u64>(epoch_fire))
           mon.record_epoch_reset();
@@ -1569,11 +1488,6 @@ struct TageAhead : predictor {
       mon.record_true_block();
 #endif
 
-#ifdef TIMING_DEBUG
-    dbg_mispredict = mispredict;
-    dbg_true_block = true_block;
-#endif
-
     // Compute new fold values OUTSIDE execute_if — runs in parallel with
     // true_block gate, so timing is max(fold_computation, true_block)
     // instead of additive (true_block + fold_computation).
@@ -1590,35 +1504,26 @@ struct TageAhead : predictor {
     hist_input.fanout(hard<NT * 2 + 1 + (USE_GSHARE ? 1 : 0)>{});
     gh.template fanout_per_bit<GH_FANOUT>();
 
-#ifdef TIMING_DEBUG
-    dbg_hist_input = val<1>{hist_input};
-    dbg_gh_fanout = val<1>{gh[0]};
-#endif
-
     // Per-table: compute new fold values, apply with mux (no execute_if gate).
     // select(true_block, new, old) avoids the execute_if timing bleed —
     // both paths resolve in parallel, mux adds ~10ps constant overhead.
     static_loop<NT>([&]<u64 I>() {
       auto &t = table<I>();
-#ifdef TIMING_DEBUG
-      if constexpr (I == 0) {
-        dbg_fold_read_in_compute = val<1>{t.fold_idx.get()};
-      }
-#endif
       auto new_idx = t.fold_idx.compute_update(
           gh, hard<TableCfg::HIST_LEN[I]>{}, hist_input);
       auto new_tag = t.fold_tag.compute_update(
           gh, hard<TableCfg::HIST_LEN[I]>{}, hist_input);
-#ifdef TIMING_DEBUG
-      if constexpr (I == 0) {
-        dbg_fold_compute = val<1>{new_idx};
-      }
-#endif
       t.fold_idx.apply_update(new_idx.fo1(), true_block);
       t.fold_tag.apply_update(new_tag.fo1(), true_block);
-#ifdef TIMING_DEBUG
+#ifdef DEBUG_PRINT
       if constexpr (I == 0) {
-        dbg_fold_apply = val<1>{t.fold_idx.get()};
+        std::cerr << "=== update_cycle fold[0] ===\n";
+        new_idx.print("  new_idx=", "\n", true, std::cerr);
+        new_tag.print("  new_tag=", "\n", true, std::cerr);
+        val<1>{t.fold_idx.get()}.print("  fold_idx_after=", "\n", true,
+                                       std::cerr);
+        val<1>{t.fold_tag.get()}.print("  fold_tag_after=", "\n", true,
+                                       std::cerr);
       }
 #endif
     });
@@ -1627,6 +1532,9 @@ struct TageAhead : predictor {
       fb_fold.apply_update(new_fb.fo1(), true_block);
     }
     gh.update(hist_input, true_block);
-    // std::cerr << "=== EXIT update_cycle ===\n";
+#ifdef DEBUG_PRINT
+    true_block.print("  true_block=", "\n", true, std::cerr);
+    hist_input.print("  hist_input=", "\n", true, std::cerr);
+#endif
   }
 };
