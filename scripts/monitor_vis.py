@@ -51,13 +51,14 @@ def main():
     fb_col = next((h for h in headers if h in ("gs%", "bim%")), None)
 
     # ---- Build figure layout ----
-    # Row 1: MPKI + misp% (dual axis) | Provider distribution stacked area
-    # Row 2: Allocation + pressure     | Entry table health (lifetime)
-    # Row 3: Collision + utilization   | Per-window stuck/hard PCs
-    # Row 4: Histograms — MPKI distribution, provider share pie
+    # Row 0: MPKI + misp%                | Provider distribution stacked area
+    # Row 1: Allocation + pressure       | Entry table health (lifetime)
+    # Row 2: Pipeline (extra%, true_blk) | Block structure (i/blk, br/blk, br)
+    # Row 3: Collision + utilization     | Per-window stuck/hard PCs
+    # Row 4: MPKI histogram              | Average provider share bar
 
-    fig = plt.figure(figsize=(16, 18))
-    gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.3)
+    fig = plt.figure(figsize=(16, 22))
+    gs = fig.add_gridspec(5, 2, hspace=0.38, wspace=0.3)
 
     # ================================================================
     # (0,0) MPKI & Misprediction Rate
@@ -123,7 +124,6 @@ def main():
     # (1,1) Entry Table Health — lifetime metrics
     # ================================================================
     ax4 = fig.add_subplot(gs[1, 1])
-    has_lifetime = any(k in data for k in ("Tlast_zu%", "Tlast_avgp", "Tlast_evict"))
     if "Tlast_zu%" in data:
         ax4.plot(wins, data["Tlast_zu%"], color="#d62728", linewidth=1.2,
                  label="Zero-Use Eviction %")
@@ -144,79 +144,140 @@ def main():
     ax4.grid(True, alpha=0.2)
 
     # ================================================================
-    # (2,0) Collision Rate + Entry Utilization
+    # (2,0) Pipeline Efficiency — extra cycles + true block %
     # ================================================================
     ax5 = fig.add_subplot(gs[2, 0])
-    if "coll%" in data:
-        ax5.plot(wins, data["coll%"], color="#e377c2", linewidth=1.2,
-                 label="Collision %")
-        ax5.set_ylabel("Collision %", color="#e377c2")
-    if "Tlast_used" in data:
+    has_pipe = False
+    if "extra%" in data:
+        ax5.plot(wins, data["extra%"], color="#d62728", linewidth=1.2,
+                 label="Extra Cycles %")
+        has_pipe = True
+    ax5.set_ylabel("Extra Cycles %", color="#d62728")
+    ax5.tick_params(axis="y", labelcolor="#d62728")
+    if "true_blk%" in data:
         ax5b = ax5.twinx()
-        ax5b.plot(wins, data["Tlast_used"], color="#17becf", linewidth=1.0,
-                  label="Entries Used")
-        ax5b.set_ylabel("Entries w/ Tag Match")
+        ax5b.plot(wins, data["true_blk%"], color="#2ca02c", linewidth=1.0,
+                  alpha=0.7, label="True Block %")
+        ax5b.set_ylabel("True Block %", color="#2ca02c")
+        ax5b.tick_params(axis="y", labelcolor="#2ca02c")
+        has_pipe = True
         lines5a = ax5.get_legend_handles_labels()
         lines5b = ax5b.get_legend_handles_labels()
         ax5.legend(lines5a[0] + lines5b[0], lines5a[1] + lines5b[1],
                    loc="upper right", fontsize=7)
-    ax5.set_title("Collision Rate & Entry Utilization")
+    elif has_pipe:
+        ax5.legend(loc="upper right", fontsize=7)
+    ax5.set_title("Pipeline Efficiency")
     ax5.grid(True, alpha=0.2)
 
     # ================================================================
-    # (2,1) Per-Window Stuck & Hard PCs
+    # (2,1) Block Structure — i/blk, br/blk, branch volume
     # ================================================================
     ax6 = fig.add_subplot(gs[2, 1])
-    if "win_stuck" in data:
-        ax6.bar(wins, data["win_stuck"], width=0.8, alpha=0.7,
-                color="#d62728", label="Stuck PCs (no alloc, has misp)")
-    if "win_hard" in data:
-        ax6.bar(wins, data["win_hard"], width=0.4, alpha=0.7,
-                color="#ff7f0e", label="Hard PCs (<60% bias)")
-    ax6.set_ylabel("PC Count")
-    ax6.set_title("Per-Window Problem Branches")
-    ax6.legend(loc="upper right", fontsize=7)
+    has_blk = False
+    if "i/blk" in data:
+        ax6.plot(wins, data["i/blk"], color="#1f77b4", linewidth=1.2,
+                 label="Instr/Block")
+        has_blk = True
+    if "br/blk" in data:
+        ax6.plot(wins, data["br/blk"], color="#ff7f0e", linewidth=1.0,
+                 alpha=0.8, label="Branches/Block")
+        has_blk = True
+    ax6.set_ylabel("Per-Block Avg")
+    if "br" in data:
+        ax6b = ax6.twinx()
+        ax6b.fill_between(wins, data["br"], alpha=0.15, color="#9467bd",
+                          label="Branch Volume")
+        ax6b.plot(wins, data["br"], color="#9467bd", linewidth=0.6, alpha=0.4)
+        ax6b.set_ylabel("Branches / Window", color="#9467bd")
+        ax6b.tick_params(axis="y", labelcolor="#9467bd")
+        has_blk = True
+        lines6a = ax6.get_legend_handles_labels()
+        lines6b = ax6b.get_legend_handles_labels()
+        ax6.legend(lines6a[0] + lines6b[0], lines6a[1] + lines6b[1],
+                   loc="upper right", fontsize=7)
+    elif has_blk:
+        ax6.legend(loc="upper right", fontsize=7)
+    ax6.set_title("Block Structure & Branch Volume")
     ax6.grid(True, alpha=0.2)
 
     # ================================================================
-    # (3,0) MPKI Histogram
+    # (3,0) Collision Rate + Entry Utilization
     # ================================================================
     ax7 = fig.add_subplot(gs[3, 0])
-    if "MPKI" in data:
-        mpki_vals = data["MPKI"]
-        ax7.hist(mpki_vals, bins=30, color="#1f77b4", alpha=0.7, edgecolor="black",
-                 linewidth=0.5)
-        ax7.axvline(np.mean(mpki_vals), color="#d62728", linestyle="--",
-                    linewidth=1.5, label=f"Mean: {np.mean(mpki_vals):.1f}")
-        ax7.axvline(np.median(mpki_vals), color="#2ca02c", linestyle="--",
-                    linewidth=1.5, label=f"Median: {np.median(mpki_vals):.1f}")
-        ax7.set_xlabel("MPKI")
-        ax7.set_ylabel("Window Count")
-        ax7.set_title("MPKI Distribution Across Windows")
-        ax7.legend(fontsize=8)
+    if "coll%" in data:
+        ax7.plot(wins, data["coll%"], color="#e377c2", linewidth=1.2,
+                 label="Collision %")
+        ax7.set_ylabel("Collision %", color="#e377c2")
+    if "Tlast_used" in data:
+        ax7b = ax7.twinx()
+        ax7b.plot(wins, data["Tlast_used"], color="#17becf", linewidth=1.0,
+                  label="Entries Used")
+        ax7b.set_ylabel("Entries w/ Tag Match")
+        lines7a = ax7.get_legend_handles_labels()
+        lines7b = ax7b.get_legend_handles_labels()
+        ax7.legend(lines7a[0] + lines7b[0], lines7a[1] + lines7b[1],
+                   loc="upper right", fontsize=7)
+    ax7.set_title("Collision Rate & Entry Utilization")
     ax7.grid(True, alpha=0.2)
 
     # ================================================================
-    # (3,1) Average Provider Share — horizontal bar
+    # (3,1) Per-Window Stuck & Hard PCs
     # ================================================================
     ax8 = fig.add_subplot(gs[3, 1])
+    if "win_stuck" in data:
+        ax8.bar(wins, data["win_stuck"], width=0.8, alpha=0.7,
+                color="#d62728", label="Stuck PCs (no alloc, has misp)")
+    if "win_hard" in data:
+        ax8.bar(wins, data["win_hard"], width=0.4, alpha=0.7,
+                color="#ff7f0e", label="Hard PCs (<60% bias)")
+    ax8.set_ylabel("PC Count")
+    ax8.set_title("Per-Window Problem Branches")
+    ax8.legend(loc="upper right", fontsize=7)
+    ax8.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (4,0) MPKI Histogram
+    # ================================================================
+    ax9 = fig.add_subplot(gs[4, 0])
+    if "MPKI" in data:
+        mpki_vals = data["MPKI"]
+        ax9.hist(mpki_vals, bins=30, color="#1f77b4", alpha=0.7, edgecolor="black",
+                 linewidth=0.5)
+        ax9.axvline(np.mean(mpki_vals), color="#d62728", linestyle="--",
+                    linewidth=1.5, label=f"Mean: {np.mean(mpki_vals):.3f}")
+        ax9.axvline(np.median(mpki_vals), color="#2ca02c", linestyle="--",
+                    linewidth=1.5, label=f"Median: {np.median(mpki_vals):.3f}")
+        p95 = np.percentile(mpki_vals, 95)
+        ax9.axvline(p95, color="#ff7f0e", linestyle=":",
+                    linewidth=1.2, label=f"P95: {p95:.3f}")
+        ax9.set_xlabel("MPKI")
+        ax9.set_ylabel("Window Count")
+        ax9.set_title("MPKI Distribution Across Windows")
+        ax9.legend(fontsize=8)
+    ax9.grid(True, alpha=0.2)
+
+    # ================================================================
+    # (4,1) Average Provider Share — horizontal bar
+    # ================================================================
+    ax10 = fig.add_subplot(gs[4, 1])
     if prov_cols:
         avg_shares = [np.mean(data[c]) for c in prov_cols]
         colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(prov_cols)))
         y_pos = np.arange(len(prov_cols))
-        ax8.barh(y_pos, avg_shares, color=colors, alpha=0.8, edgecolor="black",
+        ax10.barh(y_pos, avg_shares, color=colors, alpha=0.8, edgecolor="black",
                  linewidth=0.3)
-        ax8.set_yticks(y_pos)
-        ax8.set_yticklabels(prov_cols, fontsize=8)
-        ax8.set_xlabel("Average Provider Share %")
-        ax8.set_title("Mean Provider Distribution")
+        ax10.set_yticks(y_pos)
+        ax10.set_yticklabels(prov_cols, fontsize=8)
+        ax10.set_xlabel("Average Provider Share %")
+        ax10.set_title("Mean Provider Distribution")
         for i, v in enumerate(avg_shares):
             if v > 1.0:
-                ax8.text(v + 0.3, i, f"{v:.1f}%", va="center", fontsize=7)
-    ax8.grid(True, alpha=0.2, axis="x")
+                ax10.text(v + 0.3, i, f"{v:.1f}%", va="center", fontsize=7)
+    ax10.grid(True, alpha=0.2, axis="x")
 
     # ---- Common x-label ----
-    for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
+    for ax in [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8]:
         ax.set_xlabel("Window", fontsize=8)
 
     fig.suptitle(f"TAMonitor Dashboard — {path}", fontsize=13, fontweight="bold")

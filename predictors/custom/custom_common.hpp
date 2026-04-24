@@ -133,6 +133,8 @@ enum class DecayOp { DECREMENT, HALVE, CLEAR };
 enum class SiblingPolicy { NONE, ALL };
 // What happens to u-bit when provider mispredicts
 enum class UMispPolicy { UNTOUCHED, ZERO, DECREMENT };
+// Alloc-failure u-bit policy for tables above provider
+enum class UClearPolicy { DISABLED, ZERO, DECREMENT };
 
 // ============================================================================
 // geometric_folds_ex — geometric_folds with templated update mode

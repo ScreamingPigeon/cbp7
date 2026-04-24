@@ -60,7 +60,8 @@ template <
     u64 CTR_WIDTH = 1,          // prediction counter width per lane
     u64 HYST_WIDTH = 2,         // hysteresis width (separate from ctr)
     u64 U_WIDTH = 2,            // usefulness counter width
-    UMispPolicy U_MISP = UMispPolicy::UNTOUCHED, // u-bit on mispredict
+    UMispPolicy U_MISP = UMispPolicy::UNTOUCHED,   // u-bit on provider mispredict
+    UClearPolicy U_CLEAR = UClearPolicy::DECREMENT, // u-bit on alloc failure
     u64 FB_CAPACITY = 8192 / 2, // fallback table size (bimodal or gshare)
     bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
     u64 GS_HIST = 6,            // gshare history length (only when USE_GSHARE)
@@ -260,15 +261,9 @@ struct TageAhead : predictor {
   reg<ACC_WIDTH> acc_ctr;
   reg<ALLOC_WIDTH> alloc_ctr;
 
-  // Allocation LFSR (8-bit, hardware randomness for target policy + action
-  // gating)
-  reg<8> alloc_lfsr;
-
-  // Per-table LFSRs (varying widths via tuple)
+  // Decay LFSR widths (used to parameterize std::rand() masking)
   static constexpr u64 MAX_LFSR_WIDTH =
       DECAY_ENABLE ? ta::array_max(DECAY_LFSR_WIDTHS) : 1;
-  typename ta::TALfsrTuple<DECAY_LFSR_WIDTHS,
-                           std::make_index_sequence<NT>>::type decay_lfsrs;
 
   // ---- Prediction reg (shared by
   // predict1/reuse_predict1/predict2/reuse_predict2) ----
@@ -281,7 +276,80 @@ struct TageAhead : predictor {
 
 #ifdef TAGE_MONITOR
   TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY> mon;
-  ~TageAhead() { mon.print_summary(); }
+  ~TageAhead() {
+    mon.print_summary();
+    print_params(std::cerr);
+  }
+  void print_params(std::ostream &os) const {
+    os << "\n=== TageAhead Parameters ===\n";
+    os << "Tables: " << NT << "  N: " << N
+       << "  PathBits: " << PATHBITS
+       << "  HistMode: " << (HIST_MODE == HistUpdate::PATH ? "PATH"
+                             : HIST_MODE == HistUpdate::DIR ? "DIR" : "BOTH")
+       << "\n";
+    os << "HistLen: [";
+    for (u64 i = 0; i < NT; i++)
+      os << (i ? "," : "") << TableCfg::HIST_LEN[i];
+    os << "]\n";
+    os << "TableSize: [";
+    for (u64 i = 0; i < NT; i++)
+      os << (i ? "," : "") << TableCfg::TABLE_SIZE[i];
+    os << "]\n";
+    os << "TagWidth: [";
+    for (u64 i = 0; i < NT; i++)
+      os << (i ? "," : "") << TableCfg::TAG_WIDTH[i];
+    os << "]\n";
+    os << "CtrWidth: " << CTR_WIDTH << "  HystWidth: " << HYST_WIDTH
+       << "  SharedHyst: " << (SHARED_HYS ? "yes" : "no") << "\n";
+    os << "SecTag: " << (USE_SEC_TAG ? "yes" : "no")
+       << "  SecTagBits: " << SEC_TAG_BITS
+       << "  NumPaths: " << NUM_PATHS << "\n";
+    os << "UWidth: " << U_WIDTH
+       << "  UMisp: " << (U_MISP == UMispPolicy::UNTOUCHED ? "UNTOUCHED"
+                          : U_MISP == UMispPolicy::ZERO ? "ZERO" : "DECREMENT")
+       << "  UClear: " << (U_CLEAR == UClearPolicy::DISABLED ? "DISABLED"
+                           : U_CLEAR == UClearPolicy::ZERO ? "ZERO" : "DECREMENT")
+       << "\n";
+    os << "Fallback: " << (USE_GSHARE ? "Gshare" : "Bimodal")
+       << "  Capacity: " << FB_CAPACITY;
+    if (USE_GSHARE) os << "  GsHist: " << GS_HIST;
+    os << "  Reconcile: " << (FB_RECONCILE ? "yes" : "no") << "\n";
+    os << "Meta: width=" << META_WIDTH << " cap=" << META_CAPACITY
+       << " pipe=" << META_PIPE << "\n";
+    os << "Alloc: action="
+       << (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD ? "STANDARD"
+           : AllocCfg::ALLOC_ACTION == AllocAction::FILTERED ? "FILTERED"
+           : "THROTTLED")
+       << "  SiblingPolicy="
+       << (SIBLING_POLICY == SiblingPolicy::NONE ? "NONE" : "ALL")
+       << "  SiblingFloor=" << SIBLING_TABLE_FLOOR
+       << "  FarAllocDist=" << FARALLOC_DIST << "\n";
+    os << "Pressure: AccWidth=" << ACC_WIDTH
+       << "  AllocWidth=" << ALLOC_WIDTH << "\n";
+    os << "Epoch: " << (EPOCH_ENABLE ? "yes" : "no");
+    if (EPOCH_ENABLE)
+      os << "  ResetAcc=" << (EPOCH_RESET_ACC ? "yes" : "no")
+         << "  ResetAlloc=" << (EPOCH_RESET_ALLOC ? "yes" : "no");
+    os << "\n";
+    os << "Decay: " << (DECAY_ENABLE ? "yes" : "no");
+    if (DECAY_ENABLE) {
+      os << "  Miss="
+         << (DECAY_MISS == DecayMiss::TAG ? "TAG"
+             : DECAY_MISS == DecayMiss::TAG_OR_SEC ? "TAG_OR_SEC"
+             : "TAG_AND_SEC")
+         << "  Op="
+         << (DECAY_OP == DecayOp::DECREMENT ? "DECREMENT" : "ZERO")
+         << "  LfsrWidths=[";
+      for (u64 i = 0; i < NT; i++)
+        os << (i ? "," : "") << DECAY_LFSR_WIDTHS[i];
+      os << "]";
+    }
+    os << "\n";
+    os << "LineInst: " << LINEINST
+       << "  ReverseTableOrder: " << (REVERSE_TABLE_ORDER ? "yes" : "no")
+       << "\n";
+    os << "=== End Parameters ===\n\n";
+  }
 #endif
 
   // ======================================================================
@@ -1054,8 +1122,7 @@ struct TageAhead : predictor {
     val<NT> triggermask = alloc_trigger.fo1().replicate(hard<NT>{}).concat();
 
     // 3b. Allocation action (probabilistic gating)
-    alloc_lfsr.fanout(hard<2>{}); // alloc_rng read + LFSR tick read
-    val<8> alloc_rng = val<8>{alloc_lfsr};
+    val<8> alloc_rng = val<8>{static_cast<u64>(std::rand()) & 0xFF};
     val<NT> gated_triggermask = [&]() -> val<NT> {
       if constexpr (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD) {
         return triggermask.fo1();
@@ -1079,10 +1146,12 @@ struct TageAhead : predictor {
     };
     val<NT> notumask = u_zero.fo1().concat();
     // NOTE: @prakhar @claude ensure hardcoded fanout is correct
-    notumask.fanout(hard<2>{}); // candallocmask(1) + noalloc(1)
+    static constexpr bool UCLEAR_ACTIVE = U_CLEAR != UClearPolicy::DISABLED;
     val<NT> postmask = alloc_base.fo1() & gated_triggermask.fo1();
-    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
-    postmask.fanout(hard<3>{}); // candallocmask(1) + uclearmask(1) + noalloc(1)
+    if constexpr (UCLEAR_ACTIVE) {
+      notumask.fanout(hard<2>{}); // candallocmask(1) + noalloc(1)
+      postmask.fanout(hard<3>{}); // candallocmask(1) + noalloc(1) + uclearmask(1)
+    }
     val<NT> candallocmask = [&]() {
       val<NT> base = postmask & notumask;
       if constexpr (USE_SEC_TAG && SIBLING_POLICY == SiblingPolicy::ALL) {
@@ -1184,14 +1253,18 @@ struct TageAhead : predictor {
     }();
     alloc_target.fanout(hard<2>{}); // line 1395(!= hard<0>) + line
                                     // 1401(allocmask1, if FARALLOC_DIST>0)
-    // noalloc: only if there are truly no u=0 entries above provider.
-    // Sibling-skip is a deliberate no-op — don't penalize the set by
-    // clearing u-bits when the only u=0 slots were siblings.
-    val<1> noalloc = ((postmask & notumask) == hard<0>{});
-    val<NT> uclearmask =
-        postmask & noalloc.fo1().replicate(hard<NT>{}).concat();
-    arr<val<1>, NT> uclear = uclearmask.fo1().make_array(val<1>{});
-    // NOTE: @prakhar @claude ensure hardcoded fanout is correct
+    // uclear: on alloc failure, optionally modify u-bits of tables above
+    // provider. DISABLED = no-op, ZERO = clear to 0, DECREMENT = sat dec.
+    arr<val<1>, NT> uclear = [&]() -> arr<val<1>, NT> {
+      if constexpr (U_CLEAR == UClearPolicy::DISABLED) {
+        return arr<val<1>, NT>{[](u64) -> val<1> { return hard<0>{}; }};
+      } else {
+        val<1> noalloc = ((postmask & notumask) == hard<0>{});
+        val<NT> uclearmask =
+            postmask & noalloc.fo1().replicate(hard<NT>{}).concat();
+        return uclearmask.fo1().make_array(val<1>{});
+      }
+    }();
     uclear.fanout(hard<2>{});
 
 #ifdef TAGE_MONITOR
@@ -1218,20 +1291,24 @@ struct TageAhead : predictor {
         }
       }
       // u-clear source tracking: per-table breakdown
-      u64 ucm = static_cast<u64>(uclearmask);
-      u64 pm = static_cast<u64>(postmask);
-      u64 num = static_cast<u64>(notumask);
-      u64 cam = static_cast<u64>(candallocmask);
-      bool had_u0 = (pm & num) != 0;
-      bool had_cand = cam != 0;
-      for (u64 i = 0; i < NT; i++) {
-        if (ucm & (u64(1) << i))
-          mon.record_uclear_source(i, 0); // alloc_fail (genuine)
-        // Would-have-been sibling uclear: u=0 existed but candallocmask
-        // filtered it out (sibling skip). Under old code this triggered uclear.
-        if (!(ucm & (u64(1) << i)) && (pm & (u64(1) << i)) &&
-            had_u0 && !had_cand && static_cast<u64>(alloc_trigger))
-          mon.record_uclear_source(i, 1); // sibling (counterfactual)
+      if constexpr (UCLEAR_ACTIVE) {
+        // Reconstruct uclearmask from postmask/notumask (same logic as alloc).
+        u64 pm = static_cast<u64>(postmask);
+        u64 num = static_cast<u64>(notumask);
+        u64 cam = static_cast<u64>(candallocmask);
+        bool had_u0 = (pm & num) != 0;
+        bool had_cand = cam != 0;
+        bool noalloc = (pm & num) == 0;
+        u64 ucm = noalloc ? pm : 0;
+        for (u64 i = 0; i < NT; i++) {
+          if (ucm & (u64(1) << i))
+            mon.record_uclear_source(i, 0); // alloc_fail (genuine)
+          // Would-have-been sibling uclear: u=0 existed but candallocmask
+          // filtered it out (sibling skip). Under old code this triggered uclear.
+          if (!(ucm & (u64(1) << i)) && (pm & (u64(1) << i)) &&
+              had_u0 && !had_cand && static_cast<u64>(alloc_trigger))
+            mon.record_uclear_source(i, 1); // sibling (counterfactual)
+        }
       }
     }
 #endif
@@ -1393,31 +1470,50 @@ struct TageAhead : predictor {
           return t_m1[I] & t_ad & table_wrong;
       }();
       val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
+      // Need u_dec when U_MISP==DECREMENT or U_CLEAR==DECREMENT
+      static constexpr bool NEED_DEC =
+          U_MISP == UMispPolicy::DECREMENT || U_CLEAR == UClearPolicy::DECREMENT;
       // u_inc: ==maxval(1) + select_true(1) + +1(1) = 3
-      // u_dec (DECREMENT only): ==0(1) + select_true(1) + -1(1) = 3
-      old_u.fanout(hard<3 + (U_MISP == UMispPolicy::DECREMENT ? 3 : 0)>{});
-      // Saturating increment/decrement for u-bit
+      // u_dec: ==0(1) + select_true(1) + -1(1) = 3
+      old_u.fanout(hard<3 + (NEED_DEC ? 3 : 0)>{});
       auto u_inc = select(old_u == hard<old_u.maxval>{}, old_u,
                           val<U_WIDTH>{old_u + 1});
+      auto u_dec = [&]() {
+        if constexpr (NEED_DEC)
+          return select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
+        else
+          return val<U_WIDTH>{0}; // unused placeholder
+      }();
+
+      // uclear value: DISABLED → old_u (no-op), ZERO → 0, DECREMENT → dec
+      auto uclear_val = [&]() -> val<U_WIDTH> {
+        if constexpr (U_CLEAR == UClearPolicy::DISABLED)
+          return old_u; // never reached (uclear always 0), but type-correct
+        else if constexpr (U_CLEAR == UClearPolicy::ZERO)
+          return val<U_WIDTH>{0};
+        else
+          return u_dec;
+      }();
+
+      // Priority: allocate (zero) > u_correct (inc) > u_wrong (policy) >
+      //           uclear (policy) > old_u (no-op)
+      // base_newu: what to write. base_u_write: whether to write.
       val<U_WIDTH> base_newu = [&]() -> val<U_WIDTH> {
-        if constexpr (U_MISP == UMispPolicy::UNTOUCHED) {
-          // Only write on correct (increment) or alloc/uclear (zero)
-          return select(u_correct, u_inc,
-                        val<U_WIDTH>{~allocate[I]} & val<U_WIDTH>{~uclear[I]});
-        } else if constexpr (U_MISP == UMispPolicy::ZERO) {
-          // Correct → increment, wrong → zero, alloc/uclear → zero
-          return select(u_correct, u_inc,
-                        val<U_WIDTH>{~u_wrong} &
-                        val<U_WIDTH>{~allocate[I]} &
-                        val<U_WIDTH>{~uclear[I]});
-        } else { // DECREMENT
-          // Correct → increment, wrong → decrement, alloc/uclear → zero
-          auto u_dec = select(old_u == hard<0>{}, old_u,
-                              val<U_WIDTH>{old_u - 1});
-          return select(u_correct, u_inc,
-                 select(u_wrong, u_dec,
-                        val<U_WIDTH>{~allocate[I]} & val<U_WIDTH>{~uclear[I]}));
-        }
+        // wrong value: UNTOUCHED → n/a, ZERO → 0, DECREMENT → dec
+        auto wrong_or_clear = [&]() -> val<U_WIDTH> {
+          if constexpr (U_MISP == UMispPolicy::ZERO)
+            return select(u_wrong, val<U_WIDTH>{0},
+                   select(uclear[I], uclear_val,
+                   select(allocate[I], val<U_WIDTH>{0}, old_u)));
+          else if constexpr (U_MISP == UMispPolicy::DECREMENT)
+            return select(u_wrong, u_dec,
+                   select(uclear[I], uclear_val,
+                   select(allocate[I], val<U_WIDTH>{0}, old_u)));
+          else // UNTOUCHED
+            return select(uclear[I], uclear_val,
+                   select(allocate[I], val<U_WIDTH>{0}, old_u));
+        }();
+        return select(u_correct, u_inc, wrong_or_clear);
       }();
       val<1> base_u_write = (u_correct | u_wrong) | allocate[I] | uclear[I];
       base_u_write.fanout(
@@ -1430,7 +1526,6 @@ struct TageAhead : predictor {
                   base_u_write}; // move: fo1 path (credit >= 0 ok)
         } else {
           constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
-          auto &lfsr = std::get<I>(decay_lfsrs);
 
           // Miss condition from piped tag/sec hit
           val<1> tag_missed = ~val<1>{train_tag_hit[I]};
@@ -1452,9 +1547,10 @@ struct TageAhead : predictor {
           auto thresh = DecayThreshFn::template compute<I, LW>(
               val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr});
 
-          // LFSR fires when below threshold, on miss, not allocating
+          // Random fires when below threshold, on miss, not allocating
+          val<LW> rng = val<LW>{static_cast<u64>(std::rand())};
           val<1> decay_fire =
-              decay_miss & ~allocate[I] & (val<LW>{lfsr} < thresh);
+              decay_miss & ~allocate[I] & (rng < thresh);
 
           // Apply decay op to train_u
           val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
@@ -1566,31 +1662,7 @@ struct TageAhead : predictor {
                           static_cast<u64>(alloc_ctr));
 #endif
 
-    // ---- Allocation LFSR tick (8-bit, polynomial x^8+x^6+x^5+x^4+1) ----
-    {
-      val<8> old = val<8>{alloc_lfsr};
-      old.fanout(hard<2>{}); // fb (1) + shifted (1)
-      val<1> fb = old & hard<1>{};
-      val<8> shifted = val<8>{old >> 1};
-      val<8> tap = val<8>{u64(1) << 7};
-      alloc_lfsr =
-          shifted.fo1() ^ (tap.fo1() & fb.fo1().replicate(hard<8>{}).concat());
-    }
-
-    // ---- Decay: LFSR tick ----
-    if constexpr (DECAY_ENABLE) {
-      static_loop<NT>([&]<u64 I>() {
-        constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
-        auto &lfsr = std::get<I>(decay_lfsrs);
-        val<LW> old_lfsr = val<LW>{lfsr};
-        old_lfsr.fanout(hard<2>{}); // feedback (1) + shifted (1)
-        val<1> feedback = old_lfsr & hard<1>{};
-        val<LW> shifted = val<LW>{old_lfsr >> 1};
-        val<LW> tap_mask = val<LW>{u64(1) << (LW - 1)};
-        lfsr = shifted.fo1() ^
-               (tap_mask.fo1() & feedback.fo1().replicate(hard<LW>{}).concat());
-      });
-    }
+    // Decay LFSRs replaced by std::rand() — no tick needed.
 
     // ---- Step 8: History update ----
     // true_block uses framework's mispredict signal (not our computed
