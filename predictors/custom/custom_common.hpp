@@ -677,10 +677,12 @@ struct TATable {
   static_assert(TAG_RAM_WIDTH >= TAG_WIDTH,
                 "TAG_RAM_WIDTH must be >= TAG_WIDTH");
 
-  // ---- RAMs ----
+  // ---- RAMs (predict-path critical) ----
   hcm::ram<val<TAG_RAM_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
   ta_rwram<PRED_BITS, TABLE_SIZE, 2>      pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
+  // ---- RAMs (update-only) ----
+  hcm::zone ta_update_zone;
   ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
   ta_rwram<U_WIDTH, TABLE_SIZE, 2>        u_ram{"ta_u"};
 

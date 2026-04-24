@@ -56,18 +56,18 @@ template <
     bool USE_SEC_TAG = true, // enable secondary tag matching
     u64 NUM_PATHS = 1, // parallel resolution chains (paper: 1 << SEC_TAG_BITS)
     typename SecTagHashFn =
-        ta::DefaultSecTagHash, // sec_tag hash: PC → val<SEC_TAG_BITS>
-    u64 CTR_WIDTH = 1,         // prediction counter width per lane
-    u64 HYST_WIDTH = 2,        // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 1,           // usefulness counter width
-    u64 FB_CAPACITY = 8192,    // fallback table size (bimodal or gshare)
-    bool USE_GSHARE = false,   // use gshare base (PC^history) vs bimodal (PC)
-    u64 GS_HIST = 6,           // gshare history length (only when USE_GSHARE)
-    u64 META_WIDTH = 4,        // meta counter width (provider vs alt)
-    u64 META_CAPACITY = 256,   // meta table entries
-    u64 META_PIPE = 2,         // meta pipeline depth
-    u64 LINEINST = 1024,       // line size in instructions
-    bool SHARED_HYS = true,    // shared hyst: 2 entries share 1 counter
+        ta::DefaultSecTagHash,  // sec_tag hash: PC → val<SEC_TAG_BITS>
+    u64 CTR_WIDTH = 1,          // prediction counter width per lane
+    u64 HYST_WIDTH = 2,         // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 1,            // usefulness counter width
+    u64 FB_CAPACITY = 8192 / 2, // fallback table size (bimodal or gshare)
+    bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
+    u64 GS_HIST = 6,            // gshare history length (only when USE_GSHARE)
+    u64 META_WIDTH = 4,         // meta counter width (provider vs alt)
+    u64 META_CAPACITY = 256,    // meta table entries
+    u64 META_PIPE = 2,          // meta pipeline depth
+    u64 LINEINST = 1024,        // line size in instructions
+    bool SHARED_HYS = true,     // shared hyst: 2 entries share 1 counter
     HistUpdate HIST_MODE =
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
     // ---- Allocation policy ----
@@ -145,6 +145,8 @@ struct TageAhead : predictor {
     return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
   }
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
+  // ---- Update-only RAMs ----
+  hcm::zone update_zone;
   // Fallback hysteresis: tracks agreement between fb and TAGE.
   // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
   // Only accessed when FB_RECONCILE=true; zero cost otherwise.
