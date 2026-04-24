@@ -13,10 +13,11 @@ using namespace hcm;
 // Table Config
 // ============================================================================
 
-template <u64 N = 9, u64 SIZE = 2048, u64 TAG = 8, u64 MINH = 8, u64 MAXH = 100,
-          u64 SIZE_RATIO = 4, ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
-          typename TagFn = ta::StepTag<TAG, TAG - 2, N / 2>,
-          typename SizeFn = ta::InvGeoSize<SIZE, SIZE_RATIO>>
+template <u64 N = 12, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 4,
+          u64 MAXH = 500, u64 SIZE_RATIO = 1,
+          ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
+          typename TagFn = ta::StepTag<TAG, TAG - 3, N / 2>,
+          typename SizeFn = ta::UniformSize<SIZE>>
 struct TATableConfig {
   static constexpr u64 NUM_TABLES = N;
   static constexpr u64 MINHIST = MINH;
@@ -95,7 +96,7 @@ template <
     u64 FARALLOC_DIST = 0,
     // ---- Floorplan tuning ----
     // Reverse RAM declaration order so biggest tables are declared first.
-    bool REVERSE_TABLE_ORDER = true>
+    bool REVERSE_TABLE_ORDER = false>
 struct TageAhead : predictor {
 
   // ======== Derived Constants ========
@@ -131,17 +132,18 @@ struct TageAhead : predictor {
   // Storage
   // ======================================================================
   // ---- Table tuple (per-table tag width and table size) ----
-  using Tables = typename TAMakeTableTuple<TableCfg, CTR_WIDTH, HYST_WIDTH,
-                                           U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
-                                           REVERSE_TABLE_ORDER,
-                                           std::make_index_sequence<NT>>::type;
+  using Tables = typename TAMakeTableTuple<
+      TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
+      REVERSE_TABLE_ORDER, std::make_index_sequence<NT>>::type;
   Tables tables;
 
   // Access logical table I (remaps through reversed storage when needed)
-  template <u64 I>
-  auto &table() { return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables); }
-  template <u64 I>
-  const auto &table() const { return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables); }
+  template <u64 I> auto &table() {
+    return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
+  }
+  template <u64 I> const auto &table() const {
+    return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
+  }
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
   // Fallback hysteresis: tracks agreement between fb and TAGE.
   // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
@@ -669,7 +671,7 @@ struct TageAhead : predictor {
       // has_alt: true iff any TAGE table matched. If so, provider is a
       // table and fallback (always bit 0) is below it as alt.
       // Depends only on match — no match1 dependency.
-      val<1> ha = (match >> 1) != hard<0>{};
+      val<1> ha = val<NT>{match} != hard<0>{};
 
       val<MATCH_BITS> match1 = match.one_hot();
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
@@ -716,7 +718,7 @@ struct TageAhead : predictor {
         else
           return weak_mask;
       }();
-      val<1> pw = (val<NT>{match1 >> 1} & pw_mask.fo1()) != hard<0>{};
+      val<1> pw = (val<NT>{match1} & pw_mask.fo1()) != hard<0>{};
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       pw.fanout(hard<2>{}); // ua computation + train_provider_weak save
       // meta_use_alt: fo1() only safe for NUM_PATHS==1 (single chain call).
@@ -1349,7 +1351,7 @@ struct TageAhead : predictor {
       execute_if(gate_alloc, [&]() {
         // Use piped computed tag (from predict1 time, not current folds)
         t.tag_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                        val<t.tag_width>{train_ctag[I].fo1()});
+                        val<t.tag_ram_width>{train_ctag[I].fo1()});
         if constexpr (USE_SEC_TAG)
           t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
                           val<SEC_TAG_BITS>{sec_tag_alloc});
@@ -1473,7 +1475,7 @@ struct TageAhead : predictor {
           val<NT> allocmask1 = alloc_target;
           allocmask1.fanout(hard<2>{}); // used twice in line below: |
                                         // allocmask1, ^ allocmask1
-          val<NT> provider_bits = val<NT>{t_match1 >> 1};
+          val<NT> provider_bits = val<NT>{t_match1};
           val<1> faralloc =
               (((provider_bits >> FARALLOC_DIST) | allocmask1).one_hot() ^
                allocmask1) == hard<0>{};

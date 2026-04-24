@@ -654,7 +654,8 @@ template <u64 TABLE_SIZE,
           u64 U_WIDTH,
           u64 SEC_TAG_BITS,
           u64 N,            // max branches per block (= lanes of pred)
-          bool SHARED_HYS = false>  // shared hyst: 2 entries share 1 counter
+          bool SHARED_HYS = false,  // shared hyst: 2 entries share 1 counter
+          u64 TAG_RAM_WIDTH = TAG_WIDTH>  // RAM width for tag (uniform across tables)
 struct TATable {
   static constexpr u64 IDX_BITS = ta::clog2(TABLE_SIZE);
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -665,6 +666,7 @@ struct TATable {
   static constexpr u64 hyst_width = HYST_WIDTH;
   static constexpr u64 u_width = U_WIDTH;
   static constexpr u64 sec_tag_bits = SEC_TAG_BITS;
+  static constexpr u64 tag_ram_width = TAG_RAM_WIDTH;
 
   // When SHARED_HYS=true, halve the hyst table: pairs of entries share one counter
   static constexpr u64 HYST_SIZE = SHARED_HYS ? (TABLE_SIZE / 2) : TABLE_SIZE;
@@ -672,9 +674,11 @@ struct TATable {
 
   static_assert(TABLE_SIZE >= 2 && std::has_single_bit(TABLE_SIZE),
                 "TABLE_SIZE must be a power of 2 >= 2");
+  static_assert(TAG_RAM_WIDTH >= TAG_WIDTH,
+                "TAG_RAM_WIDTH must be >= TAG_WIDTH");
 
   // ---- RAMs ----
-  hcm::ram<val<TAG_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
+  hcm::ram<val<TAG_RAM_WIDTH>, TABLE_SIZE>    tag_ram{"ta_tag"};
   ta_rwram<PRED_BITS, TABLE_SIZE, 2>      pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
   ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
@@ -688,10 +692,12 @@ struct TATable {
 
 // Generate a TATable type from config arrays at index I
 template <typename Cfg, u64 I, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
-          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS = false>
+          u64 SEC_TAG_BITS, u64 N, bool SHARED_HYS = false,
+          u64 TAG_RAM_WIDTH = ta::array_max(Cfg::TAG_WIDTH)>
 using TATableAt =
     TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I],
-            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS>;
+            CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
+            TAG_RAM_WIDTH>;
 
 // Build a reversed index sequence: <N-1, N-2, ..., 1, 0>
 template <typename Seq> struct ReverseSeq;
