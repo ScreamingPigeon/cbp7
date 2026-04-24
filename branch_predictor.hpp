@@ -41,25 +41,6 @@ using TageAhead2C = TageAhead<
     4, 256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig,
     SiblingPolicy::NONE>;
 
-// Test configs: sibling skip variants of 2C
-using TageAhead2C_NoSib = TageAhead<
-    TATableConfig<28, 2048, 12, 4, 1000, 2,
-                  ta::HistSeries::GEOMETRIC,
-                  ta::UniformTag<12>,
-                  ta::StepSize<4096, 2048, 24>>,
-    8, 6, 3, true, 1, ta::DefaultSecTagHash, 1, 2, 1, 4096, false, 6,
-    4, 256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig,
-    SiblingPolicy::NONE>;
-
-using TageAhead2C_SibFloor14 = TageAhead<
-    TATableConfig<28, 2048, 12, 4, 1000, 2,
-                  ta::HistSeries::GEOMETRIC,
-                  ta::UniformTag<12>,
-                  ta::StepSize<4096, 2048, 24>>,
-    8, 6, 3, true, 1, ta::DefaultSecTagHash, 1, 2, 1, 4096, false, 6,
-    4, 256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig,
-    SiblingPolicy::ALL, 14>;
-
 #ifdef PREDICTOR
 using branch_predictor = PREDICTOR;
 #else
