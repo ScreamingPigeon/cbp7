@@ -234,6 +234,14 @@ constexpr std::array<T, N> uniform_array(T v) {
   return a;
 }
 
+// Two-zone array: v_lo for indices [0, SPLIT), v_hi for [SPLIT, N).
+template <typename T, std::size_t N>
+constexpr std::array<T, N> split_array(T v_lo, T v_hi, std::size_t split) {
+  std::array<T, N> a{};
+  for (std::size_t i = 0; i < N; i++) a[i] = (i < split) ? v_lo : v_hi;
+  return a;
+}
+
 constexpr u64 clog2(u64 x) {
   u64 r = 0, v = x - 1;
   while (v > 0) { v >>= 1; r++; }

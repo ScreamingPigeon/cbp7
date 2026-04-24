@@ -59,7 +59,7 @@ template <
         ta::DefaultSecTagHash,  // sec_tag hash: PC → val<SEC_TAG_BITS>
     u64 CTR_WIDTH = 1,          // prediction counter width per lane
     u64 HYST_WIDTH = 2,         // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 1,            // usefulness counter width
+    u64 U_WIDTH = 2,            // usefulness counter width
     u64 FB_CAPACITY = 8192 / 2, // fallback table size (bimodal or gshare)
     bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
     u64 GS_HIST = 6,            // gshare history length (only when USE_GSHARE)
@@ -73,8 +73,9 @@ template <
     // ---- Allocation policy ----
     typename AllocCfg = TADefaultAllocConfig,
     // ---- Sibling skip policy ----
-    SiblingPolicy SIBLING_POLICY = SiblingPolicy::ALL, // NONE=never skip, ALL=skip siblings
-    u64 SIBLING_TABLE_FLOOR = 0,      // skip siblings only for tables >= this index
+    SiblingPolicy SIBLING_POLICY =
+        SiblingPolicy::ALL,      // NONE=never skip, ALL=skip siblings
+    u64 SIBLING_TABLE_FLOOR = 0, // skip siblings only for tables >= this index
     // ---- Global pressure counters ----
     u64 ACC_WIDTH = 16,   // accuracy counter width
     u64 ALLOC_WIDTH = 16, // alloc pressure counter width
@@ -855,11 +856,12 @@ struct TageAhead : predictor {
     // Declare fanout on training regs before any reads:
     //   train_hyst[I]:     2 reads (t_hyst_weak_arr + training loop line ~1188)
     //   train_u[I]:        2 reads (u_zero lambda + decay line ~1254)
-    //   train_tag_hit[I]:  reads: (sibling lambda if active for I) + (decay if enabled)
-    //   train_sec_hit[I]:  reads: (sibling lambda if active for I) + (decay if enabled)
-    //   train_idx[I]:      5 reads (pred/hyst/tag/sec/u RAM writes)
-    //   single-read regs (match1/provider_pred/provider_weak/altdiff/pred/ctag)
-    //   use fo1() at the point of use below.
+    //   train_tag_hit[I]:  reads: (sibling lambda if active for I) + (decay if
+    //   enabled) train_sec_hit[I]:  reads: (sibling lambda if active for I) +
+    //   (decay if enabled) train_idx[I]:      5 reads (pred/hyst/tag/sec/u RAM
+    //   writes) single-read regs
+    //   (match1/provider_pred/provider_weak/altdiff/pred/ctag) use fo1() at the
+    //   point of use below.
     static_loop<NT>([&]<u64 I>() {
       train_hyst[I].fanout(
           hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
@@ -1065,8 +1067,8 @@ struct TageAhead : predictor {
         };
         // Apply floor: force not_sibling=1 for tables below floor.
         // FLOOR_MASK has bits set only for tables >= SIBLING_TABLE_FLOOR.
-        val<NT> sibling_mask = not_sibling.fo1().concat() |
-                               ~val<NT>{hard<FLOOR_MASK>{}};
+        val<NT> sibling_mask =
+            not_sibling.fo1().concat() | ~val<NT>{hard<FLOOR_MASK>{}};
         return base.fo1() & sibling_mask;
       } else {
         return base.fo1();
