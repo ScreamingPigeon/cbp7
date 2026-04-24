@@ -134,6 +134,7 @@ struct ta_folded_gh {
 enum class HistUpdate { PATH, DIR, BOTH };
 enum class DecayMiss { TAG, SEC, TAG_OR_SEC, TAG_AND_SEC };
 enum class DecayOp { DECREMENT, HALVE, CLEAR };
+enum class SiblingPolicy { NONE, ALL };
 
 // ============================================================================
 // geometric_folds_ex — geometric_folds with templated update mode

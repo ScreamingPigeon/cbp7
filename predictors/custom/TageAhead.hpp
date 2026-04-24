@@ -72,6 +72,9 @@ template <
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
     // ---- Allocation policy ----
     typename AllocCfg = TADefaultAllocConfig,
+    // ---- Sibling skip policy ----
+    SiblingPolicy SIBLING_POLICY = SiblingPolicy::ALL, // NONE=never skip, ALL=skip siblings
+    u64 SIBLING_TABLE_FLOOR = 0,      // skip siblings only for tables >= this index
     // ---- Global pressure counters ----
     u64 ACC_WIDTH = 16,   // accuracy counter width
     u64 ALLOC_WIDTH = 16, // alloc pressure counter width
@@ -852,8 +855,8 @@ struct TageAhead : predictor {
     // Declare fanout on training regs before any reads:
     //   train_hyst[I]:     2 reads (t_hyst_weak_arr + training loop line ~1188)
     //   train_u[I]:        2 reads (u_zero lambda + decay line ~1254)
-    //   train_tag_hit[I]:  2 reads (not_sibling lambda + decay line ~1230)
-    //   train_sec_hit[I]:  2 reads (not_sibling lambda + decay line ~1235)
+    //   train_tag_hit[I]:  reads: (sibling lambda if active for I) + (decay if enabled)
+    //   train_sec_hit[I]:  reads: (sibling lambda if active for I) + (decay if enabled)
     //   train_idx[I]:      5 reads (pred/hyst/tag/sec/u RAM writes)
     //   single-read regs (match1/provider_pred/provider_weak/altdiff/pred/ctag)
     //   use fo1() at the point of use below.
@@ -862,10 +865,20 @@ struct TageAhead : predictor {
           hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
       train_u[I].fanout(
           hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
-      train_tag_hit[I].fanout(
-          hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
-      train_sec_hit[I].fanout(
-          hard<2>{}); // NOTE: @prakhar @claude validate hardcoded fanout
+      // sibling skip reads train_tag_hit/train_sec_hit for ALL tables
+      // when SIBLING_POLICY==ALL (runtime lambda iterates all indices).
+      // SIBLING_TABLE_FLOOR masks the result post-hoc, not the read.
+      static constexpr bool SIBLING_ACTIVE =
+          USE_SEC_TAG && SIBLING_POLICY == SiblingPolicy::ALL;
+      static constexpr u64 TAG_HIT_READS =
+          (SIBLING_ACTIVE ? 1 : 0) + (DECAY_ENABLE ? 1 : 0);
+      static constexpr u64 SEC_HIT_READS =
+          (SIBLING_ACTIVE ? 1 : 0) + (DECAY_ENABLE ? 1 : 0);
+      if constexpr (TAG_HIT_READS > 1)
+        train_tag_hit[I].fanout(hard<TAG_HIT_READS>{});
+      if constexpr (SEC_HIT_READS > 1)
+        train_sec_hit[I].fanout(hard<SEC_HIT_READS>{});
+      // TAG/SEC_HIT_READS==1 → use fo1() at point of use; ==0 → unreferenced
       train_idx[I].fanout(
           hard<5>{}); // NOTE: @prakhar @claude validate hardcoded fanout
     });
@@ -1035,14 +1048,26 @@ struct TageAhead : predictor {
     postmask.fanout(hard<2>{});
     val<NT> candallocmask = [&]() {
       val<NT> base = postmask & notumask.fo1();
-      if constexpr (USE_SEC_TAG) {
+      if constexpr (USE_SEC_TAG && SIBLING_POLICY == SiblingPolicy::ALL) {
         // Allocation promotion (Cai/Deshmukh/Patt ISCA'25 Sec 4.3):
         // Skip entries with same primary tag but different sec_tag (siblings).
         // Promotes allocation to the next higher table.
+        // SIBLING_TABLE_FLOOR: only skip for tables >= floor index.
+        // Below floor: always 1 (never skip). At/above floor: check sec_tag.
+        // Compile-time constant mask for the floor boundary.
+        static constexpr u64 FLOOR_MASK =
+            SIBLING_TABLE_FLOOR >= NT ? ~u64(0)
+                                      : ~((u64(1) << SIBLING_TABLE_FLOOR) - 1);
         arr<val<1>, NT> not_sibling = [&](u64 i) -> val<1> {
+          // Read train_tag_hit/train_sec_hit for ALL tables (runtime i).
+          // For tables below FLOOR_MASK, the result is masked out below.
           return ~(val<1>{train_tag_hit[i]} & ~val<1>{train_sec_hit[i]});
         };
-        return base.fo1() & not_sibling.fo1().concat();
+        // Apply floor: force not_sibling=1 for tables below floor.
+        // FLOOR_MASK has bits set only for tables >= SIBLING_TABLE_FLOOR.
+        val<NT> sibling_mask = not_sibling.fo1().concat() |
+                               ~val<NT>{hard<FLOOR_MASK>{}};
+        return base.fo1() & sibling_mask;
       } else {
         return base.fo1();
       }
