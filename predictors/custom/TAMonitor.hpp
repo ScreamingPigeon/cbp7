@@ -131,6 +131,15 @@ struct TAMonitor {
     std::array<u64, NUM_TABLES> per_table_coll_checks{};
     std::array<u64, NUM_TABLES> per_table_coll_hits{};
 
+    // sec_tag predict-vs-update consistency check
+    // For entries with tag hit: does stored sec_tag match curr (predict-time)
+    // vs now (update-time)?
+    u64 sec_tag_checks = 0;       // entries with tag hit
+    u64 sec_tag_match_curr = 0;   // stored == curr_sec_tag (predict-time)
+    u64 sec_tag_match_now = 0;    // stored == sec_tag_now (update-time)
+    u64 sec_tag_match_both = 0;   // matches both
+    u64 sec_tag_match_neither = 0; // matches neither
+
     void reset() { *this = Counters{}; }
   };
 
@@ -498,6 +507,20 @@ struct TAMonitor {
     win.epoch_reset_count++;
   }
 
+  void record_sec_tag_check(u64 stored, u64 curr, u64 now) {
+    auto record = [&](Counters &c) {
+      c.sec_tag_checks++;
+      bool m_curr = (stored == curr);
+      bool m_now = (stored == now);
+      if (m_curr) c.sec_tag_match_curr++;
+      if (m_now) c.sec_tag_match_now++;
+      if (m_curr && m_now) c.sec_tag_match_both++;
+      if (!m_curr && !m_now) c.sec_tag_match_neither++;
+    };
+    record(cum);
+    record(win);
+  }
+
   void record_pressure(u64 acc_val, u64 alloc_val) {
     auto record = [&](Counters &c) {
       c.acc_ctr_sum += acc_val;
@@ -802,6 +825,20 @@ struct TAMonitor {
          << double(c.acc_ctr_sum) / c.pressure_samples << "\n";
       os << "  Avg alloc_ctr: "
          << double(c.alloc_ctr_sum) / c.pressure_samples << "\n";
+    }
+
+    // sec_tag predict-vs-update consistency
+    if (c.sec_tag_checks > 0) {
+      os << "\nSec-Tag Consistency (tag-hit entries only):\n";
+      os << "  Checks: " << c.sec_tag_checks << "\n";
+      os << "  Match curr (predict-time): " << c.sec_tag_match_curr
+         << " (" << pct(c.sec_tag_match_curr, c.sec_tag_checks) << "%)\n";
+      os << "  Match now  (update-time):  " << c.sec_tag_match_now
+         << " (" << pct(c.sec_tag_match_now, c.sec_tag_checks) << "%)\n";
+      os << "  Match both:  " << c.sec_tag_match_both
+         << " (" << pct(c.sec_tag_match_both, c.sec_tag_checks) << "%)\n";
+      os << "  Match neither: " << c.sec_tag_match_neither
+         << " (" << pct(c.sec_tag_match_neither, c.sec_tag_checks) << "%)\n";
     }
 
     // ================================================================

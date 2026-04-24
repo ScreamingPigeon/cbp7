@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -37,6 +38,8 @@ struct PredecessorEntry {
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> path_successors;
   // successor_line_pc → count (aggregated across all paths)
   std::unordered_map<uint64_t, uint64_t> all_successors;
+  // raw next_pc → count (for sec_tag hash evaluation)
+  std::unordered_map<uint64_t, uint64_t> raw_successors;
   uint64_t total = 0;
 };
 
@@ -134,6 +137,7 @@ int main(int argc, char **argv) {
       auto &entry = predecessor_map[last_block_line_pc];
       entry.path_successors[last_block_path][succ_line_pc]++;
       entry.all_successors[succ_line_pc]++;
+      entry.raw_successors[successor_pc]++;
       entry.total++;
     }
 
@@ -453,8 +457,155 @@ int main(int argc, char **argv) {
   }
   std::cout << std::endl;
 
-  // 7. Hot branches (top 20)
-  std::cout << "--- 7. Hot branches (top 20) ---" << std::endl;
+  // 7. Secondary tag hash evaluation
+  // For each predecessor, evaluate candidate hash functions on raw next_pc.
+  // Metric: for each hash, what fraction of transitions land on the dominant
+  // successor per hash bucket? Higher = better discrimination.
+  // A perfect hash maps each unique successor to a unique bucket.
+  {
+    struct HashFn {
+      const char *name;
+      uint64_t bits;
+      std::function<uint64_t(uint64_t)> fn;
+    };
+    std::vector<HashFn> hashes = {
+      {"PC[2]       (1b)", 1, [](uint64_t pc) { return (pc >> 2) & 0x1; }},
+      {"PC[3:2]     (2b)", 2, [](uint64_t pc) { return (pc >> 2) & 0x3; }},
+      {"PC[4:2]     (3b)", 3, [](uint64_t pc) { return (pc >> 2) & 0x7; }},
+      {"PC[5:2]     (4b)", 4, [](uint64_t pc) { return (pc >> 2) & 0xF; }},
+      {"PC[7:2]     (6b)", 6, [](uint64_t pc) { return (pc >> 2) & 0x3F; }},
+      {"PC[4:2]^[7:5] (3b)", 3, [](uint64_t pc) {
+        return ((pc >> 2) ^ (pc >> 5)) & 0x7;
+      }},
+      {"PC[4:2]^[10:8](3b)", 3, [](uint64_t pc) {
+        return ((pc >> 2) ^ (pc >> 8)) & 0x7;
+      }},
+      {"PC[4:2]^[13:11](3b)", 3, [](uint64_t pc) {
+        return ((pc >> 2) ^ (pc >> 11)) & 0x7;
+      }},
+      {"PC[5:2]^[9:6] (4b)", 4, [](uint64_t pc) {
+        return ((pc >> 2) ^ (pc >> 6)) & 0xF;
+      }},
+      {"PC[7:2]^[13:8](6b)", 6, [](uint64_t pc) {
+        return ((pc >> 2) ^ (pc >> 8)) & 0x3F;
+      }},
+    };
+
+    std::cout << "--- 7. Secondary tag hash evaluation ---" << std::endl;
+    std::cout << "  Metric: weighted coverage = fraction of transitions where" << std::endl;
+    std::cout << "  the hash bucket's dominant successor matches the actual." << std::endl;
+    std::cout << "  (Higher = better discrimination. 100% = perfect hash.)" << std::endl;
+    std::cout << std::endl;
+
+    // For predecessors with >1 unique successor (the interesting case)
+    uint64_t all_transitions = 0;
+    uint64_t multi_succ_preds = 0;
+    uint64_t multi_succ_transitions = 0;
+    for (auto &[pred, entry] : predecessor_map) {
+      all_transitions += entry.total;
+      if (entry.raw_successors.size() > 1) {
+        multi_succ_preds++;
+        multi_succ_transitions += entry.total;
+      }
+    }
+    std::cout << "  Predecessors with >1 successor: " << multi_succ_preds
+              << " (" << std::setprecision(1)
+              << 100.0 * multi_succ_preds / predecessor_map.size()
+              << "% of all)" << std::endl;
+    std::cout << "  Transitions from multi-succ preds: " << multi_succ_transitions
+              << std::endl << std::endl;
+
+    std::cout << std::setw(25) << "Hash"
+              << std::setw(12) << "Coverage"
+              << std::setw(12) << "MultiCov"
+              << std::setw(12) << "Collisions"
+              << std::endl;
+    std::cout << std::setw(25) << ""
+              << std::setw(12) << "(all)"
+              << std::setw(12) << "(multi)"
+              << std::setw(12) << "(multi)"
+              << std::endl;
+    std::cout << "  " << std::string(57, '-') << std::endl;
+
+    for (auto &h : hashes) {
+      uint64_t covered_all = 0, total_all = 0;
+      uint64_t covered_multi = 0, total_multi = 0;
+      uint64_t collisions = 0; // cases where 2+ successors map to same bucket
+
+      for (auto &[pred, entry] : predecessor_map) {
+        // bucket → {successor → count}
+        std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> buckets;
+        for (auto &[next_pc, count] : entry.raw_successors) {
+          uint64_t bucket = h.fn(next_pc);
+          buckets[bucket][next_pc] += count;
+        }
+
+        uint64_t pred_covered = 0;
+        uint64_t pred_collisions = 0;
+        for (auto &[bucket, succs] : buckets) {
+          uint64_t max_count = 0;
+          uint64_t bucket_total = 0;
+          for (auto &[succ, count] : succs) {
+            max_count = std::max(max_count, count);
+            bucket_total += count;
+          }
+          pred_covered += max_count;
+          if (succs.size() > 1) pred_collisions += bucket_total - max_count;
+        }
+
+        covered_all += pred_covered;
+        total_all += entry.total;
+        if (entry.raw_successors.size() > 1) {
+          covered_multi += pred_covered;
+          total_multi += entry.total;
+          collisions += pred_collisions;
+        }
+      }
+
+      std::cout << std::setw(25) << h.name
+                << std::setw(10) << std::setprecision(2)
+                << 100.0 * covered_all / total_all << "%"
+                << std::setw(10) << std::setprecision(2)
+                << 100.0 * covered_multi / total_multi << "%"
+                << std::setw(10) << std::setprecision(2)
+                << 100.0 * collisions / total_multi << "%"
+                << std::endl;
+    }
+    std::cout << std::endl;
+
+    // Per-successor-count breakdown for the best candidates
+    std::cout << "  Breakdown by #successors (using PC[4:2], 3b):" << std::endl;
+    auto &ref_hash = hashes[2]; // PC[4:2]
+    std::map<uint64_t, std::pair<uint64_t, uint64_t>> by_nsucc; // nsucc → (covered, total)
+    for (auto &[pred, entry] : predecessor_map) {
+      uint64_t nsucc = entry.raw_successors.size();
+      std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> buckets;
+      for (auto &[next_pc, count] : entry.raw_successors) {
+        buckets[ref_hash.fn(next_pc)][next_pc] += count;
+      }
+      uint64_t pred_covered = 0;
+      for (auto &[bucket, succs] : buckets) {
+        uint64_t max_count = 0;
+        for (auto &[succ, count] : succs)
+          max_count = std::max(max_count, count);
+        pred_covered += max_count;
+      }
+      by_nsucc[nsucc].first += pred_covered;
+      by_nsucc[nsucc].second += entry.total;
+    }
+    std::cout << std::setw(10) << "#succs" << std::setw(10) << "preds"
+              << std::setw(12) << "coverage" << std::endl;
+    for (auto &[ns, cv] : by_nsucc) {
+      if (cv.second < all_transitions / 1000) continue; // skip tiny buckets
+      std::cout << std::setw(10) << ns << std::setw(10) << cv.second
+                << std::setw(10) << std::setprecision(2)
+                << 100.0 * cv.first / cv.second << "%" << std::endl;
+    }
+    std::cout << std::endl;
+  }
+
+  // 8. Hot branches (top 20)
+  std::cout << "--- 8. Hot branches (top 20) ---" << std::endl;
   uint64_t total_cond = 0;
   for (auto &[pc, info] : branch_stats) total_cond += info.total;
   std::vector<std::pair<uint64_t, BranchInfo>> sorted_br(

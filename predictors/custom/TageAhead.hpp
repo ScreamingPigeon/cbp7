@@ -238,6 +238,7 @@ struct TageAhead : predictor {
   reg<1> train_fb_hyst; // piped fb hyst for reconciliation
   reg<ALLOC_PC_BITS> train_pc;
   reg<MAX_TAG_WIDTH> train_ctag[NT]; // piped computed tag for allocation
+  reg<SEC_TAG_BITS> train_sec_tag;  // piped sec_tag for allocation writes
 
   // Piped resolution values from previous update_cycle (block A's resolution)
   reg<MATCH_BITS> train_match1;
@@ -350,7 +351,7 @@ struct TageAhead : predictor {
 
 #ifdef DEBUG_PRINT
       if constexpr (I == 0) {
-        std::cerr << "\n────────────────────────────────────────\n";
+        std::cerr << "\n─────────────���──────────────────────────\n";
         std::cerr << "=== predict1 table[0] ===\n";
         fold_idx_val.print("  fold_idx_val=", "\n", true, std::cerr);
         idx.print("  idx=", "\n", true, std::cerr);
@@ -444,9 +445,15 @@ struct TageAhead : predictor {
     // reach here)
 
     // Save current_* into train_* before shift (block A's data for training)
-    // curr_sec_tag read NT times (once per table) in the loop below
+    // curr_sec_tag read NT times (train_sec_hit) + 1 (train_sec_tag save)
     if constexpr (USE_SEC_TAG)
-      curr_sec_tag.fanout(hard<NT>{});
+      curr_sec_tag.fanout(hard<NT + 1>{});
+#ifdef TAGE_MONITOR
+    // Capture raw sec values and tag hits before they're consumed
+    u64 mon_saved_sec[NT]{};
+    bool mon_tag_hit[NT]{};
+    bool mon_sec_hit[NT]{};
+#endif
     static_loop<NT>([&]<u64 I>() {
       train_idx[I] = current_idx[I].fo1();
       train_pred[I] =
@@ -455,15 +462,23 @@ struct TageAhead : predictor {
       train_u[I] = current_u[I].fo1();
       train_ctag[I] = current_ctag[I].fo1();
       train_tag_hit[I] = current_tag_hit[I].fo1();
-      if constexpr (USE_SEC_TAG)
+      if constexpr (USE_SEC_TAG) {
         train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I].fo1()} ==
                             val<SEC_TAG_BITS>{curr_sec_tag});
+#ifdef TAGE_MONITOR
+        mon_saved_sec[I] = static_cast<u64>(current_sec[I]);
+        mon_tag_hit[I] = static_cast<u64>(current_tag_hit[I]);
+        mon_sec_hit[I] = static_cast<u64>(train_sec_hit[I]);
+#endif
+      }
     });
     train_fb = current_fb.fo1();
     train_fb_idx = current_fb_idx.fo1();
     if constexpr (FB_RECONCILE)
       train_fb_hyst = current_fb_hyst.fo1();
     train_pc = current_pc.fo1();
+    if constexpr (USE_SEC_TAG)
+      train_sec_tag = curr_sec_tag;
 
     // Fanout on prefetch_* regs: read twice (shift + resolution chain bypass)
     static_loop<NT>([&]<u64 I>() {
@@ -511,19 +526,9 @@ struct TageAhead : predictor {
       // NOTE: @prakhar @claude ensure hardcoded fanout is correct
       block_end_info.next_pc.fanout(hard<2>{}); // meta_idx + hist path_bits
     else
-      // +1 for sec_tag_alloc duplicate hash (split to reduce crit-path fanout)
-      block_end_info.next_pc.fanout(hard<4 + (NUM_PATHS > 1 ? 1 : 0)>{});
+      // sec_tag_now (1) + meta_idx (1) + hist path_bits (1) [+ multi-path sel (1)]
+      block_end_info.next_pc.fanout(hard<3 + (NUM_PATHS > 1 ? 1 : 0)>{});
     auto sec_tag_now = [&]() {
-      if constexpr (USE_SEC_TAG)
-        return SecTagHashFn::template apply<SEC_TAG_BITS>(
-            block_end_info.next_pc);
-      else
-        return hard<0>{};
-    }();
-    // Separate alloc hash: same computation, independent val with its own
-    // fanout tree. Keeps alloc's NT writes off sec_tag_now's critical-path
-    // buffer tree (hard<NT+1>=3 FO2 vs old hard<2*NT+1>=4 FO2).
-    auto sec_tag_alloc = [&]() {
       if constexpr (USE_SEC_TAG)
         return SecTagHashFn::template apply<SEC_TAG_BITS>(
             block_end_info.next_pc);
@@ -535,8 +540,31 @@ struct TageAhead : predictor {
       sec_tag_now.fanout(hard<NT + 1>{});
       curr_sec_tag = sec_tag_now; // store for next-cycle use
       // Alloc-path fanout: NT sec_ram writes (off critical path)
-      sec_tag_alloc.fanout(hard<NT>{});
+      // train_sec_tag = curr_sec_tag saved before overwrite = hash(predicted
+      // block's PC). Old sec_tag_alloc was hash(successor), one stage off.
+      train_sec_tag.fanout(hard<NT>{});
     }
+
+#ifdef TAGE_MONITOR
+    // sec_tag consistency check: for tag-hit entries, does stored sec_tag
+    // match predict-time (curr_sec_tag from prev cycle) vs update-time
+    // (sec_tag_now from this cycle)?
+    if constexpr (USE_SEC_TAG) {
+      u64 now_val = static_cast<u64>(sec_tag_now);
+      for (u64 i = 0; i < NT; i++) {
+        if (mon_tag_hit[i]) {
+          auto &c = mon.cum;
+          c.sec_tag_checks++;
+          bool match_curr = mon_sec_hit[i]; // predict-time match
+          bool match_now = (mon_saved_sec[i] == now_val);
+          if (match_curr) c.sec_tag_match_curr++;
+          if (match_now) c.sec_tag_match_now++;
+          if (match_curr && match_now) c.sec_tag_match_both++;
+          if (!match_curr && !match_now) c.sec_tag_match_neither++;
+        }
+      }
+    }
+#endif
 
     // ================================================================
     // Meta pipeline: shift FIRST, then write [0].
@@ -585,10 +613,11 @@ struct TageAhead : predictor {
 #ifdef TAGE_MONITOR
     for (u64 i = 0; i < NT; i++) {
       if constexpr (USE_SEC_TAG) {
-        mon.record_tag_lookup(
-            i, static_cast<u64>(current_tag_hit[i]),
-            static_cast<u64>(val<SEC_TAG_BITS>{current_sec[i]} ==
-                             val<SEC_TAG_BITS>{sec_tag_now}));
+        // Use pre-shift values (mon_tag_hit/mon_sec_hit) to match the
+        // pipeline stage being trained.  Post-shift current_sec[i] holds
+        // the *next* block's prefetch data — comparing it against
+        // sec_tag_now was off by one stage.
+        mon.record_tag_lookup(i, mon_tag_hit[i], mon_sec_hit[i]);
       } else {
         mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
       }
@@ -1315,7 +1344,7 @@ struct TageAhead : predictor {
                         val<t.tag_ram_width>{train_ctag[I].fo1()});
         if constexpr (USE_SEC_TAG)
           t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                          val<SEC_TAG_BITS>{sec_tag_alloc});
+                          val<SEC_TAG_BITS>{train_sec_tag});
       });
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_train & do_alloc)) {
