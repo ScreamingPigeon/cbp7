@@ -485,6 +485,85 @@ struct ConstBitsSize {
   }
 };
 
+// Linear interpolation from S_HI (table 0) to S_LO (table N-1), pow2 rounded.
+// Mirrors GradedTag.
+template <u64 S_HI, u64 S_LO> struct GradedSize {
+  constexpr u64 operator()(u64 i, u64 n) const {
+    if (n <= 1)
+      return S_HI;
+    double t = double(i) / double(n - 1);
+    u64 sz = u64(double(S_HI) * (1.0 - t) + double(S_LO) * t);
+    u64 result = 64;
+    while (result < sz)
+      result *= 2;
+    return result;
+  }
+};
+
+// Logarithmic scaling: larger tables for shorter histories (higher index).
+// BASE + SCALE * level / 4, pow2 rounded. Mirrors LogTag.
+template <u64 BASE, u64 SCALE> struct LogSize {
+  constexpr u64 operator()(u64 i, u64 n) const {
+    u64 level = (n > 1) ? (n - 1 - i) : 0;
+    u64 sz = BASE + SCALE * level / 4;
+    u64 result = 64;
+    while (result < sz)
+      result *= 2;
+    return result;
+  }
+};
+
+// Three-tier step: S1 for [0, SPLIT1), S2 for [SPLIT1, SPLIT2), S3 for rest.
+template <u64 S1, u64 S2, u64 S3, u64 SPLIT1, u64 SPLIT2> struct MultiStepSize {
+  static_assert(SPLIT1 <= SPLIT2, "SPLIT1 must be <= SPLIT2");
+  constexpr u64 operator()(u64 i, u64) const {
+    if (i < SPLIT1)
+      return S1;
+    if (i < SPLIT2)
+      return S2;
+    return S3;
+  }
+};
+
+// Fixed total entry budget distributed equally across tables, pow2 rounded.
+// Each table gets TOTAL/N entries (clamped to >= MIN_SIZE).
+template <u64 TOTAL, u64 MIN_SIZE = 64> struct BudgetSize {
+  constexpr u64 operator()(u64, u64 n) const {
+    u64 per = (n > 0) ? TOTAL / n : TOTAL;
+    u64 result = 64;
+    while (result * 2 <= per)
+      result *= 2;
+    return (result < MIN_SIZE) ? MIN_SIZE : result;
+  }
+};
+
+// Fixed total entry budget weighted by inverse history length.
+// Shorter-history tables (higher index) get more entries. Pow2 rounded.
+// Requires access to HIST_LEN at TATableConfig level — use via generate overload.
+template <u64 TOTAL, u64 MIN_SIZE = 64> struct InvHistBudgetSize {
+  // Weight for table i = 1/sqrt(hist_len[i]).
+  // Called from generate_table_sizes with hist_len array.
+  template <std::size_t N>
+  constexpr std::array<u64, N>
+  generate(const std::array<u64, N> &hist_len) const {
+    std::array<u64, N> sizes{};
+    double total_weight = 0.0;
+    std::array<double, N> w{};
+    for (std::size_t i = 0; i < N; i++) {
+      w[i] = 1.0 / constexpr_pow(double(hist_len[i]), 0.5);
+      total_weight += w[i];
+    }
+    for (std::size_t i = 0; i < N; i++) {
+      u64 per = u64(double(TOTAL) * w[i] / total_weight);
+      u64 result = 64;
+      while (result * 2 <= per)
+        result *= 2;
+      sizes[i] = (result < MIN_SIZE) ? MIN_SIZE : result;
+    }
+    return sizes;
+  }
+};
+
 template <std::size_t N, typename SizeFn>
 constexpr std::array<u64, N> generate_table_sizes(SizeFn fn) {
   std::array<u64, N> s{};
@@ -539,6 +618,15 @@ struct Xor3SecTagHash {
     static_assert(SEC_TAG_BITS == 4, "Xor3SecTagHash is tuned for 4-bit sec_tag");
     pc.fanout(hard<3>{});
     return val<4>{pc >> 2} ^ val<4>{pc >> 8} ^ val<4>{pc >> 13};
+  }
+};
+
+// 3-way XOR sec_tag hash for 5-bit sec_tag: PC[6:2] ^ PC[13:9] ^ PC[20:16]
+struct Xor3SecTagHash5 {
+  template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {
+    static_assert(SEC_TAG_BITS == 5, "Xor3SecTagHash5 is tuned for 5-bit sec_tag");
+    pc.fanout(hard<3>{});
+    return val<5>{pc >> 2} ^ val<5>{pc >> 9} ^ val<5>{pc >> 16};
   }
 };
 
@@ -724,14 +812,15 @@ struct TATable {
   hcm::ram<val<TAG_RAM_WIDTH>, TABLE_SIZE> tag_ram{"ta_tag"};
   ta_rwram<PRED_BITS, TABLE_SIZE, 2> pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
+
+  // ---- Per-table folded histories (predict-path, at sec_ram location) ----
+  ta_folded_gh<IDX_BITS> fold_idx;
+  ta_folded_gh<TAG_WIDTH> fold_tag;
+
   // ---- RAMs (update-only) ----
   hcm::zone ta_update_zone;
   ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
   ta_rwram<U_WIDTH, TABLE_SIZE, 2> u_ram{"ta_u"};
-
-  // ---- Per-table folded histories (fold into exact widths) ----
-  ta_folded_gh<IDX_BITS> fold_idx;
-  ta_folded_gh<TAG_WIDTH> fold_tag;
 };
 
 // Generate a TATable type from config arrays at index I
@@ -910,6 +999,15 @@ struct TAAllocFiltered : TADefaultAllocConfig {
 
 struct TAAllocThrottled : TADefaultAllocConfig {
   static constexpr AllocAction ALLOC_ACTION = AllocAction::THROTTLED;
+};
+
+struct TAAlloc2PressSkip : TADefaultAllocConfig {
+  static constexpr u64 MAX_ALLOC = 2;
+  using TARGET_POLICY = AllocPressureSkipTarget<1>;
+};
+
+struct TAAllocPressSkip : TADefaultAllocConfig {
+  using TARGET_POLICY = AllocPressureSkipTarget<1>;
 };
 
 #endif // CUSTOM_COMMON_H

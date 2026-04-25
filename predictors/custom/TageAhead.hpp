@@ -62,14 +62,14 @@ template <
     u64 U_WIDTH = 2,           // usefulness counter width
     UMispPolicy U_MISP = UMispPolicy::UNTOUCHED, // u-bit on provider mispredict
     UClearPolicy U_CLEAR = UClearPolicy::DECREMENT, // u-bit on alloc failure
-    u64 FB_CAPACITY = 8192 / 2, // fallback table size (bimodal or gshare)
-    bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
-    u64 GS_HIST = 6,            // gshare history length (only when USE_GSHARE)
-    u64 META_WIDTH = 4,         // meta counter width (provider vs alt)
-    u64 META_CAPACITY = 1024,   // meta table entries
-    u64 META_PIPE = 2,          // meta pipeline depth
-    u64 LINEINST = 1024,        // line size in instructions
-    bool SHARED_HYS = true,     // shared hyst: 2 entries share 1 counter
+    u64 FB_CAPACITY = 8192,   // fallback table size (bimodal or gshare)
+    bool USE_GSHARE = false,  // use gshare base (PC^history) vs bimodal (PC)
+    u64 GS_HIST = 6,          // gshare history length (only when USE_GSHARE)
+    u64 META_WIDTH = 2,       // meta counter width (provider vs alt)
+    u64 META_CAPACITY = 1024, // meta table entries
+    u64 META_PIPE = 2,        // meta pipeline depth
+    u64 LINEINST = 512,       // line size in instructions
+    bool SHARED_HYS = true,   // shared hyst: 2 entries share 1 counter
     HistUpdate HIST_MODE =
         HistUpdate::PATH, // what goes into history: PATH, DIR, or BOTH
     // ---- Allocation policy ----
@@ -79,8 +79,8 @@ template <
         SiblingPolicy::ALL,      // NONE=never skip, ALL=skip siblings
     u64 SIBLING_TABLE_FLOOR = 0, // skip siblings only for tables >= this index
     // ---- Global pressure counters ----
-    u64 ACC_WIDTH = 16,   // accuracy counter width
-    u64 ALLOC_WIDTH = 16, // alloc pressure counter width
+    u64 ACC_WIDTH = 10,   // accuracy counter width
+    u64 ALLOC_WIDTH = 10, // alloc pressure counter width
     // ---- Probabilistic u-bit decay ----
     bool DECAY_ENABLE = false, DecayMiss DECAY_MISS = DecayMiss::TAG_OR_SEC,
     DecayOp DECAY_OP = DecayOp::DECREMENT,
@@ -135,32 +135,7 @@ struct TageAhead : predictor {
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
 
   // ======================================================================
-  // Storage
-  // ======================================================================
-  // ---- Table tuple (per-table tag width and table size) ----
-  using Tables = typename TAMakeTableTuple<
-      TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
-      REVERSE_TABLE_ORDER, std::make_index_sequence<NT>>::type;
-  Tables tables;
-
-  // Access logical table I (remaps through reversed storage when needed)
-  template <u64 I> auto &table() {
-    return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
-  }
-  template <u64 I> const auto &table() const {
-    return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
-  }
-  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
-  // ---- Update-only RAMs ----
-  hcm::zone update_zone;
-  // Fallback hysteresis: tracks agreement between fb and TAGE.
-  // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
-  // Only accessed when FB_RECONCILE=true; zero cost otherwise.
-  hcm::ram<val<1>, FB_CAPACITY> fb_hyst{"fb_hyst"};
-  ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
-
-  // ======================================================================
-  // Registers
+  // Predict-path Registers (declared before tables → at first table loc)
   // ======================================================================
   // ---- Global History (shared, folds live in per-table TATable) ----
   ta_global_history<MAXHIST> gh;
@@ -200,11 +175,6 @@ struct TageAhead : predictor {
   arr<reg<1>, N> branch_dir;
 
   // ---- Secondary tag (precomputed in update_cycle from next_pc) ----
-  // update_cycle for block B computes curr_sec_tag = hash(next_pc).
-  // next_pc is the PC of block B+1, which is exactly the block whose
-  // prefetched data gets shifted into current_* in the same update_cycle.
-  // So when predict1 for B+1 runs, curr_sec_tag already identifies
-  // which successor path the current_* entries were trained for.
   reg<SEC_TAG_BITS> curr_sec_tag;
 
   // ---- Pipeline Regs [NT] ----
@@ -227,6 +197,43 @@ struct TageAhead : predictor {
   reg<std::max(u64(1), HYST_WIDTH)> current_hyst[NT];
   reg<U_WIDTH> current_u[NT];
   reg<MAX_TAG_WIDTH> current_ctag[NT]; // piped computed tag for allocation
+
+  // ---- Prediction reg (shared by
+  // predict1/reuse_predict1/predict2/reuse_predict2) ----
+  arr<reg<1>, N> pred;
+
+  // ---- Meta pipeline (shifted each update_cycle) ----
+  static constexpr u64 META_IDX_BITS = ta::clog2(META_CAPACITY);
+  reg<META_WIDTH, i64> meta_pipe[META_PIPE];
+  reg<META_IDX_BITS> meta_idx_pipe[META_PIPE];
+
+  // ======================================================================
+  // Storage
+  // ======================================================================
+  // ---- Table tuple (per-table tag width and table size) ----
+  using Tables = typename TAMakeTableTuple<
+      TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
+      REVERSE_TABLE_ORDER, std::make_index_sequence<NT>>::type;
+  Tables tables;
+
+  // Access logical table I (remaps through reversed storage when needed)
+  template <u64 I> auto &table() {
+    return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
+  }
+  template <u64 I> const auto &table() const {
+    return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
+  }
+  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
+
+  // ======================================================================
+  // Update-only RAMs and Registers (in update zone)
+  // ======================================================================
+  hcm::zone update_zone;
+  // Fallback hysteresis: tracks agreement between fb and TAGE.
+  // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
+  // Only accessed when FB_RECONCILE=true; zero cost otherwise.
+  hcm::ram<val<1>, FB_CAPACITY> fb_hyst{"fb_hyst"};
+  ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
 
   // train_*: saved from current_* before pipeline shift, used for training
   // (training is for block A, resolution is for block B)
@@ -264,15 +271,6 @@ struct TageAhead : predictor {
   // Decay LFSR widths (used to parameterize std::rand() masking)
   static constexpr u64 MAX_LFSR_WIDTH =
       DECAY_ENABLE ? ta::array_max(DECAY_LFSR_WIDTHS) : 1;
-
-  // ---- Prediction reg (shared by
-  // predict1/reuse_predict1/predict2/reuse_predict2) ----
-  arr<reg<1>, N> pred;
-
-  // ---- Meta pipeline (shifted each update_cycle) ----
-  static constexpr u64 META_IDX_BITS = ta::clog2(META_CAPACITY);
-  reg<META_WIDTH, i64> meta_pipe[META_PIPE];
-  reg<META_IDX_BITS> meta_idx_pipe[META_PIPE];
 
 #ifdef TAGE_MONITOR
   TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY> mon;
@@ -321,11 +319,19 @@ struct TageAhead : predictor {
     os << "  Reconcile: " << (FB_RECONCILE ? "yes" : "no") << "\n";
     os << "Meta: width=" << META_WIDTH << " cap=" << META_CAPACITY
        << " pipe=" << META_PIPE << "\n";
-    os << "Alloc: action="
+    os << "Alloc: trigger="
+       << (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT ? "MISPREDICT"
+           : AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? "TAGE_WRONG"
+                                                                  : "ALWAYS")
+       << "  action="
        << (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD   ? "STANDARD"
            : AllocCfg::ALLOC_ACTION == AllocAction::FILTERED ? "FILTERED"
                                                              : "THROTTLED")
-       << "  SiblingPolicy="
+       << "  target=" << AllocCfg::TARGET_POLICY::name()
+       << "  maxAlloc=" << AllocCfg::MAX_ALLOC
+       << "  nonConsec=" << (AllocCfg::NON_CONSECUTIVE ? "yes" : "no")
+       << "\n";
+    os << "  SiblingPolicy="
        << (SIBLING_POLICY == SiblingPolicy::NONE ? "NONE" : "ALL")
        << "  SiblingFloor=" << SIBLING_TABLE_FLOOR
        << "  FarAllocDist=" << FARALLOC_DIST << "\n";
@@ -339,10 +345,14 @@ struct TageAhead : predictor {
     os << "Decay: " << (DECAY_ENABLE ? "yes" : "no");
     if (DECAY_ENABLE) {
       os << "  Miss="
-         << (DECAY_MISS == DecayMiss::TAG          ? "TAG"
-             : DECAY_MISS == DecayMiss::TAG_OR_SEC ? "TAG_OR_SEC"
-                                                   : "TAG_AND_SEC")
-         << "  Op=" << (DECAY_OP == DecayOp::DECREMENT ? "DECREMENT" : "ZERO")
+         << (DECAY_MISS == DecayMiss::TAG            ? "TAG"
+             : DECAY_MISS == DecayMiss::SEC          ? "SEC"
+             : DECAY_MISS == DecayMiss::TAG_OR_SEC   ? "TAG_OR_SEC"
+                                                     : "TAG_AND_SEC")
+         << "  Op="
+         << (DECAY_OP == DecayOp::DECREMENT ? "DECREMENT"
+             : DECAY_OP == DecayOp::HALVE   ? "HALVE"
+                                            : "CLEAR")
          << "  LfsrWidths=[";
       for (u64 i = 0; i < NT; i++)
         os << (i ? "," : "") << DECAY_LFSR_WIDTHS[i];
@@ -434,10 +444,10 @@ struct TageAhead : predictor {
         fold_tag_val.print("  fold_tag_val=", "\n", true, std::cerr);
         computed_tag.print("  computed_tag=", "\n", true, std::cerr);
         stored_tag.print("  stored_tag=", "\n", true, std::cerr);
-        val<1>{prefetch_tag_hit[I]}.print("  tag_hit=", "\n", true, std::cerr);
-        val<1>{prefetch_pred[I]}.print("  pred=", "\n", true, std::cerr);
-        val<1>{prefetch_hyst[I]}.print("  hyst=", "\n", true, std::cerr);
-        val<1>{prefetch_u[I]}.print("  u=", "\n", true, std::cerr);
+        prefetch_tag_hit[I].print("  tag_hit=", "\n", true, std::cerr);
+        prefetch_pred[I].print("  pred=", "\n", true, std::cerr);
+        prefetch_hyst[I].print("  hyst=", "\n", true, std::cerr);
+        prefetch_u[I].print("  u=", "\n", true, std::cerr);
       }
 #endif
     });
@@ -464,7 +474,7 @@ struct TageAhead : predictor {
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
 
 #ifdef DEBUG_PRINT
-    val<1>{prefetch_fb}.print("  fb_pred=", "\n", true, std::cerr);
+    prefetch_fb.print("  fb_pred=", "\n", true, std::cerr);
     fb_idx.print("  fb_idx=", "\n", true, std::cerr);
 #endif
 
@@ -886,6 +896,7 @@ struct TageAhead : predictor {
           val<SEC_TAG_BITS> sec_idx =
               SecTagHashFn::template apply<SEC_TAG_BITS>(
                   block_end_info.next_pc);
+          sec_idx.fanout(hard<2>{}); // lo + hi
           val<1> lo = sec_idx & hard<1>{};
           val<1> hi = (sec_idx >> 1) & hard<1>{};
           // NOTE: @prakhar @claude audit
@@ -936,7 +947,7 @@ struct TageAhead : predictor {
 #ifdef DEBUG_PRINT
     std::cerr << "--- resolve_chain output ---\n";
     block_end_info.next_pc.print("  blk_end_info.next_pc= ", "\n", true,
-                                 std ::cerr);
+                                 std::cerr);
     match1.print("  match1=", "\n", true, std::cerr);
     match2.print("  match2=", "\n", true, std::cerr);
     provider_pred.print("  provider_pred=", "\n", true, std::cerr);
@@ -947,8 +958,8 @@ struct TageAhead : predictor {
     meta_use_alt.print("  meta_use_alt=", "\n", true, std::cerr);
     weak_mask.print("  weak_mask=", "\n", true, std::cerr);
     for (u64 i = 0; i < N; i++)
-      val<1>{pred[i]}.print(("  pred[" + std::to_string(i) + "]=").c_str(),
-                            "\n", true, std::cerr);
+      pred[i].print(("  pred[" + std::to_string(i) + "]=").c_str(), "\n", true,
+                    std::cerr);
 #endif
 
 #ifdef TAGE_MONITOR
@@ -1198,13 +1209,11 @@ struct TageAhead : predictor {
     val<NT> postmask = alloc_base.fo1() & gated_triggermask.fo1();
     if constexpr (UCLEAR_ACTIVE) {
       // NOTE: @prakhar @claude audit
-      notumask.fanout(hard<2>{}); // candallocmask(1) + noalloc(1)
-      // NOTE: @prakhar @claude audit
-      postmask.fanout(
-          hard<3>{}); // candallocmask(1) + noalloc(1) + uclearmask(1)
+      // postmask: candallocmask(1) + uclearmask(1)
+      postmask.fanout(hard<2>{});
     }
     val<NT> candallocmask = [&]() {
-      val<NT> base = postmask & notumask;
+      val<NT> base = postmask & notumask.fo1();
       if constexpr (USE_SEC_TAG && SIBLING_POLICY == SiblingPolicy::ALL) {
         // Allocation promotion (Cai/Deshmukh/Patt ISCA'25 Sec 4.3):
         // Skip entries with same primary tag but different sec_tag (siblings).
@@ -1244,7 +1253,7 @@ struct TageAhead : predictor {
       }
     }();
     // NOTE: @prakhar @claude audit
-    candallocmask.fanout(hard<2>{});
+    candallocmask.fanout(hard<2>{}); // collamask(1) + noalloc(1)
 
     // acc_ctr / alloc_ctr fanout: read in collamask(1) +
     // gated_triggermask(FILTERED/THROTTLED)
@@ -1298,23 +1307,23 @@ struct TageAhead : predictor {
           val<NT> basic2 = (collamask ^ pick1).one_hot();
           if constexpr (AllocCfg::NON_CONSECUTIVE) {
             val<NT> neighbors = (pick1 << 1) | (pick1 >> 1);
-            val<NT> nc_mask = (collamask ^ pick1) & ~neighbors;
+            val<NT> nc_mask = (collamask ^ pick1) & ~neighbors.fo1();
+            nc_mask.fanout(hard<2>{}); // != hard<0> + nc_pick
             val<NT> nc_pick = nc_mask.reverse().one_hot();
-            return select(nc_mask != hard<0>{}, nc_pick, basic2);
+            return select(nc_mask != hard<0>{}, nc_pick.fo1(), basic2.fo1());
           } else {
             return basic2;
           }
         }();
-        return (pick1 | pick2).reverse().make_array(val<1>{});
+        return (pick1 | pick2.fo1()).reverse().make_array(val<1>{});
       } else {
         return collamask.fo1().one_hot().reverse().make_array(val<1>{});
       }
     }();
     // NOTE: @prakhar @claude audit
     allocate.fanout(
-        hard<4 + (DECAY_ENABLE ? 1 : 0)>{}); // do_alloc(1) + alloc_target(1) +
-                                             // base_newu(1) + base_u_write(1)
-                                             // [+ decay(1)]
+        hard<3 + (DECAY_ENABLE ? 1 : 0)>{}); // do_alloc(1) + alloc_target(1) +
+                                             // base_u_write(1) [+ decay(1)]
     val<NT> alloc_target = [&]() {
       arr<val<1>, NT> a = allocate;
       return a.fo1().concat();
@@ -1328,14 +1337,33 @@ struct TageAhead : predictor {
       if constexpr (U_CLEAR == UClearPolicy::DISABLED) {
         return arr<val<1>, NT>{[](u64) -> val<1> { return hard<0>{}; }};
       } else {
-        val<1> noalloc = ((postmask & notumask) == hard<0>{});
+        val<1> noalloc = (candallocmask == hard<0>{});
         val<NT> uclearmask =
             postmask & noalloc.fo1().replicate(hard<NT>{}).concat();
         return uclearmask.fo1().make_array(val<1>{});
       }
     }();
-    // NOTE: @prakhar @claude audit
-    uclear.fanout(hard<2>{});
+    // uclear: single read per table (fo1 in mask). No fanout needed.
+
+#ifdef DEBUG_PRINT
+    std::cerr << "--- training signals ---\n";
+    t_match1.print("  t_match1=", "\n", true, std::cerr);
+    t_pp.print("  t_pp=", "\n", true, std::cerr);
+    t_pw.print("  t_pw=", "\n", true, std::cerr);
+    t_ad.print("  t_ad=", "\n", true, std::cerr);
+    t_phw.print("  t_phw=", "\n", true, std::cerr);
+    actual_dir.print("  actual_dir=", "\n", true, std::cerr);
+    any_provider_wrong.print("  any_prov_wrong=", "\n", true, std::cerr);
+    do_train.print("  do_train=", "\n", true, std::cerr);
+    std::cerr << "--- allocation path ---\n";
+    alloc_trigger.print("  alloc_trigger=", "\n", true, std::cerr);
+    gated_triggermask.print("  gated_trigmask=", "\n", true, std::cerr);
+    alloc_base.print("  alloc_base=", "\n", true, std::cerr);
+    notumask.print("  notumask=", "\n", true, std::cerr);
+    postmask.print("  postmask=", "\n", true, std::cerr);
+    candallocmask.print("  candallocmask=", "\n", true, std::cerr);
+    alloc_target.print("  alloc_target=", "\n", true, std::cerr);
+#endif
 
 #ifdef TAGE_MONITOR
     {
@@ -1555,32 +1583,32 @@ struct TageAhead : predictor {
       //   ZERO:      clear u to 0 (aggressive, original buggy behavior)
       //   DECREMENT: saturating decrement (gradual degradation)
       val<1> u_correct = t_m1[I] & t_ad & ~table_wrong;
-      // NOTE: @prakhar @claude audit: wrong_or_clear(1) + base_u_write(1) = 2
-      u_correct.fanout(hard<2>{});
+      // Single fo1() read — high-drive to mask. No fanout needed.
       val<1> u_wrong = [&]() -> val<1> {
         if constexpr (U_MISP == UMispPolicy::UNTOUCHED)
           return hard<0>{};
         else
           return t_m1[I] & t_ad & table_wrong;
       }();
-      // NOTE: @prakhar @claude audit: wrong_or_clear(1) + base_u_write(1) = 2
-      if constexpr (U_MISP != UMispPolicy::UNTOUCHED)
-        u_wrong.fanout(hard<2>{});
+      // Single fo1() read — high-drive to mask. No fanout needed.
       val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
       // Need u_dec when U_MISP==DECREMENT or U_CLEAR==DECREMENT
       static constexpr bool NEED_DEC = U_MISP == UMispPolicy::DECREMENT ||
                                        U_CLEAR == UClearPolicy::DECREMENT;
       // NOTE: @prakhar @claude audit:
-      //   u_inc: ==maxval(1) + select_true(1) + +1(1) = 3
-      //   u_dec (NEED_DEC): ==0(1) + select_true(1) + -1(1) = 3
-      //   wrong_or_clear: innermost select fallback = 1
+      //   u_inc: !=maxval(1) + +(1) = 2
+      //   u_dec (NEED_DEC): !=0(1) + -(1) = 2
       //   silent update (!DECAY): base_newu != old_u = 1
-      old_u.fanout(hard<3 + (NEED_DEC ? 3 : 0) + 1 + (DECAY_ENABLE ? 0 : 1)>{});
+      //   DECAY fallback: old_u in select = 1
+      old_u.fanout(hard<2 + (NEED_DEC ? 2 : 0) + 1 + (DECAY_ENABLE ? 1 : 0)>{});
+      // Saturating increment: old_u + 1, clamped at maxval.
+      // Shallower than select-mux: compare + add, no mux in path.
       auto u_inc =
-          select(old_u == hard<old_u.maxval>{}, old_u, val<U_WIDTH>{old_u + 1});
-      auto u_dec = [&]() {
+          val<U_WIDTH>{old_u + val<U_WIDTH>{old_u != hard<old_u.maxval>{}}};
+      auto u_dec = [&]() -> val<U_WIDTH> {
         if constexpr (NEED_DEC)
-          return select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
+          // Saturating decrement: old_u - 1, clamped at 0.
+          return val<U_WIDTH>{old_u - val<U_WIDTH>{old_u != hard<0>{}}};
         else
           return val<U_WIDTH>{0}; // unused placeholder
       }();
@@ -1588,51 +1616,69 @@ struct TageAhead : predictor {
       // uclear value: DISABLED → old_u (no-op), ZERO → 0, DECREMENT → dec
       auto uclear_val = [&]() -> val<U_WIDTH> {
         if constexpr (U_CLEAR == UClearPolicy::DISABLED)
-          return old_u; // never reached (uclear always 0), but type-correct
+          return val<U_WIDTH>{0}; // never reached (uclear always 0)
         else if constexpr (U_CLEAR == UClearPolicy::ZERO)
           return val<U_WIDTH>{0};
         else
           return u_dec.fo1();
       }();
 
-      // Priority: allocate (zero) > u_correct (inc) > u_wrong (policy) >
-      //           uclear (policy) > old_u (no-op)
-      // base_newu: what to write. base_u_write: whether to write.
+      // Flat OR-of-ANDs: conditions are mutually exclusive per table
+      // (provider can't be allocated, uclear can't fire on allocated table).
+      // allocate → 0 (vanishes in OR), no-op → don't write (data irrelevant).
+      // Depth: 1 AND + 1 OR, vs 3 nested selects (3 mux levels).
+      // u_correct/u_wrong use fo1() — high-drive, single read each.
       val<U_WIDTH> base_newu = [&]() -> val<U_WIDTH> {
-        // wrong value: UNTOUCHED → n/a, ZERO → 0, DECREMENT → dec
-        auto wrong_or_clear = [&]() -> val<U_WIDTH> {
-          if constexpr (U_MISP == UMispPolicy::ZERO)
-            return select(u_wrong, val<U_WIDTH>{0},
-                          select(uclear[I], uclear_val.fo1(),
-                                 select(allocate[I], val<U_WIDTH>{0}, old_u)));
-          else if constexpr (U_MISP == UMispPolicy::DECREMENT)
-            return select(u_wrong, u_dec.fo1(),
-                          select(uclear[I], uclear_val.fo1(),
-                                 select(allocate[I], val<U_WIDTH>{0}, old_u)));
-          else // UNTOUCHED
-            return select(uclear[I], uclear_val.fo1(),
-                          select(allocate[I], val<U_WIDTH>{0}, old_u));
-        }();
-        return select(u_correct, u_inc.fo1(), wrong_or_clear.fo1());
+        auto uc_mask =
+            val<U_WIDTH>{u_correct.fo1().replicate(hard<U_WIDTH>{}).concat()};
+        auto inc_term = val<U_WIDTH>{uc_mask.fo1() & u_inc.fo1()};
+        if constexpr (U_MISP == UMispPolicy::UNTOUCHED) {
+          if constexpr (U_CLEAR == UClearPolicy::DISABLED)
+            return inc_term;
+          else {
+            auto ucl_mask = val<U_WIDTH>{
+                uclear[I].fo1().replicate(hard<U_WIDTH>{}).concat()};
+            return inc_term.fo1() |
+                   val<U_WIDTH>{ucl_mask.fo1() & uclear_val.fo1()};
+          }
+        } else if constexpr (U_MISP == UMispPolicy::ZERO) {
+          // u_wrong → 0 (vanishes in OR, same as allocate)
+          if constexpr (U_CLEAR == UClearPolicy::DISABLED)
+            return inc_term;
+          else {
+            auto ucl_mask = val<U_WIDTH>{
+                uclear[I].fo1().replicate(hard<U_WIDTH>{}).concat()};
+            return inc_term.fo1() |
+                   val<U_WIDTH>{ucl_mask.fo1() & uclear_val.fo1()};
+          }
+        } else { // DECREMENT
+          auto uw_mask =
+              val<U_WIDTH>{u_wrong.fo1().replicate(hard<U_WIDTH>{}).concat()};
+          auto wrong_term = val<U_WIDTH>{uw_mask.fo1() & u_dec.fo1()};
+          if constexpr (U_CLEAR == UClearPolicy::DISABLED)
+            return inc_term.fo1() | wrong_term;
+          else {
+            auto ucl_mask = val<U_WIDTH>{
+                uclear[I].fo1().replicate(hard<U_WIDTH>{}).concat()};
+            return inc_term.fo1() | wrong_term.fo1() |
+                   val<U_WIDTH>{ucl_mask.fo1() & uclear_val.fo1()};
+          }
+        }
       }();
-      val<1> base_u_write = [&]() -> val<1> {
-        if constexpr (U_MISP == UMispPolicy::UNTOUCHED)
-          return u_correct | allocate[I] | uclear[I];
-        else
-          return (u_correct | u_wrong) | allocate[I] | uclear[I];
-      }();
-      // NOTE: @prakhar @claude audit
-      base_u_write.fanout(
-          hard<2>{}); // !DECAY: changed(1); DECAY: select(1)+merged_write(1)
-
       // Probabilistic decay: on tag/sec miss, random < threshold → decay u
       // Silent update elimination: only write when new != old (both paths).
       auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
         if constexpr (!DECAY_ENABLE) {
           // NOTE: @prakhar @claude audit
-          base_newu.fanout(hard<2>{}); // != old_u (1) + return (1)
+          // base_newu reads: != 0 (base_u_write) + != old_u (changed) + return
+          // = 3
+          base_newu.fanout(hard<3>{});
+          // base_u_write: derived from base_newu to avoid second read of
+          // u_correct/u_wrong. Since u_inc >= 1, (base_newu != 0) captures
+          // u_correct/u_wrong/uclear. allocate writes 0, OR it separately.
+          val<1> base_u_write = (base_newu != hard<0>{}) | allocate[I];
           val<1> base_changed = base_newu != old_u;
-          return {base_newu, base_u_write & base_changed.fo1()};
+          return {base_newu, base_u_write.fo1() & base_changed.fo1()};
         } else {
           constexpr u64 LW = DECAY_LFSR_WIDTHS[I];
 
@@ -1672,10 +1718,16 @@ struct TageAhead : predictor {
               return val<U_WIDTH>{0};
           }();
 
+          // base_u_write for DECAY path: same derivation as !DECAY.
+          // base_newu reads: != 0 (base_u_write) + select (merged) + return = 3
+          base_newu.fanout(hard<3>{});
+          val<1> base_u_write = (base_newu != hard<0>{}) | allocate[I];
+          base_u_write.fanout(hard<2>{}); // select(1) + merged_write(1)
+
           // Mux: if base write active, use base_newu; else if decay, use
           // decayed_u
           val<U_WIDTH> merged =
-              select(base_u_write, base_newu.fo1(),
+              select(base_u_write, base_newu,
                      select(decay_fire.fo1(), decayed_u.fo1(), old_u));
           val<1> merged_write = base_u_write | decay_fire;
           val<1> merged_changed = merged.fo1() != old_u;
@@ -1689,13 +1741,29 @@ struct TageAhead : predictor {
       execute_if(gate_u, [&]() {
         t.u_ram.write(val<t.IDX_BITS>{train_idx[I]}, newu.fo1(), hard<0>{});
       });
+#ifdef DEBUG_PRINT
+      if constexpr (I == 0) {
+        std::cerr << "--- u-bit path [T0] ---\n";
+        old_u.print("  old_u=", "\n", true, std::cerr);
+        u_correct.print("  u_correct=", "\n", true, std::cerr);
+        u_wrong.print("  u_wrong=", "\n", true, std::cerr);
+        uclear[I].print("  uclear[0]=", "\n", true, std::cerr);
+        allocate[I].print("  allocate[0]=", "\n", true, std::cerr);
+        base_newu.print("  base_newu=", "\n", true, std::cerr);
+        u_write.print("  u_write=", "\n", true, std::cerr);
+        gate_u.print("  gate_u=", "\n", true, std::cerr);
+      }
+#endif
 
 #ifdef TAGE_MONITOR
       if (static_cast<u64>(do_train & u_write))
         mon.record_u_write(I, static_cast<u64>(newu) != 0);
       if constexpr (DECAY_ENABLE) {
-        // decay_fire = u_write & ~base_u_write (only non-base u write is decay)
-        if (static_cast<u64>(do_train & u_write & ~base_u_write))
+        // Decay fire: u_write active but not from base logic.
+        // Reconstruct base_u_write from base_newu for monitor only.
+        bool mon_base_write =
+            (static_cast<u64>(base_newu) != 0) || static_cast<u64>(allocate[I]);
+        if (static_cast<u64>(do_train & u_write) && !mon_base_write)
           mon.record_decay_fire();
       }
 #endif
@@ -1826,10 +1894,8 @@ struct TageAhead : predictor {
         std::cerr << "=== update_cycle fold[0] ===\n";
         new_idx.print("  new_idx=", "\n", true, std::cerr);
         new_tag.print("  new_tag=", "\n", true, std::cerr);
-        val<1>{t.fold_idx.get()}.print("  fold_idx_after=", "\n", true,
-                                       std::cerr);
-        val<1>{t.fold_tag.get()}.print("  fold_tag_after=", "\n", true,
-                                       std::cerr);
+        t.fold_idx.get().print("  fold_idx_after=", "\n", true, std::cerr);
+        t.fold_tag.get().print("  fold_tag_after=", "\n", true, std::cerr);
       }
 #endif
     });

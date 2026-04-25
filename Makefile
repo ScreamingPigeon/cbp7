@@ -32,7 +32,7 @@ REGION_SHIFT ?= 12
 PRED_HASH := $(shell echo '$(PREDICTOR_TYPE)|$(EXTRA_COMMON_FLAGS)|$(EXTRA_CBP_FLAGS)' | md5sum | cut -c1-8)
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report debug-print run-debug-print cbp-1c cbp-2c cbp-both quick-eval-1c quick-eval-2c quick-eval-both debug-print-1c debug-print-2c run-debug-print-1c run-debug-print-2c psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis eval-monitor eval-monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report debug-print run-debug-print cbp-1c cbp-2c cbp-both quick-eval-1c quick-eval-2c quick-eval-both debug-print-1c debug-print-2c run-debug-print-1c run-debug-print-2c psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -48,6 +48,8 @@ help:
 	@echo "  make cbp-profile-analyze        Run profiler in analyze mode (per-function breakdown)"
 	@echo "  make cbp-profile-analyze-regions Analyze mode with per-region breakdown"
 	@echo "  make cbp-monitor                Build+run with TAGE monitor (output to MONITOR_OUT)"
+	@echo "  make eval-monitor               Run monitor on 20 representative traces"
+	@echo "  make eval-monitor-vis           Generate visualizations from eval-monitor output"
 	@echo "  make cbp-1c / cbp-2c            Build 1-cycle / 2-cycle competition configs"
 	@echo "  make cbp-both                   Build both competition configs"
 	@echo "  make quick-eval-1c / -2c        Evaluate 1-cycle / 2-cycle on representative traces"
@@ -186,8 +188,22 @@ endif
 monitor-vis:
 	python3 scripts/monitor_vis.py $(MONITOR_OUT)
 
+# Evaluate monitor on the representative trace set (same 20 traces as quick-eval)
+EVAL_MONITOR_PRED ?= TageAhead1C
+EVAL_MONITOR_JOBS ?= $(shell nproc)
+EVAL_MONITOR_OUT ?= out/eval_monitor
+
+$(BUILD_DIR)/cbp-monitor-eval: cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(PROFILE_WARN_FLAGS) $(MONITOR_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(EVAL_MONITOR_PRED)'
+
+eval-monitor: $(BUILD_DIR)/cbp-monitor-eval | out
+	scripts/eval_monitor.sh ./$(BUILD_DIR)/cbp-monitor-eval $(TRACE_DIR) $(EVAL_MONITOR_OUT) $(EVAL_MONITOR_JOBS)
+
+eval-monitor-vis:
+	python3 scripts/monitor_vis.py --dir $(EVAL_MONITOR_OUT)
+
 # Debug print: build+run with DEBUG_PRINT to dump timing of all main signals
-DEBUG_PRINT_MEASURE ?= 2
+DEBUG_PRINT_MEASURE ?= 20
 
 $(BUILD_DIR)/debug-print-$(PRED_HASH): cbp.cpp cbp.hpp branch_predictor.hpp $(TRACE_READER) harcom.hpp $(wildcard predictors/*.hpp predictors/custom/*.hpp) $(PREDICTOR_MK) | $(BUILD_DIR)
 	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) $(CBP_WARN_FLAGS) -DDEBUG_PRINT $(EXTRA_CBP_FLAGS) -Itrace_files -o $@ cbp.cpp -lz -DPREDICTOR='$(PREDICTOR_TYPE)'
