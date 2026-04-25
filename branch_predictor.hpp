@@ -35,8 +35,7 @@ using TageAhead2C =
     TageAhead<TATableConfig<28, 2048, 12, 4, 1000, 2, ta::HistSeries::GEOMETRIC,
                             ta::UniformTag<12>, ta::StepSize<4096, 2048, 24>>,
               8, 6, 4, true, 1, ta::Xor3SecTagHash, 1, 2, 1,
-              UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT,
-              4096, false, 6,
+              UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 4096, false, 6,
               4, 256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig,
               SiblingPolicy::NONE>;
 
@@ -49,10 +48,9 @@ using TageAhead2C =
 #define TA2C_BASE_U(UW)                                                        \
   TATableConfig<28, 2048, 12, 4, 1000, 2, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<12>, ta::StepSize<4096, 2048, 24>>,             \
-      8, 6, 4, true, 1, ta::Xor3SecTagHash, 1, 2, UW,                           \
-      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 4096, false, 6, 4,       \
-      256, 2, 1024, true, HistUpdate::PATH, TADefaultAllocConfig,              \
-      SiblingPolicy::NONE, 0, 16, 16
+      8, 6, 4, true, 1, ta::Xor3SecTagHash, 1, 2, UW, UMispPolicy::UNTOUCHED,  \
+      UClearPolicy::DECREMENT, 4096, false, 6, 4, 256, 2, 1024, true,          \
+      HistUpdate::PATH, TADefaultAllocConfig, SiblingPolicy::NONE, 0, 16, 16
 #define TA2C_BASE TA2C_BASE_U(1)
 
 // A: Baseline — epoch enabled, no decay (already TageAhead2C)

@@ -56,11 +56,11 @@ template <
     bool USE_SEC_TAG = true, // enable secondary tag matching
     u64 NUM_PATHS = 1, // parallel resolution chains (paper: 1 << SEC_TAG_BITS)
     typename SecTagHashFn =
-        ta::DefaultSecTagHash,  // sec_tag hash: PC → val<SEC_TAG_BITS>
-    u64 CTR_WIDTH = 1,          // prediction counter width per lane
-    u64 HYST_WIDTH = 2,         // hysteresis width (separate from ctr)
-    u64 U_WIDTH = 2,            // usefulness counter width
-    UMispPolicy U_MISP = UMispPolicy::UNTOUCHED,   // u-bit on provider mispredict
+        ta::DefaultSecTagHash, // sec_tag hash: PC → val<SEC_TAG_BITS>
+    u64 CTR_WIDTH = 1,         // prediction counter width per lane
+    u64 HYST_WIDTH = 2,        // hysteresis width (separate from ctr)
+    u64 U_WIDTH = 2,           // usefulness counter width
+    UMispPolicy U_MISP = UMispPolicy::UNTOUCHED, // u-bit on provider mispredict
     UClearPolicy U_CLEAR = UClearPolicy::DECREMENT, // u-bit on alloc failure
     u64 FB_CAPACITY = 8192 / 2, // fallback table size (bimodal or gshare)
     bool USE_GSHARE = false,    // use gshare base (PC^history) vs bimodal (PC)
@@ -282,10 +282,11 @@ struct TageAhead : predictor {
   }
   void print_params(std::ostream &os) const {
     os << "\n=== TageAhead Parameters ===\n";
-    os << "Tables: " << NT << "  N: " << N
-       << "  PathBits: " << PATHBITS
-       << "  HistMode: " << (HIST_MODE == HistUpdate::PATH ? "PATH"
-                             : HIST_MODE == HistUpdate::DIR ? "DIR" : "BOTH")
+    os << "Tables: " << NT << "  N: " << N << "  PathBits: " << PATHBITS
+       << "  HistMode: "
+       << (HIST_MODE == HistUpdate::PATH  ? "PATH"
+           : HIST_MODE == HistUpdate::DIR ? "DIR"
+                                          : "BOTH")
        << "\n";
     os << "HistLen: [";
     for (u64 i = 0; i < NT; i++)
@@ -302,30 +303,34 @@ struct TageAhead : predictor {
     os << "CtrWidth: " << CTR_WIDTH << "  HystWidth: " << HYST_WIDTH
        << "  SharedHyst: " << (SHARED_HYS ? "yes" : "no") << "\n";
     os << "SecTag: " << (USE_SEC_TAG ? "yes" : "no")
-       << "  SecTagBits: " << SEC_TAG_BITS
-       << "  NumPaths: " << NUM_PATHS << "\n";
-    os << "UWidth: " << U_WIDTH
-       << "  UMisp: " << (U_MISP == UMispPolicy::UNTOUCHED ? "UNTOUCHED"
-                          : U_MISP == UMispPolicy::ZERO ? "ZERO" : "DECREMENT")
-       << "  UClear: " << (U_CLEAR == UClearPolicy::DISABLED ? "DISABLED"
-                           : U_CLEAR == UClearPolicy::ZERO ? "ZERO" : "DECREMENT")
+       << "  SecTagBits: " << SEC_TAG_BITS << "  NumPaths: " << NUM_PATHS
+       << "\n";
+    os << "UWidth: " << U_WIDTH << "  UMisp: "
+       << (U_MISP == UMispPolicy::UNTOUCHED ? "UNTOUCHED"
+           : U_MISP == UMispPolicy::ZERO    ? "ZERO"
+                                            : "DECREMENT")
+       << "  UClear: "
+       << (U_CLEAR == UClearPolicy::DISABLED ? "DISABLED"
+           : U_CLEAR == UClearPolicy::ZERO   ? "ZERO"
+                                             : "DECREMENT")
        << "\n";
     os << "Fallback: " << (USE_GSHARE ? "Gshare" : "Bimodal")
        << "  Capacity: " << FB_CAPACITY;
-    if (USE_GSHARE) os << "  GsHist: " << GS_HIST;
+    if (USE_GSHARE)
+      os << "  GsHist: " << GS_HIST;
     os << "  Reconcile: " << (FB_RECONCILE ? "yes" : "no") << "\n";
     os << "Meta: width=" << META_WIDTH << " cap=" << META_CAPACITY
        << " pipe=" << META_PIPE << "\n";
     os << "Alloc: action="
-       << (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD ? "STANDARD"
+       << (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD   ? "STANDARD"
            : AllocCfg::ALLOC_ACTION == AllocAction::FILTERED ? "FILTERED"
-           : "THROTTLED")
+                                                             : "THROTTLED")
        << "  SiblingPolicy="
        << (SIBLING_POLICY == SiblingPolicy::NONE ? "NONE" : "ALL")
        << "  SiblingFloor=" << SIBLING_TABLE_FLOOR
        << "  FarAllocDist=" << FARALLOC_DIST << "\n";
-    os << "Pressure: AccWidth=" << ACC_WIDTH
-       << "  AllocWidth=" << ALLOC_WIDTH << "\n";
+    os << "Pressure: AccWidth=" << ACC_WIDTH << "  AllocWidth=" << ALLOC_WIDTH
+       << "\n";
     os << "Epoch: " << (EPOCH_ENABLE ? "yes" : "no");
     if (EPOCH_ENABLE)
       os << "  ResetAcc=" << (EPOCH_RESET_ACC ? "yes" : "no")
@@ -334,11 +339,10 @@ struct TageAhead : predictor {
     os << "Decay: " << (DECAY_ENABLE ? "yes" : "no");
     if (DECAY_ENABLE) {
       os << "  Miss="
-         << (DECAY_MISS == DecayMiss::TAG ? "TAG"
+         << (DECAY_MISS == DecayMiss::TAG          ? "TAG"
              : DECAY_MISS == DecayMiss::TAG_OR_SEC ? "TAG_OR_SEC"
-             : "TAG_AND_SEC")
-         << "  Op="
-         << (DECAY_OP == DecayOp::DECREMENT ? "DECREMENT" : "ZERO")
+                                                   : "TAG_AND_SEC")
+         << "  Op=" << (DECAY_OP == DecayOp::DECREMENT ? "DECREMENT" : "ZERO")
          << "  LfsrWidths=[";
       for (u64 i = 0; i < NT; i++)
         os << (i ? "," : "") << DECAY_LFSR_WIDTHS[i];
@@ -422,8 +426,9 @@ struct TageAhead : predictor {
 
 #ifdef DEBUG_PRINT
       if constexpr (I == 0) {
-        std::cerr << "\n─────────────���──────────────────────────\n";
+        std::cerr << "\n───────────────────────────────────────\n";
         std::cerr << "=== predict1 table[0] ===\n";
+        inst_pc.print(" pc=", "\n", true, std::cerr);
         fold_idx_val.print("  fold_idx_val=", "\n", true, std::cerr);
         idx.print("  idx=", "\n", true, std::cerr);
         fold_tag_val.print("  fold_tag_val=", "\n", true, std::cerr);
@@ -465,14 +470,15 @@ struct TageAhead : predictor {
 
     // Crit path: just read precomputed prediction from reg
     // NOTE: @prakhar @claude audit
-    block_entry.fanout(hard<2 * LINEINST>{}); // line_end() across predict + reuse + update_condbr
+    block_entry.fanout(hard<2 * LINEINST>{}); // line_end() across predict +
+                                              // reuse + update_condbr
     // NOTE: @prakhar @claude audit
     // predict1/2, reuse calls [+ 1 old_pred read under TAGE_MONITOR]
     pred.fanout(hard<2 * LINEINST
 #ifdef TAGE_MONITOR
-                       + 1
+                     + 1
 #endif
-                       >{});
+                     >{});
     block_size = 1;
     num_branch = 0;
     reuse_prediction(~line_end());
@@ -524,7 +530,8 @@ struct TageAhead : predictor {
     // curr_sec_tag read NT times (train_sec_hit) + 1 (train_sec_tag save)
     // NOTE: @prakhar @claude audit
     if constexpr (USE_SEC_TAG)
-      curr_sec_tag.fanout(hard<NT + 1>{}); // NT train_sec_hit comparisons + train_sec_tag save
+      curr_sec_tag.fanout(
+          hard<NT + 1>{}); // NT train_sec_hit comparisons + train_sec_tag save
 #ifdef TAGE_MONITOR
     // Capture raw sec values and tag hits before they're consumed
     u64 mon_saved_sec[NT]{};
@@ -563,11 +570,11 @@ struct TageAhead : predictor {
       prefetch_tag_hit[I].fanout(
           hard<1 + NUM_PATHS>{}); // shift + full_hits (1 per chain)
       prefetch_pred[I].fanout(
-          hard<1 + NUM_PATHS>{});         // shift + table_preds (1 per chain)
+          hard<1 + NUM_PATHS>{}); // shift + table_preds (1 per chain)
       // NOTE: @prakhar @claude audit
       prefetch_hyst[I].fanout(hard<2>{}); // shift + weak_mask
       // NOTE: @prakhar @claude audit
-      prefetch_u[I].fanout(hard<2>{});    // shift + weak_mask
+      prefetch_u[I].fanout(hard<2>{}); // shift + weak_mask
       if constexpr (USE_SEC_TAG)
         prefetch_sec[I].fanout(
             hard<1 + NUM_PATHS>{}); // shift + full_hits (1 per chain)
@@ -697,8 +704,7 @@ struct TageAhead : predictor {
 
     // Save old prediction (block B) before scatter overwrites with B+1.
     // NOTE: @prakhar @claude audit
-    branch_dir.fanout(
-        hard<3>{}); // true_block + hist_input + actual_dir
+    branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
 #ifdef TAGE_MONITOR
     arr<val<1>, N> old_pred = [&](u64 i) -> val<1> { return val<1>{pred[i]}; };
 #endif
@@ -815,9 +821,12 @@ struct TageAhead : predictor {
       val<1> ad = pp_xor_ap.fo1() != hard<0>{};
 
       // fanout'd vars use lvalue copy (last credit); non-fanout'd use fo1
-      return std::tuple{val<MATCH_BITS>{match1}, val<MATCH_BITS>{match2},
-                        val<PRED_BITS>{pp},      val<PRED_BITS>{ap},
-                        val<1>{pw},              ad.fo1(),
+      return std::tuple{val<MATCH_BITS>{match1},
+                        val<MATCH_BITS>{match2},
+                        val<PRED_BITS>{pp},
+                        val<PRED_BITS>{ap},
+                        val<1>{pw},
+                        ad.fo1(),
                         ua.fo1()};
     };
 
@@ -836,16 +845,14 @@ struct TageAhead : predictor {
           return val<1>{prefetch_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<0>{});
         };
-        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] =
-            resolve_chain(fh0.fo1());
+        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] = resolve_chain(fh0.fo1());
 
         // Chain 1: stored sec_tag == 1 (compile-time constant)
         arr<val<1>, NT> fh1 = [&](u64 i) {
           return val<1>{prefetch_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<1>{});
         };
-        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] =
-            resolve_chain(fh1.fo1());
+        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] = resolve_chain(fh1.fo1());
 
         // Fields muxed through NP select: m1, m2, pp, ap, pw, ad, ua.
         static constexpr u64 MUX_FIELDS = 7;
@@ -867,15 +874,13 @@ struct TageAhead : predictor {
             return val<1>{prefetch_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<2>{});
           };
-          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] =
-              resolve_chain(fh2.fo1());
+          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] = resolve_chain(fh2.fo1());
 
           arr<val<1>, NT> fh3 = [&](u64 i) {
             return val<1>{prefetch_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<3>{});
           };
-          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] =
-              resolve_chain(fh3.fo1());
+          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] = resolve_chain(fh3.fo1());
 
           // 4-to-1 mux tree: derive sel directly from next_pc (bypass reg)
           val<SEC_TAG_BITS> sec_idx =
@@ -886,7 +891,7 @@ struct TageAhead : predictor {
           // NOTE: @prakhar @claude audit
           lo.fanout(hard<MUX_FIELDS * 2>{}); // each field needs lo for 2 pairs
           // NOTE: @prakhar @claude audit
-          hi.fanout(hard<MUX_FIELDS>{});     // each field needs hi for final
+          hi.fanout(hard<MUX_FIELDS>{}); // each field needs hi for final
 
           auto mux4 = [&](auto a, auto b, auto c, auto d) {
             auto ab = select(lo, b, a);
@@ -917,7 +922,8 @@ struct TageAhead : predictor {
 
     // Per-branch 1-bit scatter: split pp/ap into per-bit arrays to reduce
     // fanout on the wide values (fanout(3) + N×fo1 vs fanout(N+2) on each).
-    // NOTE: @prakhar @claude audit: make_array(1) + train_provider_pred save(1) = 2
+    // NOTE: @prakhar @claude audit: make_array(1) + train_provider_pred save(1)
+    // = 2
     provider_pred.fanout(hard<2>{});
     // NOTE: @prakhar @claude audit: N reads in static_loop scatter
     use_alt.fanout(hard<N>{});
@@ -929,6 +935,8 @@ struct TageAhead : predictor {
 
 #ifdef DEBUG_PRINT
     std::cerr << "--- resolve_chain output ---\n";
+    block_end_info.next_pc.print("  blk_end_info.next_pc= ", "\n", true,
+                                 std ::cerr);
     match1.print("  match1=", "\n", true, std::cerr);
     match2.print("  match2=", "\n", true, std::cerr);
     provider_pred.print("  provider_pred=", "\n", true, std::cerr);
@@ -990,8 +998,7 @@ struct TageAhead : predictor {
     //   (match1/provider_pred/provider_weak/altdiff/pred/ctag) use fo1() at the
     //   point of use below.
     static_loop<NT>([&]<u64 I>() {
-      train_hyst[I].fanout(
-          hard<2>{}); // NOTE: @prakhar @claude audit
+      train_hyst[I].fanout(hard<2>{}); // NOTE: @prakhar @claude audit
       // NOTE: @prakhar @claude audit
       // u_zero(1) + base old_u(1) [+ decay old_u(1)]
       train_u[I].fanout(hard<2 + (DECAY_ENABLE ? 1 : 0)>{});
@@ -1011,8 +1018,7 @@ struct TageAhead : predictor {
       if constexpr (SEC_HIT_READS > 1)
         train_sec_hit[I].fanout(hard<SEC_HIT_READS>{});
       // TAG/SEC_HIT_READS==1 → use fo1() at point of use; ==0 → unreferenced
-      train_idx[I].fanout(
-          hard<5>{}); // NOTE: @prakhar @claude audit
+      train_idx[I].fanout(hard<5>{}); // NOTE: @prakhar @claude audit
     });
 
     val<MATCH_BITS> t_match1 = train_match1.fo1();
@@ -1025,12 +1031,10 @@ struct TageAhead : predictor {
     // do_hyst_update(1) + base_u_write(1) t_m1[NT]:   1 read normally, 2 if
     // FB_RECONCILE — declared at use site
     static_loop<NT>([&]<u64 I>() {
-      t_m1[I].fanout(
-          hard<4>{}); // NOTE: @prakhar @claude audit
+      t_m1[I].fanout(hard<4>{}); // NOTE: @prakhar @claude audit
     });
     if constexpr (FB_RECONCILE)
-      t_m1[NT].fanout(
-          hard<2>{}); // NOTE: @prakhar @claude audit
+      t_m1[NT].fanout(hard<2>{}); // NOTE: @prakhar @claude audit
     val<PRED_BITS> t_pp = train_provider_pred.fo1();
     val<1> t_pw =
         train_provider_weak.fo1(); // newly-alloc (hyst==0 & u==0) — meta
@@ -1110,9 +1114,10 @@ struct TageAhead : predictor {
       mon.record_train_skip();
 #endif
 #ifdef TAGE_MONITOR
-    arr<val<1>, N> badpred = [&](u64 i) -> val<1> {
-      return old_pred[i].fo1() ^ val<1>{branch_dir[i]};
-    };
+    // TODO: No idea why this even is here
+    // arr<val<1>, N> badpred = [&](u64 i) -> val<1> {
+    //   return old_pred[i].fo1() ^ val<1>{branch_dir[i]};
+    // };
 #endif
 
     // ---- Compute training signals ----
@@ -1121,7 +1126,8 @@ struct TageAhead : predictor {
                                 }}.concat();
 
     // Provider wrong on any branch? (uses piped provider_pred)
-    // NOTE: @prakhar @claude audit: any_provider_wrong(1) [+ fb_tage_disagree(1) if FB_RECONCILE]
+    // NOTE: @prakhar @claude audit: any_provider_wrong(1) [+
+    // fb_tage_disagree(1) if FB_RECONCILE]
     if constexpr (FB_RECONCILE)
       t_pp.fanout(hard<2>{}); // any_provider_wrong + fb_tage_disagree
     // NOTE: @prakhar @claude audit: any_provider_wrong(1) + table_wrong×NT(NT)
@@ -1134,7 +1140,8 @@ struct TageAhead : predictor {
       else
         return (t_pp.fo1() ^ actual_dir) != hard<0>{};
     }();
-    // NOTE: @prakhar @claude audit: meta_update(1) [+ alloc_trigger(1) if TAGE_WRONG]
+    // NOTE: @prakhar @claude audit: meta_update(1) [+ alloc_trigger(1) if
+    // TAGE_WRONG]
     if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG)
       any_provider_wrong.fanout(hard<2>{}); // meta_update + alloc_trigger
     // NOTE: @prakhar @claude audit: meta_gate(1) + meta_update_dir(1) = 2
@@ -1193,7 +1200,8 @@ struct TageAhead : predictor {
       // NOTE: @prakhar @claude audit
       notumask.fanout(hard<2>{}); // candallocmask(1) + noalloc(1)
       // NOTE: @prakhar @claude audit
-      postmask.fanout(hard<3>{}); // candallocmask(1) + noalloc(1) + uclearmask(1)
+      postmask.fanout(
+          hard<3>{}); // candallocmask(1) + noalloc(1) + uclearmask(1)
     }
     val<NT> candallocmask = [&]() {
       val<NT> base = postmask & notumask;
@@ -1213,12 +1221,16 @@ struct TageAhead : predictor {
           // When DECAY also reads these, fanout(2) was declared and lvalue
           // reads are fine. When sibling is the only reader, use fo1.
           auto th = [&]() -> val<1> {
-            if constexpr (DECAY_ENABLE) return val<1>{train_tag_hit[i]};
-            else return train_tag_hit[i].fo1();
+            if constexpr (DECAY_ENABLE)
+              return val<1>{train_tag_hit[i]};
+            else
+              return train_tag_hit[i].fo1();
           }();
           auto sh = [&]() -> val<1> {
-            if constexpr (DECAY_ENABLE) return val<1>{train_sec_hit[i]};
-            else return train_sec_hit[i].fo1();
+            if constexpr (DECAY_ENABLE)
+              return val<1>{train_sec_hit[i]};
+            else
+              return train_sec_hit[i].fo1();
           }();
           return ~(th.fo1() & ~sh.fo1());
         };
@@ -1362,9 +1374,10 @@ struct TageAhead : predictor {
           if (ucm & (u64(1) << i))
             mon.record_uclear_source(i, 0); // alloc_fail (genuine)
           // Would-have-been sibling uclear: u=0 existed but candallocmask
-          // filtered it out (sibling skip). Under old code this triggered uclear.
-          if (!(ucm & (u64(1) << i)) && (pm & (u64(1) << i)) &&
-              had_u0 && !had_cand && static_cast<u64>(alloc_trigger))
+          // filtered it out (sibling skip). Under old code this triggered
+          // uclear.
+          if (!(ucm & (u64(1) << i)) && (pm & (u64(1) << i)) && had_u0 &&
+              !had_cand && static_cast<u64>(alloc_trigger))
             mon.record_uclear_source(i, 1); // sibling (counterfactual)
         }
       }
@@ -1379,10 +1392,8 @@ struct TageAhead : predictor {
     if constexpr (FB_RECONCILE) {
       // NOTE: @prakhar @claude audit
       train_fb_hyst.fanout(hard<2>{}); // fb_hyst_weak + silent update check
-      train_fb.fanout(
-          hard<2>{}); // NOTE: @prakhar @claude audit
-      train_fb_idx.fanout(
-          hard<3>{}); // NOTE: @prakhar @claude audit
+      train_fb.fanout(hard<2>{});      // NOTE: @prakhar @claude audit
+      train_fb_idx.fanout(hard<3>{});  // NOTE: @prakhar @claude audit
     }
     val<1> fb_changed = [&]() -> val<1> {
       if constexpr (FB_RECONCILE)
@@ -1476,8 +1487,10 @@ struct TageAhead : predictor {
       val<1> table_wrong =
           (val<PRED_BITS>{train_pred[I].fo1()} ^ actual_dir) != hard<0>{};
       // NOTE: @prakhar @claude audit
-      // do_pred_update(1) + new_hyst(1) + u_correct(1) [+ u_wrong(1) if !UNTOUCHED]
-      table_wrong.fanout(hard<3 + (U_MISP != UMispPolicy::UNTOUCHED ? 1 : 0)>{});
+      // do_pred_update(1) + new_hyst(1) + u_correct(1) [+ u_wrong(1) if
+      // !UNTOUCHED]
+      table_wrong.fanout(
+          hard<3 + (U_MISP != UMispPolicy::UNTOUCHED ? 1 : 0)>{});
 
       // pred_ram: alloc writes actual_dir, update writes actual_dir → same
       // data. Gated on hyst-only weakness (t_phw), not newly-alloc (t_pw). A
@@ -1555,16 +1568,16 @@ struct TageAhead : predictor {
         u_wrong.fanout(hard<2>{});
       val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
       // Need u_dec when U_MISP==DECREMENT or U_CLEAR==DECREMENT
-      static constexpr bool NEED_DEC =
-          U_MISP == UMispPolicy::DECREMENT || U_CLEAR == UClearPolicy::DECREMENT;
+      static constexpr bool NEED_DEC = U_MISP == UMispPolicy::DECREMENT ||
+                                       U_CLEAR == UClearPolicy::DECREMENT;
       // NOTE: @prakhar @claude audit:
       //   u_inc: ==maxval(1) + select_true(1) + +1(1) = 3
       //   u_dec (NEED_DEC): ==0(1) + select_true(1) + -1(1) = 3
       //   wrong_or_clear: innermost select fallback = 1
       //   silent update (!DECAY): base_newu != old_u = 1
       old_u.fanout(hard<3 + (NEED_DEC ? 3 : 0) + 1 + (DECAY_ENABLE ? 0 : 1)>{});
-      auto u_inc = select(old_u == hard<old_u.maxval>{}, old_u,
-                          val<U_WIDTH>{old_u + 1});
+      auto u_inc =
+          select(old_u == hard<old_u.maxval>{}, old_u, val<U_WIDTH>{old_u + 1});
       auto u_dec = [&]() {
         if constexpr (NEED_DEC)
           return select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
@@ -1590,15 +1603,15 @@ struct TageAhead : predictor {
         auto wrong_or_clear = [&]() -> val<U_WIDTH> {
           if constexpr (U_MISP == UMispPolicy::ZERO)
             return select(u_wrong, val<U_WIDTH>{0},
-                   select(uclear[I], uclear_val.fo1(),
-                   select(allocate[I], val<U_WIDTH>{0}, old_u)));
+                          select(uclear[I], uclear_val.fo1(),
+                                 select(allocate[I], val<U_WIDTH>{0}, old_u)));
           else if constexpr (U_MISP == UMispPolicy::DECREMENT)
             return select(u_wrong, u_dec.fo1(),
-                   select(uclear[I], uclear_val.fo1(),
-                   select(allocate[I], val<U_WIDTH>{0}, old_u)));
+                          select(uclear[I], uclear_val.fo1(),
+                                 select(allocate[I], val<U_WIDTH>{0}, old_u)));
           else // UNTOUCHED
             return select(uclear[I], uclear_val.fo1(),
-                   select(allocate[I], val<U_WIDTH>{0}, old_u));
+                          select(allocate[I], val<U_WIDTH>{0}, old_u));
         }();
         return select(u_correct, u_inc.fo1(), wrong_or_clear.fo1());
       }();
@@ -1661,8 +1674,9 @@ struct TageAhead : predictor {
 
           // Mux: if base write active, use base_newu; else if decay, use
           // decayed_u
-          val<U_WIDTH> merged = select(base_u_write, base_newu.fo1(),
-                                       select(decay_fire.fo1(), decayed_u.fo1(), old_u));
+          val<U_WIDTH> merged =
+              select(base_u_write, base_newu.fo1(),
+                     select(decay_fire.fo1(), decayed_u.fo1(), old_u));
           val<1> merged_write = base_u_write | decay_fire;
           val<1> merged_changed = merged.fo1() != old_u;
           return {merged, merged_write.fo1() & merged_changed.fo1()};
