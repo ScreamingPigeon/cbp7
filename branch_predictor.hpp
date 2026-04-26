@@ -31,6 +31,77 @@ using TageAhead1C =
               2, 1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,
               SiblingPolicy::ALL>;
 
+// ============================================================================
+// Sweep helpers: 1C base macro, parameterized by AllocConfig
+// ============================================================================
+#define TA1C_BASE(ALLOC_CFG)                                                   \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
+      0, 10, 10
+
+// ============================================================================
+// Sweep 2: tuning V1/V4 winners, MAX_ALLOC=2, utilization-gated decay
+// ============================================================================
+
+// --- A. Threshold tuning around V1 (fixed, TAG_OR_SEC) ---
+// S1: V1 but thresh=8 (~3.1%), half of V1
+using Sweep2_S1 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
+// S2: V1 but thresh=24 (~9.4%), 1.5x of V1
+using Sweep2_S2 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<24>, false>;
+
+// S3: V1 but thresh=32 (~12.5%), 2x of V1
+using Sweep2_S3 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<32>, false>;
+
+// --- B. Threshold tuning around V4 (graded, TAG only) ---
+// S4: V4 but graded 8→64 (wider range, TAG only)
+using Sweep2_S4 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::GradedDecayThresh<8, 64, 14>, false>;
+
+// S5: V4 but graded 8→48 (moderate range, TAG only)
+using Sweep2_S5 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::GradedDecayThresh<8, 48, 14>, false>;
+
+// --- C. MAX_ALLOC=2 (double allocation per misprediction) ---
+// S6: baseline + MAX_ALLOC=2 (epoch, no decay)
+using Sweep2_S6 = TageAhead<TA1C_BASE(TAAlloc2PressSkip)>;
+
+// S7: V1 + MAX_ALLOC=2 (best fixed decay + double alloc)
+using Sweep2_S7 = TageAhead<TA1C_BASE(TAAlloc2PressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<16>, false>;
+
+// S8: V4 + MAX_ALLOC=2 (best graded decay + double alloc)
+using Sweep2_S8 = TageAhead<TA1C_BASE(TAAlloc2PressSkip),
+    true, DecayMiss::TAG, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::GradedDecayThresh<4, 32, 14>, false>;
+
+// --- D. Utilization-gated decay via per-table LFSR widths ---
+// Longer-history tables (T0) get wider LFSR → lower P(decay),
+// shorter-history tables (T13) get narrower LFSR → higher P(decay).
+// Combined with fixed threshold so total P varies per table.
+
+// S9: V1 thresh=16 + graded LFSR 10→7 (T0: 16/1024≈1.6%, T13: 16/128≈12.5%)
+using Sweep2_S9 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::graded_array<u64, 14>(10, 7), ta::FixedDecayThresh<16>, false>;
+
+// S10: V1 thresh=16 + graded LFSR 12→6 (T0: 16/4096≈0.4%, T13: 16/64≈25%)
+using Sweep2_S10 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::graded_array<u64, 14>(12, 6), ta::FixedDecayThresh<16>, false>;
+
 // 2-cycle config: 28 tables, StepSize 4096/2048 split@24, P2 ≈ 1.91
 // 106K entries, 24 tables at 4096 + 4 at 2048, MAXH=1000
 // SiblingPolicy::NONE — sibling skip hurts 2C (3.3% MPKI regression)

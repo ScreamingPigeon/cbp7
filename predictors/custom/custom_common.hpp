@@ -240,6 +240,16 @@ constexpr std::array<T, N> split_array(T v_lo, T v_hi, std::size_t split) {
   return a;
 }
 
+// Graded array: linear interpolation from v_first (index 0) to v_last (index N-1).
+// Useful for per-table LFSR widths where T0 (longest history) differs from T(N-1).
+template <typename T, std::size_t N>
+constexpr std::array<T, N> graded_array(T v_first, T v_last) {
+  std::array<T, N> a{};
+  for (std::size_t i = 0; i < N; i++)
+    a[i] = N > 1 ? v_first + (v_last - v_first) * T(i) / T(N - 1) : v_first;
+  return a;
+}
+
 constexpr u64 clog2(u64 x) {
   u64 r = 0, v = x - 1;
   while (v > 0) {
@@ -593,6 +603,47 @@ struct DefaultDecayThresh {
   template <u64 I, u64 LW, u64 AW, u64 PW>
   static auto compute(val<AW> /*accuracy_ctr*/, val<PW> alloc_ctr) {
     return val<LW>{alloc_ctr};
+  }
+};
+
+// Fixed threshold: compile-time constant probability independent of counters.
+// P(decay|miss) ≈ THRESH / 2^LW.  E.g. THRESH=16, LW=8 → ~6.25% per miss.
+template <u64 THRESH>
+struct FixedDecayThresh {
+  template <u64 I, u64 LW, u64 AW, u64 PW>
+  static auto compute(val<AW> /*acc*/, val<PW> /*alloc*/) {
+    constexpr u64 clamped = THRESH < (u64(1) << LW) ? THRESH : (u64(1) << LW) - 1;
+    return val<LW>{hard<clamped>{}};
+  }
+};
+
+// Graded fixed threshold: per-table constant.  T0 (longest history, index 0)
+// gets THRESH_LO (decays rarely), T(N-1) gets THRESH_HI (decays more often).
+// Linear interpolation between them.
+template <u64 THRESH_LO, u64 THRESH_HI, u64 NT>
+struct GradedDecayThresh {
+  template <u64 I, u64 LW, u64 AW, u64 PW>
+  static auto compute(val<AW> /*acc*/, val<PW> /*alloc*/) {
+    constexpr u64 t = NT > 1 ? THRESH_LO + (THRESH_HI - THRESH_LO) * I / (NT - 1)
+                              : THRESH_LO;
+    constexpr u64 clamped = t < (u64(1) << LW) ? t : (u64(1) << LW) - 1;
+    return val<LW>{hard<clamped>{}};
+  }
+};
+
+// Accuracy-gated threshold: threshold = FIXED * (1 - acc_ctr/maxval).
+// High accuracy (acc_ctr near max) → low threshold → rare decay.
+// Low accuracy (acc_ctr near 0) → threshold near FIXED → frequent decay.
+template <u64 FIXED>
+struct AccGatedDecayThresh {
+  template <u64 I, u64 LW, u64 AW, u64 PW>
+  static auto compute(val<AW> acc_ctr, val<PW> /*alloc*/) {
+    // Invert acc: low accuracy → high value
+    val<AW> inv_acc = val<AW>{hard<acc_ctr.maxval>{}} - acc_ctr;
+    // Scale: thresh = FIXED * inv_acc / maxval ≈ (FIXED * inv_acc) >> AW
+    // Approximate with shift to avoid HW multiply
+    constexpr u64 clamped = FIXED < (u64(1) << LW) ? FIXED : (u64(1) << LW) - 1;
+    return val<LW>{(val<AW + LW>{inv_acc} * hard<clamped>{}) >> AW};
   }
 };
 
