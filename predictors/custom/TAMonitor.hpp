@@ -207,6 +207,29 @@ struct TAMonitor {
     u64 meta_chose_pri = 0;
     u64 meta_chose_pri_correct = 0;
 
+    // Provider source breakdown (per branch):
+    //   no_tag_match:   no TAGE table had a tag match at all
+    //   sec_tag_reject: at least one tag match, but sec_tag filtered all out
+    //   tage_meta_alt:  TAGE provider exists, meta chose alt (fallback)
+    //   tage_meta_pri:  TAGE provider exists, meta chose primary (TAGE)
+    //   tage_no_meta:   TAGE provider exists, meta not involved (provider strong)
+    u64 prov_no_tag_match = 0;
+    u64 prov_no_tag_match_correct = 0;
+    u64 prov_sec_tag_reject = 0;
+    u64 prov_sec_tag_reject_correct = 0;
+    u64 prov_tage_meta_alt = 0;
+    u64 prov_tage_meta_alt_correct = 0;
+    u64 prov_tage_meta_pri = 0;
+    u64 prov_tage_meta_pri_correct = 0;
+    u64 prov_tage_no_meta = 0;
+    u64 prov_tage_no_meta_correct = 0;
+
+    // Counterfactual: for sec-tag-rejected branches, would the tag-only
+    // provider have been correct? (i.e. what we lose by sec-tag filtering)
+    u64 cf_sec_tag_only_total = 0;
+    u64 cf_sec_tag_only_correct = 0;  // tag-only provider would have been right
+    u64 cf_sec_fb_correct = 0;        // fallback was right (what we actually used)
+
     // Tag match rate
     std::array<u64, NUM_TABLES> tag_lookups{};
     std::array<u64, NUM_TABLES> tag_matches{};
@@ -319,6 +342,10 @@ struct TAMonitor {
   std::array<u64, N> shadow_pc{};
   // Feature 24: shadow fallback prediction per branch
   std::array<bool, N> shadow_fb_pred{};
+  // Provider source breakdown shadow
+  bool shadow_any_tag_hit = false;
+  bool shadow_has_tage_provider = false;
+  std::array<bool, N> shadow_tag_only_pred{};
 
   // Per-PC diagnostics
   std::unordered_map<u64, PCDiag> pc_diag;
@@ -432,13 +459,19 @@ struct TAMonitor {
 
   void record_prediction(u64 rank, u64 match1_val, u64 match2_val,
                           bool meta_overrode, bool meta_chose_alt,
-                          bool pred_taken) {
+                          bool pred_taken,
+                          bool any_tag_hit = false,
+                          bool has_tage_provider = false,
+                          bool tag_only_pred = false) {
     u64 prov = decode_provider(match1_val);
     shadow_provider[rank] = prov;
     shadow_alt[rank] = decode_provider(match2_val);
     shadow_meta_overrode[rank] = meta_overrode;
     shadow_meta_chose_alt[rank] = meta_chose_alt;
     shadow_pred[rank] = pred_taken;
+    shadow_any_tag_hit = any_tag_hit;
+    shadow_has_tage_provider = has_tage_provider;
+    shadow_tag_only_pred[rank] = tag_only_pred;
   }
 
   // Feature 24: record fallback prediction per branch (call from TageAhead)
@@ -477,6 +510,31 @@ struct TAMonitor {
           c.meta_chose_pri++;
           if (correct) c.meta_chose_pri_correct++;
         }
+      }
+
+      // Provider source breakdown
+      if (!shadow_any_tag_hit) {
+        c.prov_no_tag_match++;
+        if (correct) c.prov_no_tag_match_correct++;
+      } else if (!shadow_has_tage_provider) {
+        c.prov_sec_tag_reject++;
+        if (correct) c.prov_sec_tag_reject_correct++;
+        // Counterfactual: would tag-only provider have been correct?
+        c.cf_sec_tag_only_total++;
+        bool tag_only_correct = (shadow_tag_only_pred[rank] == actual_taken);
+        if (tag_only_correct) c.cf_sec_tag_only_correct++;
+        if (correct) c.cf_sec_fb_correct++; // FB was actually used and correct
+      } else if (shadow_meta_overrode[rank]) {
+        if (shadow_meta_chose_alt[rank]) {
+          c.prov_tage_meta_alt++;
+          if (correct) c.prov_tage_meta_alt_correct++;
+        } else {
+          c.prov_tage_meta_pri++;
+          if (correct) c.prov_tage_meta_pri_correct++;
+        }
+      } else {
+        c.prov_tage_no_meta++;
+        if (correct) c.prov_tage_no_meta_correct++;
       }
 
       if (rank < N) {
@@ -887,7 +945,9 @@ struct TAMonitor {
       os << "phase_delta_avg,phase_max_delta,";
       os << "jaccard,";
       os << "pingpong,";
-      os << "cf_fb_only%,cf_tage_only%";
+      os << "cf_fb_only%,cf_tage_only%,";
+      os << "prov_no_tag%,prov_sec_rej%,prov_meta_alt%,prov_meta_pri%,prov_no_meta%,";
+      os << "cf_sec_fb_acc%,cf_sec_tage_acc%";
       os << "\n";
       header_printed = true;
     }
@@ -971,6 +1031,18 @@ struct TAMonitor {
     // Feature 24: counterfactual
     os << "," << pct(w.cf_fb_only, w.cf_total)
        << "," << pct(w.cf_tage_only, w.cf_total);
+    // Provider source breakdown
+    u64 w_prov_total = w.prov_no_tag_match + w.prov_sec_tag_reject +
+                       w.prov_tage_meta_alt + w.prov_tage_meta_pri +
+                       w.prov_tage_no_meta;
+    os << "," << pct(w.prov_no_tag_match, w_prov_total)
+       << "," << pct(w.prov_sec_tag_reject, w_prov_total)
+       << "," << pct(w.prov_tage_meta_alt, w_prov_total)
+       << "," << pct(w.prov_tage_meta_pri, w_prov_total)
+       << "," << pct(w.prov_tage_no_meta, w_prov_total);
+    // Sec-tag counterfactual accuracy
+    os << "," << pct(w.cf_sec_fb_correct, w.cf_sec_tag_only_total)
+       << "," << pct(w.cf_sec_tag_only_correct, w.cf_sec_tag_only_total);
 
     os << "\n";
   }
@@ -1082,6 +1154,45 @@ struct TAMonitor {
     os << "  Chose primary: " << c.meta_chose_pri
        << "  Correct: " << c.meta_chose_pri_correct << " ("
        << pct(c.meta_chose_pri_correct, c.meta_chose_pri) << "%)\n";
+
+    // Provider source breakdown
+    u64 prov_total = c.prov_no_tag_match + c.prov_sec_tag_reject +
+                     c.prov_tage_meta_alt + c.prov_tage_meta_pri +
+                     c.prov_tage_no_meta;
+    os << "\nProvider Source Breakdown:\n";
+    os << "  No tag match (FB only):    " << c.prov_no_tag_match << " ("
+       << pct(c.prov_no_tag_match, prov_total) << "%)  acc="
+       << pct(c.prov_no_tag_match_correct, c.prov_no_tag_match) << "%\n";
+    os << "  Sec-tag rejected (FB):     " << c.prov_sec_tag_reject << " ("
+       << pct(c.prov_sec_tag_reject, prov_total) << "%)  acc="
+       << pct(c.prov_sec_tag_reject_correct, c.prov_sec_tag_reject) << "%\n";
+    os << "  TAGE provider, meta→alt:   " << c.prov_tage_meta_alt << " ("
+       << pct(c.prov_tage_meta_alt, prov_total) << "%)  acc="
+       << pct(c.prov_tage_meta_alt_correct, c.prov_tage_meta_alt) << "%\n";
+    os << "  TAGE provider, meta→pri:   " << c.prov_tage_meta_pri << " ("
+       << pct(c.prov_tage_meta_pri, prov_total) << "%)  acc="
+       << pct(c.prov_tage_meta_pri_correct, c.prov_tage_meta_pri) << "%\n";
+    os << "  TAGE provider, no meta:    " << c.prov_tage_no_meta << " ("
+       << pct(c.prov_tage_no_meta, prov_total) << "%)  acc="
+       << pct(c.prov_tage_no_meta_correct, c.prov_tage_no_meta) << "%\n";
+
+    // Counterfactual: sec-tag rejection cost
+    if (c.cf_sec_tag_only_total > 0) {
+      os << "\n  Sec-tag counterfactual (tag-hit but sec-tag rejected):\n";
+      os << "    Branches: " << c.cf_sec_tag_only_total << "\n";
+      os << "    FB accuracy (actual):      "
+         << pct(c.cf_sec_fb_correct, c.cf_sec_tag_only_total) << "%\n";
+      os << "    Tag-only TAGE accuracy:    "
+         << pct(c.cf_sec_tag_only_correct, c.cf_sec_tag_only_total) << "%\n";
+      double delta = static_cast<double>(c.cf_sec_tag_only_correct) -
+                     static_cast<double>(c.cf_sec_fb_correct);
+      os << "    Delta (TAGE - FB):         " << std::showpos
+         << std::fixed << std::setprecision(0) << delta << std::noshowpos
+         << " branches (" << std::showpos << std::setprecision(2)
+         << (c.cf_sec_tag_only_total > 0
+             ? 100.0 * delta / c.cf_sec_tag_only_total : 0.0)
+         << "%" << std::noshowpos << ")\n";
+    }
 
     // Allocation
     os << "\nAllocation:\n";

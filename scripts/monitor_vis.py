@@ -330,7 +330,7 @@ def page_pipeline(data, wins, base, title):
 # Page 4: Advanced Features (micro MPKI, Jaccard, ping-pong, counterfactual)
 # ============================================================================
 def page_advanced(data, wins, base, title):
-    fig, axes = plt.subplots(3, 2, figsize=(16, 15))
+    fig, axes = plt.subplots(4, 2, figsize=(16, 20))
     fig.suptitle(f"{title} — Advanced Analysis", fontsize=13, fontweight="bold")
 
     # (0,0) Micro sliding-window MPKI p50/p95
@@ -434,6 +434,42 @@ def page_advanced(data, wins, base, title):
     ax.set_xlabel("Window")
     ax.grid(True, alpha=0.2)
 
+    # (3,0) Provider source breakdown stacked area
+    ax = axes[3, 0]
+    prov_keys = ["prov_no_tag%", "prov_sec_rej%", "prov_meta_alt%",
+                 "prov_meta_pri%", "prov_no_meta%"]
+    prov_labels = ["No tag match", "Sec-tag rejected", "Meta→alt",
+                   "Meta→primary", "TAGE (no meta)"]
+    prov_colors = ["#d62728", "#ff7f0e", "#9467bd", "#2ca02c", "#1f77b4"]
+    prov_present = [k for k in prov_keys if k in data]
+    if prov_present:
+        stacks = [data[k] for k in prov_present]
+        labels = [prov_labels[prov_keys.index(k)] for k in prov_present]
+        colors = [prov_colors[prov_keys.index(k)] for k in prov_present]
+        ax.stackplot(wins, *stacks, labels=labels, colors=colors, alpha=0.8)
+        ax.legend(loc="upper right", fontsize=7)
+    ax.set_ylabel("% of branches")
+    ax.set_title("Provider Source Breakdown (per window)")
+    ax.set_xlabel("Window")
+    ax.grid(True, alpha=0.2)
+
+    # (3,1) Provider source: sec-tag rejection rate vs meta-alt rate over time
+    ax = axes[3, 1]
+    if has(data, "prov_sec_rej%"):
+        ax.plot(wins, data["prov_sec_rej%"], color="#ff7f0e", linewidth=1.2,
+                label="Sec-tag rejected %")
+    if has(data, "prov_meta_alt%"):
+        ax.plot(wins, data["prov_meta_alt%"], color="#9467bd", linewidth=1.2,
+                label="Meta→alt %")
+    if has(data, "prov_no_tag%"):
+        ax.plot(wins, data["prov_no_tag%"], color="#d62728", linewidth=1.2,
+                label="No tag match %", linestyle="--")
+    ax.set_ylabel("% of branches")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("Fallback Causes: Sec-tag vs Meta vs No-match")
+    ax.set_xlabel("Window")
+    ax.grid(True, alpha=0.2)
+
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     save_fig(fig, base, "page4_advanced")
 
@@ -521,7 +557,9 @@ def page_correlations(data, wins, base, title):
     candidates = ["MPKI", "misp%", "alloc_ok%", "acc_avg", "extra%",
                   "true_blk%", "coll%", "Tlast_zu%", "dir_misp%", "bnd_misp%",
                   "micro_p50_mpki", "micro_p95_mpki", "phase_delta_avg", "phase_max_delta",
-                  "jaccard", "pingpong", "cf_fb_only%", "cf_tage_only%"]
+                  "jaccard", "pingpong", "cf_fb_only%", "cf_tage_only%",
+                  "prov_no_tag%", "prov_sec_rej%", "prov_meta_alt%",
+                  "prov_meta_pri%", "prov_no_meta%"]
     cols = [c for c in candidates if c in data and np.std(data[c]) > 1e-9]
 
     if len(cols) < 4:

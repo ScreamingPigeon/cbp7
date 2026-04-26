@@ -963,15 +963,34 @@ struct TageAhead : predictor {
 #endif
 
 #ifdef TAGE_MONITOR
+    // Provider source: any_tag_hit = at least one table matched on primary tag
+    // has_tage_provider = provider is a TAGE table (not fallback)
+    bool mon_any_tag_hit = false;
+    u64 mon_tag_only_provider = NT; // fallback if no tag match
+    for (u64 i = 0; i < NT; i++) {
+      if (mon_tag_hit[i]) {
+        if (!mon_any_tag_hit) mon_tag_only_provider = i;
+        mon_any_tag_hit = true;
+      }
+    }
+    u64 m1v_check = static_cast<u64>(match1);
+    bool mon_has_tage = (decltype(mon)::decode_provider(m1v_check) < NT);
+    // Counterfactual: what would the tag-only provider have predicted?
+    // (ignoring sec-tag filter — for branches where sec-tag rejected all)
+    u64 mon_tag_only_pred = (mon_tag_only_provider < NT)
+        ? static_cast<u64>(prefetch_pred[mon_tag_only_provider])
+        : static_cast<u64>(prefetch_fb);
     for (u64 r = 0; r < num_branch; r++) {
       bool meta_overrode =
           static_cast<u64>(provider_weak) &&
           ((static_cast<u64>(match2) & ((1ULL << NT) - 1)) != 0);
       bool meta_chose = static_cast<u64>(use_alt);
       bool pred_taken = static_cast<u64>(pred[r]);
+      bool tag_only_taken = (mon_tag_only_pred >> r) & 1;
       mon.record_prediction(r, static_cast<u64>(match1),
                             static_cast<u64>(match2), meta_overrode, meta_chose,
-                            pred_taken);
+                            pred_taken, mon_any_tag_hit, mon_has_tage,
+                            tag_only_taken);
     }
     {
       u64 m1v = static_cast<u64>(match1);

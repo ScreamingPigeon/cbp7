@@ -185,7 +185,10 @@ def main():
         interesting = ["MPKI", "misp%", "alloc_ok%", "acc_avg", "extra%",
                        "true_blk%", "coll%", "Tlast_zu%", "dir_misp%", "bnd_misp%",
                        "micro_p50_mpki", "micro_p95_mpki", "phase_delta_avg",
-                       "jaccard", "pingpong", "cf_fb_only%", "cf_tage_only%"]
+                       "jaccard", "pingpong", "cf_fb_only%", "cf_tage_only%",
+                       "prov_no_tag%", "prov_sec_rej%", "prov_meta_alt%",
+                       "prov_meta_pri%", "prov_no_meta%",
+                       "cf_sec_fb_acc%", "cf_sec_tage_acc%"]
         for col in interesting:
             if col not in numeric_cols:
                 continue

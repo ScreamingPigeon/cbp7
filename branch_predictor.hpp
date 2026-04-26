@@ -42,6 +42,50 @@ using TageAhead1C =
       1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
       0, 10, 10
 
+// S1 base with variable META_WIDTH (MW) and META_CAPACITY (MC)
+#define S1_META(MW, MC)                                                        \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, MW,    \
+      MC, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                    \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false
+
+// 1C base with doubled bimodal (16384 entries)
+#define TA1C_BASE_BIM2X(ALLOC_CFG)                                             \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, 2,    \
+      1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
+      0, 10, 10
+
+// ============================================================================
+// Sweep 3: Meta table tuning (META_WIDTH × META_CAPACITY) on S1 base
+// ============================================================================
+// MW=1
+using S3_MW1_MC512  = TageAhead<S1_META(1, 512)>;
+using S3_MW1_MC1024 = TageAhead<S1_META(1, 1024)>;
+using S3_MW1_MC2048 = TageAhead<S1_META(1, 2048)>;
+using S3_MW1_MC4096 = TageAhead<S1_META(1, 4096)>;
+// MW=2
+using S3_MW2_MC512  = TageAhead<S1_META(2, 512)>;
+using S3_MW2_MC1024 = TageAhead<S1_META(2, 1024)>; // == Sweep2_S1
+using S3_MW2_MC2048 = TageAhead<S1_META(2, 2048)>;
+using S3_MW2_MC4096 = TageAhead<S1_META(2, 4096)>;
+// MW=4
+using S3_MW4_MC512  = TageAhead<S1_META(4, 512)>;
+using S3_MW4_MC1024 = TageAhead<S1_META(4, 1024)>;
+using S3_MW4_MC2048 = TageAhead<S1_META(4, 2048)>;
+using S3_MW4_MC4096 = TageAhead<S1_META(4, 4096)>;
+
+// S1 with doubled bimodal: Fixed thresh=8, TAG_OR_SEC, FB_CAPACITY=16384
+using Sweep2_S1_Bim2x = TageAhead<TA1C_BASE_BIM2X(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
 // ============================================================================
 // Sweep 2: tuning V1/V4 winners, MAX_ALLOC=2, utilization-gated decay
 // ============================================================================
@@ -101,6 +145,25 @@ using Sweep2_S9 = TageAhead<TA1C_BASE(TAAllocPressSkip),
 using Sweep2_S10 = TageAhead<TA1C_BASE(TAAllocPressSkip),
     true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
     ta::graded_array<u64, 14>(12, 6), ta::FixedDecayThresh<16>, false>;
+
+// --- E. Pressure-gated decay (only decay under allocation pressure) ---
+// S11: graded 4→32, TAG_OR_SEC, gated at alloc_ctr > 512 (~50% pressure)
+using Sweep2_S11 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8),
+    ta::PressGatedDecayThresh<4, 32, 14, 512>, false>;
+
+// S12: graded 4→32, TAG_OR_SEC, gated at alloc_ctr > 256 (~25% pressure)
+using Sweep2_S12 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8),
+    ta::PressGatedDecayThresh<4, 32, 14, 256>, false>;
+
+// S13: pressure-scaled graded 8→64, TAG_OR_SEC (thresh proportional to pressure)
+using Sweep2_S13 = TageAhead<TA1C_BASE(TAAllocPressSkip),
+    true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+    ta::uniform_array<u64, 14>(8),
+    ta::PressScaledDecayThresh<8, 64, 14>, false>;
 
 // 2-cycle config: 28 tables, StepSize 4096/2048 split@24, P2 ≈ 1.91
 // 106K entries, 24 tables at 4096 + 4 at 2048, MAXH=1000

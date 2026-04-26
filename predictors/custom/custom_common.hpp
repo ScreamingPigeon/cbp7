@@ -245,8 +245,10 @@ constexpr std::array<T, N> split_array(T v_lo, T v_hi, std::size_t split) {
 template <typename T, std::size_t N>
 constexpr std::array<T, N> graded_array(T v_first, T v_last) {
   std::array<T, N> a{};
+  using S = std::make_signed_t<T>;
   for (std::size_t i = 0; i < N; i++)
-    a[i] = N > 1 ? v_first + (v_last - v_first) * T(i) / T(N - 1) : v_first;
+    a[i] = N > 1 ? T(S(v_first) + (S(v_last) - S(v_first)) * S(i) / S(N - 1))
+                  : v_first;
   return a;
 }
 
@@ -644,6 +646,35 @@ struct AccGatedDecayThresh {
     // Approximate with shift to avoid HW multiply
     constexpr u64 clamped = FIXED < (u64(1) << LW) ? FIXED : (u64(1) << LW) - 1;
     return val<LW>{(val<AW + LW>{inv_acc} * hard<clamped>{}) >> AW};
+  }
+};
+
+// Pressure-gated graded threshold: only decay when alloc_ctr exceeds GATE.
+// Below GATE → threshold=0 (no decay). Above GATE → graded per-table threshold.
+// Addresses workloads with low table contention (e.g. namd) where decay is harmful.
+template <u64 THRESH_LO, u64 THRESH_HI, u64 NT, u64 GATE>
+struct PressGatedDecayThresh {
+  template <u64 I, u64 LW, u64 AW, u64 PW>
+  static auto compute(val<AW> /*acc*/, val<PW> alloc_ctr) {
+    constexpr u64 t = NT > 1 ? THRESH_LO + (THRESH_HI - THRESH_LO) * I / (NT - 1)
+                              : THRESH_LO;
+    constexpr u64 clamped = t < (u64(1) << LW) ? t : (u64(1) << LW) - 1;
+    val<1> gate = alloc_ctr.fo1() > hard<GATE>{};
+    return select(gate, val<LW>{hard<clamped>{}}, val<LW>{hard<0>{}});
+  }
+};
+
+// Pressure-scaled graded threshold: scales threshold linearly with alloc_ctr.
+// thresh[I] = graded_base[I] * alloc_ctr / max_alloc_ctr
+// High pressure → full threshold. Low pressure → near-zero threshold.
+template <u64 THRESH_LO, u64 THRESH_HI, u64 NT>
+struct PressScaledDecayThresh {
+  template <u64 I, u64 LW, u64 AW, u64 PW>
+  static auto compute(val<AW> /*acc*/, val<PW> alloc_ctr) {
+    constexpr u64 t = NT > 1 ? THRESH_LO + (THRESH_HI - THRESH_LO) * I / (NT - 1)
+                              : THRESH_LO;
+    constexpr u64 clamped = t < (u64(1) << LW) ? t : (u64(1) << LW) - 1;
+    return val<LW>{(val<PW + LW>{alloc_ctr} * hard<clamped>{}) >> PW};
   }
 };
 
