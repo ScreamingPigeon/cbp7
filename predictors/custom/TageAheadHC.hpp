@@ -13,9 +13,8 @@ using namespace hcm;
 //   CTR=1, HYST=2(shared), U=2, Bimodal 8K, Meta 4-bit/2048,
 //   AllocPressSkip, SiblingAll, Decay TAG_OR_SEC/DECREMENT/FixedThresh8
 //
-// Table sizes (GradedSize<512,2048>):
-//   T0:    512  entries (IDX=9,  HYST=256)
-//   T1-4:  1024 entries (IDX=10, HYST=512)
+// Table sizes (T0 bumped from 512→1024):
+//   T0-4:  1024 entries (IDX=10, HYST=512)
 //   T5-13: 2048 entries (IDX=11, HYST=1024)
 // ============================================================================
 
@@ -46,9 +45,9 @@ struct TageAheadHC : predictor {
   static constexpr u64 ALLOC_WIDTH = 10;
   static constexpr u64 MAX_IDX_BITS = 11; // clog2(2048)
 
-  // Per-table sizes: GradedSize<512, 2048>
+  // Per-table sizes: T0 bumped to 1024 (was GradedSize<512, 2048>)
   static constexpr std::array<u64, NT> TABLE_SIZE = {
-    512, 1024, 1024, 1024, 1024,
+    1024, 1024, 1024, 1024, 1024,
     2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048
   };
   // Per-table history lengths: geometric_hist<14>(8, 200)
@@ -56,11 +55,11 @@ struct TageAheadHC : predictor {
       ta::geometric_hist<NT>(8, 200);
   // Per-table IDX bits
   static constexpr std::array<u64, NT> IDX_BITS = {
-    9, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11
+    10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11
   };
   // Per-table hyst sizes (shared hyst: TABLE_SIZE/2)
   static constexpr std::array<u64, NT> HYST_SIZE = {
-    256, 512, 512, 512, 512,
+    512, 512, 512, 512, 512,
     1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024
   };
 
@@ -129,15 +128,15 @@ struct TageAheadHC : predictor {
   // zone after each table's predict cluster.
   // ====================================================================
 
-  // ---- Table 0 (512 entries, IDX=9) ----
-  hcm::ram<val<TAG_WIDTH>, 512> tag_ram0{"t0_tag"};
+  // ---- Table 0 (1024 entries, IDX=10) ----
+  hcm::ram<val<TAG_WIDTH>, 1024> tag_ram0{"t0_tag"};
   ta_folded_gh<9> fold_idx0;
   ta_folded_gh<TAG_WIDTH> fold_tag0;
-  ta_rwram<PRED_BITS, 512, 2> pred_ram0{"t0_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 512> sec_ram0{"t0_sec"};
+  ta_rwram<PRED_BITS, 1024, 2> pred_ram0{"t0_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram0{"t0_sec"};
   hcm::zone zone0;
-  ta_rwram<HYST_WIDTH, 256, 2> hyst_ram0{"t0_hyst"};
-  ta_rwram<U_WIDTH, 512, 2> u_ram0{"t0_u"};
+  ta_rwram<HYST_WIDTH, 512, 2> hyst_ram0{"t0_hyst"};
+  ta_rwram<U_WIDTH, 1024, 2> u_ram0{"t0_u"};
 
   // ---- Table 1 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram1{"t1_tag"};
@@ -331,7 +330,7 @@ struct TageAheadHC : predictor {
 
   // Per-table HYST_IDX_BITS
   static constexpr std::array<u64, NT> HYST_IDX_BITS = {
-    8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10
+    9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10
   };
 
   // ======== Helpers ========

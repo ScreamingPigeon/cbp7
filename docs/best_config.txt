@@ -1,0 +1,31 @@
+S3_MW4_MC2048 — Best Config
+
+using S3_MW4_MC2048 = TageAhead<
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,
+  7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,
+  UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 4,
+  2048, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,
+  SiblingPolicy::ALL, 0, 10, 10,
+  true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+  ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
+Parameters:
+  Tables:          14, GradedSize<512, 2048> (SM=512, MD=1024, LG=2048)
+  Tag width:       UniformTag<11>
+  History:         GEOMETRIC, max=200, min_hist=8
+  N (lanes):       7
+  Path bits:       6
+  Sec-tag:         5-bit, Xor3SecTagHash5, SecTagAll
+  CTR_WIDTH:       1
+  HYST_WIDTH:      2 (shared)
+  U_WIDTH:         2
+  U policy:        UNTOUCHED on misp, DECREMENT on clear
+  Bimodal:         8192
+  Meta:            WIDTH=4, CAPACITY=2048, PIPE=2
+  LINEINST:        256
+  Alloc:           TAAllocPressSkip
+  Sibling:         ALL
+  ACC/ALLOC width: 10/10
+  Decay:           TAG_OR_SEC, DECREMENT, FixedThresh<8>, LFSR=8
+  Epoch:           disabled
