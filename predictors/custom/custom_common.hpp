@@ -686,6 +686,117 @@ struct DefaultEpochTrigger {
   }
 };
 
+// ============================================================================
+// SecTagPolicy — per-table sec-tag enforcement
+// ============================================================================
+// Controls whether the sec-tag match is required for each TAGE table.
+// apply<I, NT>() returns true (at compile time) if table I requires sec-tag.
+// For pressure-gated variants, apply_runtime<I, NT>(alloc_ctr) returns a
+// val<1> gate signal (1 = enforce sec-tag, 0 = skip).
+//
+// The RUNTIME flag distinguishes compile-time-only policies (no extra HW)
+// from runtime-gated policies (adds a comparator on critical path).
+
+// SecTagAll: all tables check sec-tag (default, current behavior)
+struct SecTagAll {
+  static constexpr bool RUNTIME = false;
+  template <u64 I, u64 NT> static constexpr bool apply() { return true; }
+};
+
+// SecTagNone: no tables check sec-tag
+struct SecTagNone {
+  static constexpr bool RUNTIME = false;
+  template <u64 I, u64 NT> static constexpr bool apply() { return false; }
+};
+
+// SecTagFloor<F>: only tables with index >= F check sec-tag.
+// T0..T(F-1) skip sec-tag (long-history tables — namd-style entries survive).
+// T(F)..T(NT-1) still check (short-history tables — stale entries rejected).
+template <u64 F>
+struct SecTagFloor {
+  static constexpr bool RUNTIME = false;
+  template <u64 I, u64 NT> static constexpr bool apply() { return I >= F; }
+};
+
+// SecTagCeil<C>: only tables with index < C check sec-tag.
+// T0..T(C-1) check (long history — more likely to be stale).
+// T(C)..T(NT-1) skip (short history — less likely to be stale).
+template <u64 C>
+struct SecTagCeil {
+  static constexpr bool RUNTIME = false;
+  template <u64 I, u64 NT> static constexpr bool apply() { return I < C; }
+};
+
+// SecTagMask<MASK>: bitmask — bit I set = table I checks sec-tag.
+template <u64 MASK>
+struct SecTagMask {
+  static constexpr bool RUNTIME = false;
+  template <u64 I, u64 NT> static constexpr bool apply() {
+    return (MASK >> I) & 1;
+  }
+};
+
+// SecTagPressGated<GATE>: skip sec-tag for ALL tables when alloc_ctr > GATE.
+// Under high pressure, entries are churning fast → sec-tag mismatch is common
+// but the TAGE entry might still be useful. Under low pressure, sec-tag filter
+// remains active to reject stale entries.
+template <u64 GATE>
+struct SecTagPressGated {
+  static constexpr bool RUNTIME = true;
+  template <u64 I, u64 NT> static constexpr bool apply() { return true; }
+  template <u64 I, u64 NT, u64 AW, u64 PW, u64 BW>
+  static val<1> gate(val<AW> /*acc*/, val<PW> alloc_ctr, val<BW> /*benefit*/) {
+    return val<1>{alloc_ctr.fo1() <= hard<GATE>{}};
+  }
+};
+
+// SecTagPressGatedFloor<F, GATE>: combine floor + pressure gating.
+// Tables < F always skip sec-tag. Tables >= F check sec-tag only when
+// alloc_ctr <= GATE (low pressure).
+template <u64 F, u64 GATE>
+struct SecTagPressGatedFloor {
+  static constexpr bool RUNTIME = true;
+  template <u64 I, u64 NT> static constexpr bool apply() { return I >= F; }
+  template <u64 I, u64 NT, u64 AW, u64 PW, u64 BW>
+  static val<1> gate(val<AW> /*acc*/, val<PW> alloc_ctr, val<BW> /*benefit*/) {
+    if constexpr (I < F) return val<1>{hard<0>{}};
+    else return val<1>{alloc_ctr.fo1() <= hard<GATE>{}};
+  }
+};
+
+// SecTagAccGated<GATE>: skip sec-tag when accuracy is high (acc_ctr > GATE).
+// When accuracy is high, TAGE entries are likely valid → sec-tag mismatch
+// is noise, not signal. When accuracy drops, re-enable sec-tag filtering.
+template <u64 GATE>
+struct SecTagAccGated {
+  static constexpr bool RUNTIME = true;
+  template <u64 I, u64 NT> static constexpr bool apply() { return true; }
+  template <u64 I, u64 NT, u64 AW, u64 PW, u64 BW>
+  static val<1> gate(val<AW> acc_ctr, val<PW> /*alloc*/, val<BW> /*benefit*/) {
+    return val<1>{acc_ctr.fo1() <= hard<GATE>{}};
+  }
+};
+
+// SecTagAdaptive<WIDTH, THRESH>: benefit-tracking adaptive sec-tag policy.
+// Maintains a saturating up/down counter updated at training time:
+//   - When sec-tag rejects a TAGE match and fallback was correct but TAGE wrong
+//     → increment (sec-tag helped)
+//   - When sec-tag rejects a TAGE match and TAGE was correct but fallback wrong
+//     → decrement (sec-tag hurt)
+// At prediction time, enforce sec-tag when benefit_ctr >= THRESH.
+template <u64 WIDTH, u64 THRESH>
+struct SecTagAdaptive {
+  static constexpr bool RUNTIME = true;
+  static constexpr u64 BENEFIT_WIDTH = WIDTH;
+  static constexpr u64 BENEFIT_THRESH = THRESH;
+  template <u64 I, u64 NT> static constexpr bool apply() { return true; }
+  template <u64 I, u64 NT, u64 AW, u64 PW, u64 BW>
+  static val<1> gate(val<AW> /*acc*/, val<PW> /*alloc*/, val<BW> benefit) {
+    return val<1>{benefit.fo1() >= hard<THRESH>{}};
+  }
+};
+
+// ============================================================================
 // Default sec_tag hash: extract bits [2+SEC_TAG_BITS-1 : 2] from PC.
 struct DefaultSecTagHash {
   template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {

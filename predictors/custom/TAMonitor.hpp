@@ -313,6 +313,14 @@ struct TAMonitor {
     u64 cf_fb_only = 0;       // FB right, TAGE wrong
     u64 cf_tage_only = 0;     // TAGE right, FB wrong
 
+    // Feature 25: sec-tag adaptive benefit counter diagnostics
+    u64 ben_reject_all = 0;   // blocks where sec_would_reject_all fired (causal condition)
+    u64 ben_incr = 0;         // benefit counter increments (FB > TAGE, enforcement helped)
+    u64 ben_decr = 0;         // benefit counter decrements (TAGE > FB, enforcement hurt)
+    u64 ben_tie = 0;          // causal condition fired but outcome tied (no update)
+    u64 ben_ctr_sum = 0;      // sum of benefit_ctr value (for avg)
+    u64 ben_ctr_samples = 0;  // number of samples
+
     void reset() { *this = Counters{}; }
   };
 
@@ -915,6 +923,35 @@ struct TAMonitor {
     record(win);
   }
 
+  // Feature 25: benefit counter update diagnostics.
+  // fired=true when sec_would_reject_all was true (causal condition met).
+  // updated=true when fb_right != tage_right (outcome was decisive).
+  // incr=true when benefit counter was incremented (FB > TAGE).
+  void record_benefit_update(bool fired, bool updated, bool incr) {
+    auto record = [&](Counters &c) {
+      if (fired) {
+        c.ben_reject_all++;
+        if (updated) {
+          if (incr) c.ben_incr++;
+          else      c.ben_decr++;
+        } else {
+          c.ben_tie++;
+        }
+      }
+    };
+    record(cum);
+    record(win);
+  }
+
+  void record_benefit_ctr(u64 val) {
+    auto record = [&](Counters &c) {
+      c.ben_ctr_sum += val;
+      c.ben_ctr_samples++;
+    };
+    record(cum);
+    record(win);
+  }
+
   // ======== Helpers ========
 
   static u64 decode_provider(u64 one_hot) {
@@ -947,7 +984,8 @@ struct TAMonitor {
       os << "pingpong,";
       os << "cf_fb_only%,cf_tage_only%,";
       os << "prov_no_tag%,prov_sec_rej%,prov_meta_alt%,prov_meta_pri%,prov_no_meta%,";
-      os << "cf_sec_fb_acc%,cf_sec_tage_acc%";
+      os << "cf_sec_fb_acc%,cf_sec_tage_acc%,";
+      os << "ben_rej%,ben_incr%,ben_decr%,ben_ctr_avg";
       os << "\n";
       header_printed = true;
     }
@@ -1043,6 +1081,12 @@ struct TAMonitor {
     // Sec-tag counterfactual accuracy
     os << "," << pct(w.cf_sec_fb_correct, w.cf_sec_tag_only_total)
        << "," << pct(w.cf_sec_tag_only_correct, w.cf_sec_tag_only_total);
+    // Feature 25: benefit counter diagnostics
+    os << "," << pct(w.ben_reject_all, w.blocks)
+       << "," << pct(w.ben_incr, w.ben_reject_all)
+       << "," << pct(w.ben_decr, w.ben_reject_all)
+       << "," << (w.ben_ctr_samples > 0
+                      ? double(w.ben_ctr_sum) / w.ben_ctr_samples : 0.0);
 
     os << "\n";
   }
@@ -1825,6 +1869,25 @@ struct TAMonitor {
                              : 0;
         os << "  Hypothetical FB-only MPKI: " << std::setprecision(3) << fb_mpki << "\n";
       }
+    }
+
+    // Feature 25: benefit counter diagnostics
+    if (c.ben_ctr_samples > 0 || c.ben_reject_all > 0) {
+      os << "\n--- Feature 25: Sec-Tag Adaptive Benefit Counter ---\n";
+      os << "  sec_would_reject_all fired: " << c.ben_reject_all
+         << " (" << pct(c.ben_reject_all, c.blocks) << "% of blocks)\n";
+      u64 ben_total = c.ben_incr + c.ben_decr + c.ben_tie;
+      os << "  Decisive outcomes: " << ben_total << "\n";
+      os << "    Increments (FB > TAGE, enforce helped): " << c.ben_incr
+         << " (" << pct(c.ben_incr, ben_total) << "%)\n";
+      os << "    Decrements (TAGE > FB, enforce hurt):   " << c.ben_decr
+         << " (" << pct(c.ben_decr, ben_total) << "%)\n";
+      os << "    Ties (no update):                       " << c.ben_tie
+         << " (" << pct(c.ben_tie, c.ben_reject_all) << "% of fired)\n";
+      os << "  Avg benefit_ctr value: "
+         << std::setprecision(1)
+         << (c.ben_ctr_samples > 0
+                 ? double(c.ben_ctr_sum) / c.ben_ctr_samples : 0.0) << "\n";
     }
 
     os << "\n=== End TageAhead Monitor ===\n\n";

@@ -462,6 +462,7 @@ struct TageAhead : predictor {
         computed_tag.print("  computed_tag=", "\n", true, std::cerr);
         stored_tag.print("  stored_tag=", "\n", true, std::cerr);
         prefetch_tag_hit[I].print("  tag_hit=", "\n", true, std::cerr);
+        prefetch_sec[I].print("  sec=", "\n", true, std::cerr);
         prefetch_pred[I].print("  pred=", "\n", true, std::cerr);
         prefetch_hyst[I].print("  hyst=", "\n", true, std::cerr);
         prefetch_u[I].print("  u=", "\n", true, std::cerr);
@@ -996,6 +997,16 @@ struct TageAhead : predictor {
             }
           }
         };
+#ifdef DEBUG_PRINT
+        std::cerr << "--- sec-tag path ---\n";
+        sec_tag_now.print("  sec_tag_now=", "\n", true, std::cerr);
+        if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME)
+          sec_rt_gate.print("  sec_rt_gate=", "\n", true, std::cerr);
+        for (u64 i = 0; i < NT; i++) {
+          std::cerr << "  sec_enforce[" << i << "]=" << sec_enforce[i];
+          full_hits[i].print("  full_hit=", "\n", true, std::cerr);
+        }
+#endif
         return resolve_chain(full_hits.fo1());
       }
     }();
@@ -1461,6 +1472,12 @@ struct TageAhead : predictor {
     postmask.print("  postmask=", "\n", true, std::cerr);
     candallocmask.print("  candallocmask=", "\n", true, std::cerr);
     alloc_target.print("  alloc_target=", "\n", true, std::cerr);
+    std::cerr << "--- sec-tag train ---\n";
+    train_sec_tag.print("  train_sec_tag=", "\n", true, std::cerr);
+    for (u64 i = 0; i < NT; i++) {
+      train_tag_hit[i].print(("  train_tag_hit[" + std::to_string(i) + "]=").c_str(), "\n", true, std::cerr);
+      train_sec_hit[i].print(("  train_sec_hit[" + std::to_string(i) + "]=").c_str(), "\n", true, std::cerr);
+    }
 #endif
 
 #ifdef TAGE_MONITOR
@@ -1824,11 +1841,23 @@ struct TageAhead : predictor {
 
           // Mux: if base write active, use base_newu; else if decay, use
           // decayed_u
+          decay_fire.fanout(hard<2>{}); // select(1) + merged_write(1)
           val<U_WIDTH> merged =
               select(base_u_write, base_newu,
-                     select(decay_fire.fo1(), decayed_u.fo1(), old_u));
+                     select(decay_fire, decayed_u.fo1(), old_u));
           val<1> merged_write = base_u_write | decay_fire;
-          val<1> merged_changed = merged.fo1() != old_u;
+          merged.fanout(hard<2>{}); // merged_changed(1) + return(1)
+          val<1> merged_changed = merged != old_u;
+#ifdef DEBUG_PRINT
+          if constexpr (I == 0) {
+            std::cerr << "--- decay path [T0] ---\n";
+            decay_miss.print("  decay_miss=", "\n", true, std::cerr);
+            decay_fire.print("  decay_fire=", "\n", true, std::cerr);
+            decayed_u.print("  decayed_u=", "\n", true, std::cerr);
+            merged.print("  merged=", "\n", true, std::cerr);
+            merged_write.print("  merged_write=", "\n", true, std::cerr);
+          }
+#endif
           return {merged, merged_write.fo1() & merged_changed.fo1()};
         }
       }();

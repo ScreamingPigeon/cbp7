@@ -3,6 +3,7 @@
 #include "predictors/bimodalN.hpp"
 #include "predictors/custom/Tage.hpp"
 #include "predictors/custom/TageAhead.hpp"
+#include "predictors/custom/TageAheadHC.hpp"
 #include "predictors/custom/TageDirect.hpp"
 #include "predictors/custom/TageDirectBim.hpp"
 #include "predictors/experiment_perceptron.hpp"
@@ -42,12 +43,31 @@ using TageAhead1C =
       1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
       0, 10, 10
 
+// S1 base with variable SecTagPolicy (STP)
+// S1 decay params + all defaults through REVERSE_TABLE_ORDER, then STP
+#define S1_STP(STP)                                                            \
+  TA1C_BASE(TAAllocPressSkip),                                                 \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, 0, false, STP
+
 // S1 base with variable META_WIDTH (MW) and META_CAPACITY (MC)
 #define S1_META(MW, MC)                                                        \
   TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
       7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
       UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, MW,    \
+      MC, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                    \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false
+
+// S1 base with variable META_WIDTH/CAPACITY and doubled bimodal (16384)
+#define S1_META_BIM2X(MW, MC)                                                  \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, MW,   \
       MC, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                    \
       SiblingPolicy::ALL, 0, 10, 10,                                           \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
@@ -61,6 +81,59 @@ using TageAhead1C =
       UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, 2,    \
       1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
       0, 10, 10
+
+// ============================================================================
+// Sweep 4: Sec-tag policy tuning on S1 base
+// ============================================================================
+
+// A. SecTagNone — disable sec-tag entirely (baseline counterfactual)
+using S4_None = TageAhead<S1_STP(ta::SecTagNone)>;
+
+// B. SecTagFloor — skip sec-tag for long-history tables (T0..T(F-1))
+using S4_Floor4  = TageAhead<S1_STP(ta::SecTagFloor<4>)>;   // skip T0-T3
+using S4_Floor7  = TageAhead<S1_STP(ta::SecTagFloor<7>)>;   // skip T0-T6 (half)
+using S4_Floor10 = TageAhead<S1_STP(ta::SecTagFloor<10>)>;  // skip T0-T9
+
+// C. SecTagCeil — skip sec-tag for short-history tables (T(C)..T13)
+using S4_Ceil4  = TageAhead<S1_STP(ta::SecTagCeil<4>)>;   // only T0-T3 check
+using S4_Ceil7  = TageAhead<S1_STP(ta::SecTagCeil<7>)>;   // only T0-T6 check
+using S4_Ceil10 = TageAhead<S1_STP(ta::SecTagCeil<10>)>;  // only T0-T9 check
+
+// D. SecTagPressGated — skip sec-tag under high allocation pressure
+using S4_Press256  = TageAhead<S1_STP(ta::SecTagPressGated<256>)>;   // ~25%
+using S4_Press512  = TageAhead<S1_STP(ta::SecTagPressGated<512>)>;   // ~50%
+using S4_Press768  = TageAhead<S1_STP(ta::SecTagPressGated<768>)>;   // ~75%
+
+// E. SecTagAccGated — skip sec-tag when accuracy is high
+using S4_Acc256  = TageAhead<S1_STP(ta::SecTagAccGated<256>)>;   // skip when acc>256
+using S4_Acc512  = TageAhead<S1_STP(ta::SecTagAccGated<512>)>;   // skip when acc>512
+using S4_Acc768  = TageAhead<S1_STP(ta::SecTagAccGated<768>)>;   // skip when acc>768
+
+// F. SecTagPressGatedFloor — skip T0-T6 always + rest pressure-gated
+using S4_PGF7_512_Policy = ta::SecTagPressGatedFloor<7, 512>;
+using S4_PGF7_512 = TageAhead<S1_STP(S4_PGF7_512_Policy)>;
+
+// ============================================================================
+// Sweep 5: SecTagAdaptive — benefit-tracking adaptive sec-tag policy
+// ============================================================================
+// 8-bit counter, vary threshold
+using S5_A8_64_P   = ta::SecTagAdaptive<8, 64>;
+using S5_A8_96_P   = ta::SecTagAdaptive<8, 96>;
+using S5_A8_128_P  = ta::SecTagAdaptive<8, 128>;
+using S5_A8_160_P  = ta::SecTagAdaptive<8, 160>;
+using S5_A8_192_P  = ta::SecTagAdaptive<8, 192>;
+using S5_A8_64     = TageAhead<S1_STP(S5_A8_64_P)>;
+using S5_A8_96     = TageAhead<S1_STP(S5_A8_96_P)>;
+using S5_A8_128    = TageAhead<S1_STP(S5_A8_128_P)>;
+using S5_A8_160    = TageAhead<S1_STP(S5_A8_160_P)>;
+using S5_A8_192    = TageAhead<S1_STP(S5_A8_192_P)>;
+// 10-bit counter, vary threshold
+using S5_A10_256_P = ta::SecTagAdaptive<10, 256>;
+using S5_A10_512_P = ta::SecTagAdaptive<10, 512>;
+using S5_A10_768_P = ta::SecTagAdaptive<10, 768>;
+using S5_A10_256   = TageAhead<S1_STP(S5_A10_256_P)>;
+using S5_A10_512   = TageAhead<S1_STP(S5_A10_512_P)>;
+using S5_A10_768   = TageAhead<S1_STP(S5_A10_768_P)>;
 
 // ============================================================================
 // Sweep 3: Meta table tuning (META_WIDTH × META_CAPACITY) on S1 base
@@ -80,6 +153,12 @@ using S3_MW4_MC512  = TageAhead<S1_META(4, 512)>;
 using S3_MW4_MC1024 = TageAhead<S1_META(4, 1024)>;
 using S3_MW4_MC2048 = TageAhead<S1_META(4, 2048)>;
 using S3_MW4_MC4096 = TageAhead<S1_META(4, 4096)>;
+
+// ============================================================================
+// Best combined: MW4/MC1024 + 16K bimodal + LFSR decay
+// ============================================================================
+using Best_8K  = TageAhead<S1_META(4, 1024)>;         // == S3_MW4_MC1024
+using Best_16K = TageAhead<S1_META_BIM2X(4, 1024)>;   // 16K bim + MW4/MC1024
 
 // S1 with doubled bimodal: Fixed thresh=8, TAG_OR_SEC, FB_CAPACITY=16384
 using Sweep2_S1_Bim2x = TageAhead<TA1C_BASE_BIM2X(TAAllocPressSkip),
@@ -228,6 +307,60 @@ using TA2C_H =
     TageAhead<TA2C_BASE, true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
               ta::split_array<u64, 28>(12, 6, 14), ta::DefaultDecayThresh,
               false>;
+
+// ============================================================================
+// Sweep 6: Block size sweep — N (branches/block) × LINEINST
+// Base = TageAhead1C (best 1S config)
+// ============================================================================
+#define BLKSWEEP(N_VAL, LINE_VAL)                                              \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      N_VAL, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                     \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, LINE_VAL, true, HistUpdate::PATH, TAAllocPressSkip,             \
+      SiblingPolicy::ALL
+
+using BLK_N1_L4  = TageAhead<BLKSWEEP(1, 4)>;
+using BLK_N1_L8  = TageAhead<BLKSWEEP(1, 8)>;
+using BLK_N1_L16 = TageAhead<BLKSWEEP(1, 16)>;
+using BLK_N2_L4  = TageAhead<BLKSWEEP(2, 4)>;
+using BLK_N2_L8  = TageAhead<BLKSWEEP(2, 8)>;
+using BLK_N2_L16 = TageAhead<BLKSWEEP(2, 16)>;
+using BLK_N4_L4  = TageAhead<BLKSWEEP(4, 4)>;
+using BLK_N4_L8  = TageAhead<BLKSWEEP(4, 8)>;
+using BLK_N4_L16 = TageAhead<BLKSWEEP(4, 16)>;
+using BLK_N1_L32 = TageAhead<BLKSWEEP(1, 32)>;
+using BLK_N1_L64 = TageAhead<BLKSWEEP(1, 64)>;
+using BLK_N1_L128 = TageAhead<BLKSWEEP(1, 128)>;
+using BLK_N2_L32  = TageAhead<BLKSWEEP(2, 32)>;
+using BLK_N2_L64  = TageAhead<BLKSWEEP(2, 64)>;
+using BLK_N2_L128 = TageAhead<BLKSWEEP(2, 128)>;
+using BLK_N2_L256 = TageAhead<BLKSWEEP(2, 256)>;
+using BLK_N4_L32  = TageAhead<BLKSWEEP(4, 32)>;
+using BLK_N4_L64  = TageAhead<BLKSWEEP(4, 64)>;
+using BLK_N4_L128 = TageAhead<BLKSWEEP(4, 128)>;
+
+#define HISTSWEEP(N_VAL, LINE_VAL, MINH_VAL, MAXH_VAL)                        \
+  TATableConfig<14, 1024, 11, MINH_VAL, MAXH_VAL, 1, ta::HistSeries::GEOMETRIC, \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      N_VAL, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                     \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, LINE_VAL, true, HistUpdate::PATH, TAAllocPressSkip,             \
+      SiblingPolicy::ALL
+
+// N2 history sweep: MAXH=200 (baseline), 400, 600. MINH scaled proportionally.
+using HS_N2_L8_H200   = TageAhead<HISTSWEEP(2, 8, 8, 200)>;
+using HS_N2_L8_H400   = TageAhead<HISTSWEEP(2, 8, 16, 400)>;
+using HS_N2_L8_H600   = TageAhead<HISTSWEEP(2, 8, 24, 600)>;
+using HS_N2_L16_H200  = TageAhead<HISTSWEEP(2, 16, 8, 200)>;
+using HS_N2_L16_H400  = TageAhead<HISTSWEEP(2, 16, 16, 400)>;
+using HS_N2_L16_H600  = TageAhead<HISTSWEEP(2, 16, 24, 600)>;
+using HS_N2_L128_H200 = TageAhead<HISTSWEEP(2, 128, 8, 200)>;
+using HS_N2_L128_H400 = TageAhead<HISTSWEEP(2, 128, 16, 400)>;
+using HS_N2_L128_H600 = TageAhead<HISTSWEEP(2, 128, 24, 600)>;
+using HS_N2_L256_H200 = TageAhead<HISTSWEEP(2, 256, 8, 200)>;
+using HS_N2_L256_H400 = TageAhead<HISTSWEEP(2, 256, 16, 400)>;
+using HS_N2_L256_H600 = TageAhead<HISTSWEEP(2, 256, 24, 600)>;
 
 #ifdef PREDICTOR
 using branch_predictor = PREDICTOR;
