@@ -131,10 +131,10 @@ struct TageAheadHC : predictor {
 
   // ---- Table 0 (512 entries, IDX=9) ----
   hcm::ram<val<TAG_WIDTH>, 512> tag_ram0{"t0_tag"};
-  ta_rwram<PRED_BITS, 512, 2> pred_ram0{"t0_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 512> sec_ram0{"t0_sec"};
   ta_folded_gh<9> fold_idx0;
   ta_folded_gh<TAG_WIDTH> fold_tag0;
+  ta_rwram<PRED_BITS, 512, 2> pred_ram0{"t0_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 512> sec_ram0{"t0_sec"};
   hcm::zone zone0;
   ta_rwram<HYST_WIDTH, 256, 2> hyst_ram0{"t0_hyst"};
   ta_rwram<U_WIDTH, 512, 2> u_ram0{"t0_u"};
@@ -828,17 +828,17 @@ struct TageAheadHC : predictor {
     }();
     candallocmask.fanout(hard<2>{}); // collamask + noalloc
 
-    // Pressure counter fanout: collamask(1) + decay loop(NT) + new_ctr(1)
-    acc_ctr.fanout(hard<NT + 2>{});
-    alloc_ctr.fanout(hard<NT + 2>{});
+    // Pressure counter fanout: collamask/target(1) + ta_update_ctr(1) = 2
+    acc_ctr.fanout(hard<2>{});
+    alloc_ctr.fanout(hard<2>{});
 
     // 7e. Target policy: AllocPressureSkipTarget<1>
     // Probabilistically skips the closest candidate when alloc pressure is high.
-    alloc_rng.fanout(hard<2>{}); // target policy reads twice
+    // alloc_rng: single read, use fo1()
     val<NT> collamask =
         AllocPressureSkipTarget<1>::apply<NT>(
             candallocmask.reverse(), val<ALLOC_WIDTH>{alloc_ctr},
-            val<ACC_WIDTH>{acc_ctr}, alloc_rng);
+            val<ACC_WIDTH>{acc_ctr}, alloc_rng.fo1());
 
     // 7f. Final allocation: one-hot pick (MAX_ALLOC=1)
     arr<val<1>, NT> allocate =
@@ -968,8 +968,8 @@ struct TageAheadHC : predictor {
       val<1> u_correct = t_m1[I] & t_ad & ~table_wrong;
 
       val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
-      // u_inc(2) + u_dec(2) + silent_check(1) + decay_fallback(1)
-      old_u.fanout(hard<6>{});
+      // u_inc(2) + u_dec(2) + decay_select(2) + merged_select(1) + merged_changed(1)
+      old_u.fanout(hard<8>{});
       // Saturating increment: clamp at maxval
       auto u_inc =
           val<U_WIDTH>{old_u + val<U_WIDTH>{old_u != hard<old_u.maxval>{}}};
@@ -1011,7 +1011,7 @@ struct TageAheadHC : predictor {
           select(old_u == hard<0>{}, old_u, val<U_WIDTH>{old_u - 1});
 
       // Merge: base write takes priority, then decay, then hold
-      base_newu.fanout(hard<3>{}); // != 0 check + select + return
+      base_newu.fanout(hard<2>{}); // != 0 check + select
       val<1> base_u_write = (base_newu != hard<0>{}) | allocate[I];
       base_u_write.fanout(hard<2>{}); // select + merged_write
       decay_fire.fanout(hard<2>{});   // select + merged_write
