@@ -102,7 +102,11 @@ template <
     u64 FARALLOC_DIST = 0,
     // ---- Floorplan tuning ----
     // Reverse RAM declaration order so biggest tables are declared first.
-    bool REVERSE_TABLE_ORDER = false>
+    bool REVERSE_TABLE_ORDER = false,
+    // ---- Per-table sec-tag policy ----
+    // Controls which tables require sec-tag match. Only used when
+    // USE_SEC_TAG=true and NUM_PATHS==1 (single-chain).
+    typename SecTagPolicy = ta::SecTagAll>
 struct TageAhead : predictor {
 
   // ======== Derived Constants ========
@@ -122,6 +126,16 @@ struct TageAhead : predictor {
   static constexpr u64 MAX_IDX_BITS = ta::clog2(MAX_TABLE_SIZE);
 
   static constexpr u64 MATCH_BITS = NT + 1; // NT tables + fallback
+
+  // ---- Sec-tag adaptive benefit counter ----
+  static constexpr u64 BENEFIT_WIDTH = [] {
+    if constexpr (requires { SecTagPolicy::BENEFIT_WIDTH; })
+      return SecTagPolicy::BENEFIT_WIDTH;
+    else
+      return u64(0);
+  }();
+  static constexpr bool HAS_BENEFIT_CTR = BENEFIT_WIDTH > 0;
+  static constexpr u64 BENEFIT_REG_WIDTH = std::max(u64(1), BENEFIT_WIDTH);
 
   // Per-bit gh fanout: only fanout bits each table actually reads
   static constexpr auto GH_FANOUT = []() {
@@ -267,6 +281,9 @@ struct TageAhead : predictor {
   // Global pressure counters (always declared, zero-cost when unused)
   reg<ACC_WIDTH> acc_ctr;
   reg<ALLOC_WIDTH> alloc_ctr;
+
+  // Sec-tag adaptive benefit counter (dead 1-bit reg when policy doesn't use it)
+  reg<BENEFIT_REG_WIDTH> benefit_ctr;
 
   // Decay LFSR widths (used to parameterize std::rand() masking)
   static constexpr u64 MAX_LFSR_WIDTH =
@@ -916,15 +933,67 @@ struct TageAhead : predictor {
               mux4(ua0, ua1, ua2, ua3)};
         }
       } else {
-        // Single chain: original behavior
+        // Single chain: sec-tag policy controls per-table enforcement.
         // sec_tag_now fanout already declared above (covers all reads)
-        arr<val<1>, NT> full_hits = [&](u64 i) {
-          if constexpr (USE_SEC_TAG) {
-            return val<1>{prefetch_tag_hit[i]} &
-                   (val<SEC_TAG_BITS>{prefetch_sec[i]} ==
-                    val<SEC_TAG_BITS>{sec_tag_now});
+
+        // Precompute per-table sec-tag enforcement (compile-time).
+        static constexpr auto sec_enforce = []() {
+          std::array<bool, NT> a{};
+          // Use a helper to expand the parameter pack
+          auto fill = [&]<u64... Is>(std::index_sequence<Is...>) {
+            ((a[Is] = SecTagPolicy::template apply<Is, NT>()), ...);
+          };
+          fill(std::make_index_sequence<NT>{});
+          return a;
+        }();
+        // Count how many tables enforce (for fanout on runtime gate)
+        static constexpr u64 SEC_ENFORCE_COUNT = []() {
+          u64 n = 0;
+          for (u64 i = 0; i < NT; i++) if (sec_enforce[i]) n++;
+          return n;
+        }();
+
+        // Runtime-gated policies: single shared gate signal.
+        [[maybe_unused]] val<1> sec_rt_gate = [&]() -> val<1> {
+          if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME &&
+                        SEC_ENFORCE_COUNT > 0) {
+            return SecTagPolicy::template gate<0, NT>(
+                val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr},
+                val<BENEFIT_REG_WIDTH>{benefit_ctr});
           } else {
+            return val<1>{hard<1>{}};
+          }
+        }();
+        if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME &&
+                      SEC_ENFORCE_COUNT > 1)
+          sec_rt_gate.fanout(hard<SEC_ENFORCE_COUNT>{});
+
+        arr<val<1>, NT> full_hits = [&](u64 i) {
+          if constexpr (!USE_SEC_TAG || SEC_ENFORCE_COUNT == 0) {
+            // No sec-tag at all
             return val<1>{prefetch_tag_hit[i]};
+          } else {
+            val<1> sec_match =
+                val<SEC_TAG_BITS>{prefetch_sec[i]} ==
+                val<SEC_TAG_BITS>{sec_tag_now};
+            if constexpr (!SecTagPolicy::RUNTIME) {
+              // Compile-time only: skip sec-tag for non-enforced tables
+              // sec_enforce[i] is constexpr but i is runtime — compiler
+              // unrolls the arr lambda, so this becomes a per-element branch.
+              if (sec_enforce[i])
+                return val<1>{prefetch_tag_hit[i]} & sec_match;
+              else
+                return val<1>{prefetch_tag_hit[i]};
+            } else {
+              // Runtime gate: full_hit = tag_hit & (sec_match | !gate)
+              // For tables the policy says to skip at compile time, just
+              // return tag_hit directly (no gate needed).
+              if (sec_enforce[i])
+                return val<1>{prefetch_tag_hit[i]} &
+                       (sec_match | ~sec_rt_gate);
+              else
+                return val<1>{prefetch_tag_hit[i]};
+            }
           }
         };
         return resolve_chain(full_hits.fo1());
@@ -1278,24 +1347,34 @@ struct TageAhead : predictor {
     // gated_triggermask(FILTERED/THROTTLED)
     // + decay/epoch loop(NT each) + new_acc/new_alloc(1 each) + epoch_check(1
     // each) NOTE: @prakhar @claude audit
+    static constexpr bool SEC_TAG_RUNTIME =
+        USE_SEC_TAG && SecTagPolicy::RUNTIME && NUM_PATHS == 1;
     static constexpr u64 ACC_CTR_READS =
         1 + // collamask lambda
         (AllocCfg::ALLOC_ACTION == AllocAction::FILTERED
              ? 1
              : 0) +                                     // gated_triggermask
         ((DECAY_ENABLE || EPOCH_ENABLE) ? NT + 1 : 0) + // loop(NT) + new_acc
-        (EPOCH_ENABLE ? 1 : 0);                         // epoch_check
+        (EPOCH_ENABLE ? 1 : 0) +                        // epoch_check
+        (SEC_TAG_RUNTIME ? 1 : 0);                      // sec-tag gate
     static constexpr u64 ALLOC_CTR_READS =
         1 + // collamask lambda
         (AllocCfg::ALLOC_ACTION == AllocAction::THROTTLED
              ? 1
              : 0) +                                     // gated_triggermask
         ((DECAY_ENABLE || EPOCH_ENABLE) ? NT + 1 : 0) + // loop(NT) + new_alloc
-        (EPOCH_ENABLE ? 1 : 0);                         // epoch_check
+        (EPOCH_ENABLE ? 1 : 0) +                        // epoch_check
+        (SEC_TAG_RUNTIME ? 1 : 0);                      // sec-tag gate
     // NOTE: @prakhar @claude audit
     acc_ctr.fanout(hard<ACC_CTR_READS>{});
     // NOTE: @prakhar @claude audit
     alloc_ctr.fanout(hard<ALLOC_CTR_READS>{});
+    // benefit_ctr fanout: gate read (1) + ta_update_ctr input (1) = 2
+    // When HAS_BENEFIT_CTR is false, benefit_ctr is a dead 1-bit reg, skip.
+    static constexpr u64 BENEFIT_CTR_READS =
+        (SEC_TAG_RUNTIME && HAS_BENEFIT_CTR) ? 2 : 0;
+    if constexpr (BENEFIT_CTR_READS > 0)
+      benefit_ctr.fanout(hard<BENEFIT_CTR_READS>{});
 
     // 3d. Target policy (may skip closest candidates)
     // alloc_rng: STANDARD uses it once (apply only); FILTERED/THROTTLED use
@@ -1854,6 +1933,51 @@ struct TageAhead : predictor {
         acc_ctr = new_acc.fo1();
         alloc_ctr = new_alloc.fo1();
       }
+    }
+
+    // ---- Sec-tag adaptive benefit counter update ----
+    if constexpr (HAS_BENEFIT_CTR && USE_SEC_TAG) {
+      // Counterfactual sec-tag benefit signal.
+      // Update only when enforcement WOULD have changed the provider to fallback:
+      //   - at least one table has a tag match (tag_hit)
+      //   - NO table has a full match (tag_hit && sec_hit)
+      // Only then does "enforce vs don't enforce" causally map to "FB vs TAGE".
+      u64 tag_only_prov = NT; // best tag-only provider (tag_hit, !sec_hit)
+      bool any_full_match = false;
+      for (u64 i = 0; i < NT; i++) {
+        bool th = static_cast<u64>(train_tag_hit[i]);
+        bool sh = static_cast<u64>(train_sec_hit[i]);
+        if (th && sh) { any_full_match = true; }
+        else if (th && tag_only_prov == NT) { tag_only_prov = i; }
+      }
+      // Fires only when sec-tag would have rejected ALL TAGE matches → FB
+      bool sec_would_reject_all = (tag_only_prov < NT) && !any_full_match;
+      bool should_update = false;
+      bool benefit_incr_val = true;
+      if (sec_would_reject_all && num_branch > 0) {
+        bool tage_right = (static_cast<u64>(train_pred[tag_only_prov]) & 1) ==
+                          (static_cast<u64>(actual_dir) & 1);
+        bool fb_right = (static_cast<u64>(train_fb) & 1) ==
+                        (static_cast<u64>(actual_dir) & 1);
+        if (fb_right != tage_right) {
+          should_update = true;
+          benefit_incr_val = fb_right; // true=incr (FB>TAGE, enforcement helps)
+                                       // false=decr (TAGE>FB, enforcement hurts)
+        }
+      }
+      // Always read and compute (fanout-safe), conditionally write back
+      val<1> b_incr{benefit_incr_val ? 1ULL : 0ULL};
+      auto new_benefit =
+          ta_update_ctr(val<BENEFIT_REG_WIDTH>{benefit_ctr}, b_incr);
+      if (should_update)
+        benefit_ctr = new_benefit.fo1();
+#ifdef TAGE_MONITOR
+      mon.record_benefit_update(
+          sec_would_reject_all && static_cast<u64>(do_train),
+          should_update,
+          benefit_incr_val);
+      mon.record_benefit_ctr(static_cast<u64>(benefit_ctr));
+#endif
     }
 
 #ifdef TAGE_MONITOR
