@@ -128,9 +128,15 @@ struct TageAheadHC : predictor {
   // zone after each table's predict cluster.
   // ====================================================================
 
+  // ============================================================
+  // Per-table zone layout (Exp 6 — best):
+  //   tag, fold_idx, fold_tag, pred, sec, zone, hyst, u
+  // 14 zones: one per table separating predict/update paths.
+  // ============================================================
+
   // ---- Table 0 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram0{"t0_tag"};
-  ta_folded_gh<9> fold_idx0;
+  ta_folded_gh<10> fold_idx0;
   ta_folded_gh<TAG_WIDTH> fold_tag0;
   ta_rwram<PRED_BITS, 1024, 2> pred_ram0{"t0_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram0{"t0_sec"};
@@ -140,130 +146,130 @@ struct TageAheadHC : predictor {
 
   // ---- Table 1 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram1{"t1_tag"};
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram1{"t1_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram1{"t1_sec"};
   ta_folded_gh<10> fold_idx1;
   ta_folded_gh<TAG_WIDTH> fold_tag1;
+  ta_rwram<PRED_BITS, 1024, 2> pred_ram1{"t1_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram1{"t1_sec"};
   hcm::zone zone1;
   ta_rwram<HYST_WIDTH, 512, 2> hyst_ram1{"t1_hyst"};
   ta_rwram<U_WIDTH, 1024, 2> u_ram1{"t1_u"};
 
   // ---- Table 2 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram2{"t2_tag"};
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram2{"t2_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram2{"t2_sec"};
   ta_folded_gh<10> fold_idx2;
   ta_folded_gh<TAG_WIDTH> fold_tag2;
+  ta_rwram<PRED_BITS, 1024, 2> pred_ram2{"t2_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram2{"t2_sec"};
   hcm::zone zone2;
   ta_rwram<HYST_WIDTH, 512, 2> hyst_ram2{"t2_hyst"};
   ta_rwram<U_WIDTH, 1024, 2> u_ram2{"t2_u"};
 
   // ---- Table 3 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram3{"t3_tag"};
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram3{"t3_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram3{"t3_sec"};
   ta_folded_gh<10> fold_idx3;
   ta_folded_gh<TAG_WIDTH> fold_tag3;
+  ta_rwram<PRED_BITS, 1024, 2> pred_ram3{"t3_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram3{"t3_sec"};
   hcm::zone zone3;
   ta_rwram<HYST_WIDTH, 512, 2> hyst_ram3{"t3_hyst"};
   ta_rwram<U_WIDTH, 1024, 2> u_ram3{"t3_u"};
 
   // ---- Table 4 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram4{"t4_tag"};
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram4{"t4_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram4{"t4_sec"};
   ta_folded_gh<10> fold_idx4;
   ta_folded_gh<TAG_WIDTH> fold_tag4;
+  ta_rwram<PRED_BITS, 1024, 2> pred_ram4{"t4_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram4{"t4_sec"};
   hcm::zone zone4;
   ta_rwram<HYST_WIDTH, 512, 2> hyst_ram4{"t4_hyst"};
   ta_rwram<U_WIDTH, 1024, 2> u_ram4{"t4_u"};
 
   // ---- Table 5 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram5{"t5_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram5{"t5_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram5{"t5_sec"};
   ta_folded_gh<11> fold_idx5;
   ta_folded_gh<TAG_WIDTH> fold_tag5;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram5{"t5_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram5{"t5_sec"};
   hcm::zone zone5;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram5{"t5_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram5{"t5_u"};
 
   // ---- Table 6 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram6{"t6_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram6{"t6_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram6{"t6_sec"};
   ta_folded_gh<11> fold_idx6;
   ta_folded_gh<TAG_WIDTH> fold_tag6;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram6{"t6_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram6{"t6_sec"};
   hcm::zone zone6;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram6{"t6_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram6{"t6_u"};
 
   // ---- Table 7 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram7{"t7_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram7{"t7_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram7{"t7_sec"};
   ta_folded_gh<11> fold_idx7;
   ta_folded_gh<TAG_WIDTH> fold_tag7;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram7{"t7_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram7{"t7_sec"};
   hcm::zone zone7;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram7{"t7_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram7{"t7_u"};
 
   // ---- Table 8 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram8{"t8_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram8{"t8_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram8{"t8_sec"};
   ta_folded_gh<11> fold_idx8;
   ta_folded_gh<TAG_WIDTH> fold_tag8;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram8{"t8_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram8{"t8_sec"};
   hcm::zone zone8;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram8{"t8_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram8{"t8_u"};
 
   // ---- Table 9 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram9{"t9_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram9{"t9_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram9{"t9_sec"};
   ta_folded_gh<11> fold_idx9;
   ta_folded_gh<TAG_WIDTH> fold_tag9;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram9{"t9_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram9{"t9_sec"};
   hcm::zone zone9;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram9{"t9_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram9{"t9_u"};
 
   // ---- Table 10 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram10{"t10_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram10{"t10_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram10{"t10_sec"};
   ta_folded_gh<11> fold_idx10;
   ta_folded_gh<TAG_WIDTH> fold_tag10;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram10{"t10_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram10{"t10_sec"};
   hcm::zone zone10;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram10{"t10_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram10{"t10_u"};
 
   // ---- Table 11 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram11{"t11_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram11{"t11_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram11{"t11_sec"};
   ta_folded_gh<11> fold_idx11;
   ta_folded_gh<TAG_WIDTH> fold_tag11;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram11{"t11_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram11{"t11_sec"};
   hcm::zone zone11;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram11{"t11_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram11{"t11_u"};
 
   // ---- Table 12 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram12{"t12_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram12{"t12_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram12{"t12_sec"};
   ta_folded_gh<11> fold_idx12;
   ta_folded_gh<TAG_WIDTH> fold_tag12;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram12{"t12_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram12{"t12_sec"};
   hcm::zone zone12;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram12{"t12_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram12{"t12_u"};
 
   // ---- Table 13 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram13{"t13_tag"};
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram13{"t13_pred"};
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram13{"t13_sec"};
   ta_folded_gh<11> fold_idx13;
   ta_folded_gh<TAG_WIDTH> fold_tag13;
+  ta_rwram<PRED_BITS, 2048, 2> pred_ram13{"t13_pred"};
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram13{"t13_sec"};
   hcm::zone zone13;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram13{"t13_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram13{"t13_u"};
