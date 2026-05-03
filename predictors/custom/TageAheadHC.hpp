@@ -214,6 +214,9 @@ struct TageAheadHC : predictor {
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram7{"t7_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram7{"t7_u"};
 
+  // ---- Fallback RAM (mid-array, between T7 and T8) ----
+  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
+
   // ---- Table 8 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram8{"t8_tag"};
   ta_folded_gh<11> fold_idx8;
@@ -273,9 +276,6 @@ struct TageAheadHC : predictor {
   hcm::zone zone13;
   ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram13{"t13_hyst"};
   ta_rwram<U_WIDTH, 2048, 2> u_ram13{"t13_u"};
-
-  // ---- Fallback RAM ----
-  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
 
   // ---- Meta (update-only) ----
   hcm::zone meta_zone;
