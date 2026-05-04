@@ -869,7 +869,15 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
   reg<L> write_localaddr;
   reg<N> write_data;
 
-  ta_rwram(const char *label = "") : bank{label} {}
+  // conflict tracking (simulation only, no hardware cost)
+  const char *name_ = "";
+  u64 stat_writes = 0;        // total write() calls
+  u64 stat_buffered = 0;      // writes buffered (nc=0, read-write same cycle)
+  u64 stat_lost = 0;          // buffered writes overwritten before flush
+  u64 stat_flushed = 0;       // buffered writes successfully flushed
+  u64 pending_bank_ = 0;      // which bank has the pending buffered write (bitmask)
+
+  ta_rwram(const char *label = "") : bank{label}, name_{label} {}
 
   // Split full address into (local_addr, bank_id).
   auto split_addr(val<A> addr) {
@@ -904,6 +912,36 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
   void write(val<A> addr, val<N> data, val<1> nc) {
     // noconflict=1: no read this cycle, write immediately.
     // noconflict=0: buffer write, flush when bank is free.
+    // --- conflict tracking (simulation-only, monitor builds) ---
+#ifdef TAGE_MONITOR
+    stat_writes++;
+    {
+      u64 nc_val = static_cast<u64>(nc);
+      u64 read_bitmask = static_cast<u64>(read_bank);
+      if (pending_bank_ != 0) {
+        if ((pending_bank_ & read_bitmask) == 0) {
+          stat_flushed++;
+        } else {
+          if (nc_val == 0) stat_lost++;
+        }
+      }
+      if (nc_val == 0) {
+        stat_buffered++;
+        u64 addr_val = static_cast<u64>(addr);
+        u64 new_bank;
+        if constexpr (BANK_SHIFT == 0) {
+          new_bank = 1u << (addr_val & ((1u << BANK_BITS) - 1));
+        } else {
+          new_bank = 1u << ((addr_val >> BANK_SHIFT) & ((1u << BANK_BITS) - 1));
+        }
+        pending_bank_ = new_bank;
+      } else {
+        if (pending_bank_ != 0 && (pending_bank_ & read_bitmask) == 0)
+          pending_bank_ = 0;
+      }
+    }
+#endif
+    // --- end conflict tracking ---
     // Connect narrow noconflict (1-bit) to bank[0] so operations happen
     // at the bank location, reducing wire distance.
     auto noconflict = nc.fo1().connect(bank[0]);
@@ -961,6 +999,17 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
     for (u64 i = 0; i < B; i++)
       bank[i].reset();
   }
+
+  void print_conflict_stats(std::ostream &os = std::cerr) const {
+    if (stat_writes == 0) return;
+    os << "rwram[" << name_ << "] writes=" << stat_writes
+       << " buffered=" << stat_buffered
+       << " (" << (100.0 * stat_buffered / stat_writes) << "%)"
+       << " lost=" << stat_lost
+       << " (" << (stat_buffered > 0 ? 100.0 * stat_lost / stat_buffered : 0.0) << "% of buffered)"
+       << " flushed=" << stat_flushed
+       << "\n";
+  }
 };
 
 // ============================================================================
@@ -977,8 +1026,9 @@ template <u64 TABLE_SIZE, u64 TAG_WIDTH,
           u64 HYST_WIDTH, u64 U_WIDTH, u64 SEC_TAG_BITS,
           u64 N,                   // max branches per block (= lanes of pred)
           bool SHARED_HYS = false, // shared hyst: 2 entries share 1 counter
-          u64 TAG_RAM_WIDTH =
-              TAG_WIDTH> // RAM width for tag (uniform across tables)
+          u64 TAG_RAM_WIDTH = TAG_WIDTH, // RAM width for tag (uniform across tables)
+          u64 RWRAM_BANK_SHIFT = 0, // which address bit selects rwram bank
+          u64 RWRAM_BANKS = 2>     // number of rwram banks (power of 2)
 struct TATable {
   static constexpr u64 IDX_BITS = ta::clog2(TABLE_SIZE);
   static constexpr u64 PRED_BITS = N * CTR_WIDTH;
@@ -1001,9 +1051,11 @@ struct TATable {
   static_assert(TAG_RAM_WIDTH >= TAG_WIDTH,
                 "TAG_RAM_WIDTH must be >= TAG_WIDTH");
 
+  static constexpr u64 rwram_bank_shift = RWRAM_BANK_SHIFT;
+
   // ---- RAMs (predict-path critical) ----
   hcm::ram<val<TAG_RAM_WIDTH>, TABLE_SIZE> tag_ram{"ta_tag"};
-  ta_rwram<PRED_BITS, TABLE_SIZE, 2> pred_ram{"ta_pred"};
+  ta_rwram<PRED_BITS, TABLE_SIZE, RWRAM_BANKS, RWRAM_BANK_SHIFT> pred_ram{"ta_pred"};
   hcm::ram<val<SEC_TAG_BITS>, TABLE_SIZE> sec_ram{"ta_sec"};
 
   // ---- Per-table folded histories (predict-path, at sec_ram location) ----
@@ -1012,8 +1064,8 @@ struct TATable {
 
   // ---- RAMs (update-only) ----
   hcm::zone ta_update_zone;
-  ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, 2> hyst_ram{"ta_hyst"};
-  ta_rwram<U_WIDTH, TABLE_SIZE, 2> u_ram{"ta_u"};
+  ta_rwram<std::max(u64(1), HYST_WIDTH), HYST_SIZE, RWRAM_BANKS, RWRAM_BANK_SHIFT> hyst_ram{"ta_hyst"};
+  ta_rwram<U_WIDTH, TABLE_SIZE, RWRAM_BANKS, RWRAM_BANK_SHIFT> u_ram{"ta_u"};
 };
 
 // Generate a TATable type from config arrays at index I
@@ -1022,7 +1074,8 @@ template <typename Cfg, u64 I, u64 CTR_WIDTH, u64 HYST_WIDTH, u64 U_WIDTH,
           u64 TAG_RAM_WIDTH = ta::array_max(Cfg::TAG_WIDTH)>
 using TATableAt =
     TATable<Cfg::TABLE_SIZE[I], Cfg::TAG_WIDTH[I], Cfg::HIST_LEN[I], CTR_WIDTH,
-            HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS, TAG_RAM_WIDTH>;
+            HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS, TAG_RAM_WIDTH,
+            Cfg::RWRAM_BANK_SHIFT[I], Cfg::RWRAM_BANKS[I]>;
 
 // Build a reversed index sequence: <N-1, N-2, ..., 1, 0>
 template <typename Seq> struct ReverseSeq;

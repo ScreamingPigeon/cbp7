@@ -17,13 +17,17 @@ template <u64 N = 12, u64 SIZE = 1024, u64 TAG = 11, u64 MINH = 4,
           u64 MAXH = 500, u64 SIZE_RATIO = 4,
           ta::HistSeries HIST = ta::HistSeries::GEOMETRIC,
           typename TagFn = ta::UniformTag<TAG>,
-          typename SizeFn = ta::GeoSize<SIZE, SIZE_RATIO>>
+          typename SizeFn = ta::GeoSize<SIZE, SIZE_RATIO>,
+          auto BANK_SHIFTS = ta::uniform_array<u64, N>(1),
+          auto BANK_COUNTS = ta::uniform_array<u64, N>(2)>
 struct TATableConfig {
   static constexpr u64 NUM_TABLES = N;
   static constexpr u64 MINHIST = MINH;
   static constexpr u64 MAXHIST = MAXH;
   static constexpr auto TABLE_SIZE = ta::generate_table_sizes<N>(SizeFn{});
   static constexpr auto TAG_WIDTH = ta::generate_tag_widths<N>(TagFn{});
+  static constexpr auto RWRAM_BANK_SHIFT = BANK_SHIFTS;
+  static constexpr auto RWRAM_BANKS = BANK_COUNTS;
   static constexpr auto HIST_LEN = []() {
     if constexpr (HIST == ta::HistSeries::GEOMETRIC)
       return ta::geometric_hist<N>(MINH, MAXH);
@@ -294,6 +298,16 @@ struct TageAhead : predictor {
   ~TageAhead() {
     mon.print_summary();
     print_params(std::cerr);
+    // rwram bank conflict stats
+    std::cerr << "\n=== rwram bank conflict stats ===\n";
+    static_loop<NT>([&]<u64 I>() {
+      auto &t = table<I>();
+      t.pred_ram.print_conflict_stats();
+      t.hyst_ram.print_conflict_stats();
+      t.u_ram.print_conflict_stats();
+    });
+    meta_ctr.print_conflict_stats();
+    std::cerr << "=================================\n";
   }
   void print_params(std::ostream &os) const {
     os << "\n=== TageAhead Parameters ===\n";

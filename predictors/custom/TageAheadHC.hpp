@@ -138,81 +138,81 @@ struct TageAheadHC : predictor {
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram0{"t0_tag"};
   ta_folded_gh<10> fold_idx0;
   ta_folded_gh<TAG_WIDTH> fold_tag0;
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram0{"t0_pred"};
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram0{"t0_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram0{"t0_sec"};
   hcm::zone zone0;
-  ta_rwram<HYST_WIDTH, 512, 2> hyst_ram0{"t0_hyst"};
-  ta_rwram<U_WIDTH, 1024, 2> u_ram0{"t0_u"};
+  ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram0{"t0_hyst"};
+  ta_rwram<U_WIDTH, 1024, 8, 1> u_ram0{"t0_u"};
 
   // ---- Table 1 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram1{"t1_tag"};
   ta_folded_gh<10> fold_idx1;
   ta_folded_gh<TAG_WIDTH> fold_tag1;
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram1{"t1_pred"};
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram1{"t1_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram1{"t1_sec"};
   hcm::zone zone1;
-  ta_rwram<HYST_WIDTH, 512, 2> hyst_ram1{"t1_hyst"};
-  ta_rwram<U_WIDTH, 1024, 2> u_ram1{"t1_u"};
+  ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram1{"t1_hyst"};
+  ta_rwram<U_WIDTH, 1024, 8, 1> u_ram1{"t1_u"};
 
   // ---- Table 2 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram2{"t2_tag"};
   ta_folded_gh<10> fold_idx2;
   ta_folded_gh<TAG_WIDTH> fold_tag2;
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram2{"t2_pred"};
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram2{"t2_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram2{"t2_sec"};
   hcm::zone zone2;
-  ta_rwram<HYST_WIDTH, 512, 2> hyst_ram2{"t2_hyst"};
-  ta_rwram<U_WIDTH, 1024, 2> u_ram2{"t2_u"};
+  ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram2{"t2_hyst"};
+  ta_rwram<U_WIDTH, 1024, 8, 1> u_ram2{"t2_u"};
 
   // ---- Table 3 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram3{"t3_tag"};
   ta_folded_gh<10> fold_idx3;
   ta_folded_gh<TAG_WIDTH> fold_tag3;
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram3{"t3_pred"};
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram3{"t3_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram3{"t3_sec"};
   hcm::zone zone3;
-  ta_rwram<HYST_WIDTH, 512, 2> hyst_ram3{"t3_hyst"};
-  ta_rwram<U_WIDTH, 1024, 2> u_ram3{"t3_u"};
+  ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram3{"t3_hyst"};
+  ta_rwram<U_WIDTH, 1024, 8, 1> u_ram3{"t3_u"};
 
   // ---- Table 4 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram4{"t4_tag"};
   ta_folded_gh<10> fold_idx4;
   ta_folded_gh<TAG_WIDTH> fold_tag4;
-  ta_rwram<PRED_BITS, 1024, 2> pred_ram4{"t4_pred"};
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram4{"t4_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram4{"t4_sec"};
   hcm::zone zone4;
-  ta_rwram<HYST_WIDTH, 512, 2> hyst_ram4{"t4_hyst"};
-  ta_rwram<U_WIDTH, 1024, 2> u_ram4{"t4_u"};
+  ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram4{"t4_hyst"};
+  ta_rwram<U_WIDTH, 1024, 8, 1> u_ram4{"t4_u"};
 
   // ---- Table 5 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram5{"t5_tag"};
   ta_folded_gh<11> fold_idx5;
   ta_folded_gh<TAG_WIDTH> fold_tag5;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram5{"t5_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram5{"t5_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram5{"t5_sec"};
   hcm::zone zone5;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram5{"t5_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram5{"t5_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram5{"t5_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram5{"t5_u"};
 
   // ---- Table 6 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram6{"t6_tag"};
   ta_folded_gh<11> fold_idx6;
   ta_folded_gh<TAG_WIDTH> fold_tag6;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram6{"t6_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram6{"t6_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram6{"t6_sec"};
   hcm::zone zone6;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram6{"t6_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram6{"t6_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram6{"t6_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram6{"t6_u"};
 
   // ---- Table 7 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram7{"t7_tag"};
   ta_folded_gh<11> fold_idx7;
   ta_folded_gh<TAG_WIDTH> fold_tag7;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram7{"t7_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram7{"t7_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram7{"t7_sec"};
   hcm::zone zone7;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram7{"t7_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram7{"t7_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram7{"t7_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram7{"t7_u"};
 
   // ---- Fallback RAM (mid-array, between T7 and T8) ----
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
@@ -221,65 +221,65 @@ struct TageAheadHC : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram8{"t8_tag"};
   ta_folded_gh<11> fold_idx8;
   ta_folded_gh<TAG_WIDTH> fold_tag8;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram8{"t8_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram8{"t8_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram8{"t8_sec"};
   hcm::zone zone8;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram8{"t8_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram8{"t8_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram8{"t8_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram8{"t8_u"};
 
   // ---- Table 9 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram9{"t9_tag"};
   ta_folded_gh<11> fold_idx9;
   ta_folded_gh<TAG_WIDTH> fold_tag9;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram9{"t9_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram9{"t9_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram9{"t9_sec"};
   hcm::zone zone9;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram9{"t9_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram9{"t9_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram9{"t9_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram9{"t9_u"};
 
   // ---- Table 10 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram10{"t10_tag"};
   ta_folded_gh<11> fold_idx10;
   ta_folded_gh<TAG_WIDTH> fold_tag10;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram10{"t10_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram10{"t10_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram10{"t10_sec"};
   hcm::zone zone10;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram10{"t10_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram10{"t10_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram10{"t10_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram10{"t10_u"};
 
   // ---- Table 11 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram11{"t11_tag"};
   ta_folded_gh<11> fold_idx11;
   ta_folded_gh<TAG_WIDTH> fold_tag11;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram11{"t11_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram11{"t11_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram11{"t11_sec"};
   hcm::zone zone11;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram11{"t11_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram11{"t11_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram11{"t11_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram11{"t11_u"};
 
   // ---- Table 12 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram12{"t12_tag"};
   ta_folded_gh<11> fold_idx12;
   ta_folded_gh<TAG_WIDTH> fold_tag12;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram12{"t12_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram12{"t12_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram12{"t12_sec"};
   hcm::zone zone12;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram12{"t12_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram12{"t12_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram12{"t12_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram12{"t12_u"};
 
   // ---- Table 13 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram13{"t13_tag"};
   ta_folded_gh<11> fold_idx13;
   ta_folded_gh<TAG_WIDTH> fold_tag13;
-  ta_rwram<PRED_BITS, 2048, 2> pred_ram13{"t13_pred"};
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram13{"t13_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram13{"t13_sec"};
   hcm::zone zone13;
-  ta_rwram<HYST_WIDTH, 1024, 2> hyst_ram13{"t13_hyst"};
-  ta_rwram<U_WIDTH, 2048, 2> u_ram13{"t13_u"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram13{"t13_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram13{"t13_u"};
 
   // ---- Meta (update-only) ----
   hcm::zone meta_zone;
-  ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
+  ta_rwram<META_WIDTH, META_CAPACITY, 8, 1> meta_ctr{"meta"};
 
   // ======== Training regs ========
   reg<MAX_IDX_BITS> train_idx[NT];
@@ -876,7 +876,7 @@ struct TageAheadHC : predictor {
 
     val<1> fb_changed = actual_dir != val<PRED_BITS>{train_fb.fo1()};
     val<1> fb_gate = do_train & t_m1[NT].fo1() & mispredict & fb_changed.fo1();
-    fb_gate.fanout(hard<5>{}); // fb_ctr ta_rwram: B=2 banks + write_bank + localaddr + data
+    fb_gate.fanout(hard<5>{}); // fb_ctr: execute_if gate + idx fanout + data + extra
     execute_if(fb_gate, [&]() {
       fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir);
     });
@@ -896,7 +896,7 @@ struct TageAheadHC : predictor {
     new_meta.fanout(hard<2>{}); // (new != old) + meta_ctr.write
     // Gate: train valid AND provider weak AND provider/alt disagree AND value changed
     val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
-    meta_gate.fanout(hard<5>{}); // meta_ctr ta_rwram: B=2 + 3
+    meta_gate.fanout(hard<11>{}); // meta_ctr ta_rwram: B=8 + 3
     execute_if(meta_gate, [&]() {
       meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1].fo1()},
                      new_meta, hard<0>{});
@@ -932,7 +932,7 @@ struct TageAheadHC : predictor {
       // weak hyst that's wrong should still get its prediction flipped.
       val<1> do_pred_update = t_m1[I] & t_phw & table_wrong;
       val<1> gate_pred = do_train & (do_alloc | do_pred_update.fo1());
-      gate_pred.fanout(hard<5>{}); // ta_rwram B=2: B+3=5
+      gate_pred.fanout(hard<11>{}); // ta_rwram B=8: B+3=11
       execute_if(gate_pred, [&]() {
         pred_ram_at<I>().write(val<IDX_BITS[I]>{train_idx[I]},
                                actual_dir, hard<0>{});
@@ -948,7 +948,7 @@ struct TageAheadHC : predictor {
       auto hyst_data = select(do_alloc, val<HYST_WIDTH>{0}, new_hyst);
       val<1> do_hyst_update = t_m1[I] & (new_hyst != old_hyst);
       val<1> gate_hyst = do_train & (do_alloc | do_hyst_update.fo1());
-      gate_hyst.fanout(hard<5>{});
+      gate_hyst.fanout(hard<11>{}); // ta_rwram B=8: B+3=11
       execute_if(gate_hyst, [&]() {
         hyst_ram_at<I>().write(val<HYST_IDX_BITS[I]>{train_idx[I]},
                                hyst_data.fo1(), hard<0>{});
@@ -1029,7 +1029,7 @@ struct TageAheadHC : predictor {
 
       // Silent update elimination: only write when value actually changes
       val<1> gate_u = do_train & (merged_write.fo1() & merged_changed.fo1());
-      gate_u.fanout(hard<5>{}); // u_ram ta_rwram B=2: B+3=5
+      gate_u.fanout(hard<11>{}); // u_ram ta_rwram B=8: B+3=11
       execute_if(gate_u, [&]() {
         u_ram_at<I>().write(val<IDX_BITS[I]>{train_idx[I]}, merged.fo1(),
                             hard<0>{});
