@@ -155,6 +155,196 @@ using S3_MW4_MC2048 = TageAhead<S1_META(4, 2048)>;
 using S3_MW4_MC4096 = TageAhead<S1_META(4, 4096)>;
 
 // ============================================================================
+// Sweep 6: Graded LFSR widths on S3_MW4_MC2048 base
+// ============================================================================
+// Baseline (S3_MW4_MC2048): uniform LFSR=8, FixedThresh<8> → 3.1% decay/miss
+// Graded LFSR: T0 (longest hist) wider LFSR (less decay), T13 narrower (more)
+
+// LFSR width arrays for sweep 6
+inline constexpr auto S6_LFSR_U8  = ta::uniform_array<u64, 14>(8);
+inline constexpr auto S6_LFSR_G10_7 = ta::graded_array<u64, 14>(10, 7);
+inline constexpr auto S6_LFSR_G12_6 = ta::graded_array<u64, 14>(12, 6);
+
+// Helper: S3_MW4_MC2048 base + custom decay (LFSR via constexpr var, thresh via type)
+#define S6_DECAY(LFSR_VAR, THRESH_FN)                                          \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 4,     \
+      2048, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      LFSR_VAR, THRESH_FN, false
+
+using S6_G10_7     = TageAhead<S6_DECAY(S6_LFSR_G10_7, ta::FixedDecayThresh<8>)>;
+using S6_G12_6     = TageAhead<S6_DECAY(S6_LFSR_G12_6, ta::FixedDecayThresh<8>)>;
+using S6_G10_7_T16 = TageAhead<S6_DECAY(S6_LFSR_G10_7, ta::FixedDecayThresh<16>)>;
+using S6_G12_6_T16 = TageAhead<S6_DECAY(S6_LFSR_G12_6, ta::FixedDecayThresh<16>)>;
+// GradedThresh and PressGated need type aliases to avoid comma-in-macro
+using S6_GT8_64_Thresh = ta::GradedDecayThresh<8, 64, 14>;
+using S6_PG512_Thresh  = ta::PressGatedDecayThresh<4, 32, 14, 512>;
+using S6_GT8_64    = TageAhead<S6_DECAY(S6_LFSR_U8, S6_GT8_64_Thresh)>;
+using S6_PG512     = TageAhead<S6_DECAY(S6_LFSR_U8, S6_PG512_Thresh)>;
+
+// S3_MW4_MC2048 + MAX_ALLOC=2
+using S6_Alloc2 = TageAhead<
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 4,
+      2048, 2, 256, true, HistUpdate::PATH, TAAlloc2PressSkip,
+      SiblingPolicy::ALL, 0, 10, 10,
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
+// S3_MW4_MC2048 + FB 16K
+using S6_FB16K = TageAhead<
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, 4,
+      2048, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,
+      SiblingPolicy::ALL, 0, 10, 10,
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
+// S3_MW4_MC2048 + META 4096
+using S6_MC4096 = TageAhead<
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 4,
+      4096, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,
+      SiblingPolicy::ALL, 0, 10, 10,
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
+// S3_MW4_MC2048 + ALL THREE (MAX_ALLOC=2 + FB 16K + META 4096)
+using S6_All3 = TageAhead<
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, 4,
+      4096, 2, 256, true, HistUpdate::PATH, TAAlloc2PressSkip,
+      SiblingPolicy::ALL, 0, 10, 10,
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false>;
+
+// ============================================================================
+// Sweep 7: Structural accuracy improvements on S3_MW4_MC2048 base
+// ============================================================================
+// Helper: S3 base with custom TableCfg and SecTagPolicy, rest standard
+#define S7_BASE(TABLE_CFG, STP)                                                \
+  TABLE_CFG,                                                                   \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 4,     \
+      2048, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, 0, false, STP
+
+// Pre-declare TableCfg and SecTagPolicy types to avoid comma-in-macro
+using S7_TC11 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                              ta::UniformTag<11>, ta::GradedSize<512, 2048>>;
+using S7_TC12 = TATableConfig<14, 1024, 12, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                              ta::UniformTag<12>, ta::GradedSize<512, 2048>>;
+using S7_TC_GT13_9 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                              ta::GradedTag<13, 9>, ta::GradedSize<512, 2048>>;
+using S7_TC_GT14_8 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                              ta::GradedTag<14, 8>, ta::GradedSize<512, 2048>>;
+using S7_TC_GT12_10 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                              ta::GradedTag<12, 10>, ta::GradedSize<512, 2048>>;
+// History length variants
+using S7_TC_H6_300 = TATableConfig<14, 1024, 11, 6, 300, 1, ta::HistSeries::GEOMETRIC,
+                              ta::UniformTag<11>, ta::GradedSize<512, 2048>>;
+using S7_TC_H5_150 = TATableConfig<14, 1024, 11, 5, 150, 1, ta::HistSeries::GEOMETRIC,
+                              ta::UniformTag<11>, ta::GradedSize<512, 2048>>;
+using S7_TC_H10_250 = TATableConfig<14, 1024, 11, 10, 250, 1, ta::HistSeries::GEOMETRIC,
+                              ta::UniformTag<11>, ta::GradedSize<512, 2048>>;
+
+// SecTagPolicy aliases
+using S7_STP_A96  = ta::SecTagAdaptive<8, 96>;
+using S7_STP_A128 = ta::SecTagAdaptive<8, 128>;
+using S7_STP_A64  = ta::SecTagAdaptive<8, 64>;
+
+// --- A. Adaptive sec-tag (3 thresholds) ---
+using S7_Adapt64   = TageAhead<S7_BASE(S7_TC11, S7_STP_A64)>;
+using S7_Adapt96   = TageAhead<S7_BASE(S7_TC11, S7_STP_A96)>;
+using S7_Adapt128  = TageAhead<S7_BASE(S7_TC11, S7_STP_A128)>;
+
+// --- B. Tag width: uniform 12-bit ---
+using S7_Tag12     = TageAhead<S7_BASE(S7_TC12, ta::SecTagAll)>;
+
+// --- C. Graded tags ---
+using S7_GT13_9    = TageAhead<S7_BASE(S7_TC_GT13_9, ta::SecTagAll)>;   // T0:13, T13:9
+using S7_GT14_8    = TageAhead<S7_BASE(S7_TC_GT14_8, ta::SecTagAll)>;   // T0:14, T13:8
+using S7_GT12_10   = TageAhead<S7_BASE(S7_TC_GT12_10, ta::SecTagAll)>;  // T0:12, T13:10
+
+// --- D. History length tuning ---
+using S7_H6_300    = TageAhead<S7_BASE(S7_TC_H6_300, ta::SecTagAll)>;   // min=6, max=300
+using S7_H5_150    = TageAhead<S7_BASE(S7_TC_H5_150, ta::SecTagAll)>;   // min=5, max=150
+using S7_H10_250   = TageAhead<S7_BASE(S7_TC_H10_250, ta::SecTagAll)>;  // min=10, max=250
+
+// ============================================================================
+// Sweep 8: rwram bank shift — which address bit selects the bank
+// ============================================================================
+// Baseline: BANK_SHIFT=0 (bit 0). ~50% of buffered writes lost.
+// Higher shifts use higher-order bits which may have less correlation
+// between consecutive accesses.
+// Tables: T0-4 are 1024 (10-bit idx), T5-13 are 2048 (11-bit idx).
+// Max safe uniform shift = 9 (fits 10-bit smallest idx).
+
+// Bank shift arrays
+inline constexpr auto S8_BS0 = ta::uniform_array<u64, 14>(0);
+inline constexpr auto S8_BS1 = ta::uniform_array<u64, 14>(1);
+inline constexpr auto S8_BS2 = ta::uniform_array<u64, 14>(2);
+// Graded: small tables (T0-4) shift=X, large tables (T5-13) shift=Y
+inline constexpr auto S8_BS_GRAD = ta::split_array<u64, 14>(2, 3, 5);
+inline constexpr auto S8_BS_GRAD2 = ta::split_array<u64, 14>(1, 3, 5);  // lo=1, hi=3
+inline constexpr auto S8_BS_GRAD3 = ta::split_array<u64, 14>(3, 5, 5);  // lo=3, hi=5
+
+using S8_TC_BS0 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<11>, ta::GradedSize<512, 2048>, S8_BS0>;
+using S8_TC_BS1 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<11>, ta::GradedSize<512, 2048>, S8_BS1>;
+using S8_TC_BS2 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<11>, ta::GradedSize<512, 2048>, S8_BS2>;
+using S8_TC_GRAD = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                 ta::UniformTag<11>, ta::GradedSize<512, 2048>, S8_BS_GRAD>;
+using S8_TC_GRAD2 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                  ta::UniformTag<11>, ta::GradedSize<512, 2048>, S8_BS_GRAD2>;
+using S8_TC_GRAD3 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                  ta::UniformTag<11>, ta::GradedSize<512, 2048>, S8_BS_GRAD3>;
+
+using S8_Shift0 = TageAhead<S7_BASE(S8_TC_BS0, ta::SecTagAll)>;
+using S8_Shift1 = TageAhead<S7_BASE(S8_TC_BS1, ta::SecTagAll)>;
+using S8_Shift2 = TageAhead<S7_BASE(S8_TC_BS2, ta::SecTagAll)>;
+using S8_Graded = TageAhead<S7_BASE(S8_TC_GRAD, ta::SecTagAll)>;
+using S8_Graded2 = TageAhead<S7_BASE(S8_TC_GRAD2, ta::SecTagAll)>;
+using S8_Graded3 = TageAhead<S7_BASE(S8_TC_GRAD3, ta::SecTagAll)>;
+
+// ---- B=4 banks (2-bit bank select) ----
+inline constexpr auto S8_B4 = ta::uniform_array<u64, 14>(4);
+// B=4, shift=0 (bits [1:0])
+using S8_TC_4B_S0 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                   ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                   S8_BS0, S8_B4>;
+// B=4, shift=1 (bits [2:1])
+using S8_TC_4B_S1 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                   ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                   S8_BS1, S8_B4>;
+using S8_4B_S0 = TageAhead<S7_BASE(S8_TC_4B_S0, ta::SecTagAll)>;
+using S8_4B_S1 = TageAhead<S7_BASE(S8_TC_4B_S1, ta::SecTagAll)>;
+
+// ---- B=8 banks (3-bit bank select) ----
+inline constexpr auto S8_B8 = ta::uniform_array<u64, 14>(8);
+using S8_TC_8B_S1 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                   ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                   S8_BS1, S8_B8>;
+using S8_8B_S1 = TageAhead<S7_BASE(S8_TC_8B_S1, ta::SecTagAll)>;
+
+// ============================================================================
 // Best combined: MW4/MC1024 + 16K bimodal + LFSR decay
 // ============================================================================
 using Best_8K  = TageAhead<S1_META(4, 1024)>;         // == S3_MW4_MC1024
