@@ -411,7 +411,7 @@ struct TageAheadHC_IR : predictor {
 #endif
     });
 
-    // Fallback ahead read (single 8K×7 RAM, no banking)
+    // Fallback ahead read (single 8K×7 RAM)
     auto fb_idx = val<FB_IDX_BITS>{inst_pc >> 2};
     fb_idx.fanout(hard<2>{}); // prefetch_fb_idx + fb read
     prefetch_fb_idx = fb_idx;

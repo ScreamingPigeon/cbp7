@@ -302,3 +302,159 @@ rwram conflicts: 100% writes buffered, ~52% lost (overwritten before flush).
 - Bank imbalance in high tables (T10-T14) suggests index hash doesn't spread
   well for long-history tables. Low tables (T0-T2) have group-related bias
   (69:1 for T0) despite BPE1 — likely due to program structure.
+
+## Sweep 9b: BPE1 8-bank Config (2026-05-05)
+
+Moved from 2-bank to 8-bank ta_rwram with BANK_SHIFT=1.
+Config: S9_TC_U11_8B (15 tables, UniformTag<11>, GradedSize<512,2048>, 8 banks).
+
+### Monitor baseline (eval_monitor_mb2, 20 traces)
+
+| Metric | Value |
+|--------|-------|
+| Mean MPKI | 11.432 |
+| Tlast_zu% | 27.6% |
+| prov_sec_rej% | 24% |
+
+rwram write loss by table (BANK_SHIFT=1, 8 banks, namd trace):
+
+| Table group | Capacity | Loss % | Theoretical |
+|-------------|----------|--------|-------------|
+| T0-T2 (512) | small | 12.7-13.8% | 12.5% |
+| T3 (1024) | mid | 19.9% | 12.5% |
+| T4-T6 (2048) | large | 25.7-34.7% | 12.5% |
+| T7 (2048) | largest | 39.0% | 12.5% |
+
+Long-history tables show 2-3× theoretical loss rate. Root cause: folded
+history register (ta_folded_gh) shifts by only 1 bit per cycle, so
+consecutive block indices are highly correlated → bank bits repeat.
+
+## Sweep 11: PC_IDX_SHIFT=5 (2026-05-05)
+
+Hypothesis: TageAhead uses `idx = fold XOR (pc >> 2)` — shifting PC by only
+2 leaves intra-block bits in the index. Tage.hpp uses `pc >> (LOG_FETCH_WIDTH + 2)`
+= `>> 5` (block-aligned). Try matching that to reduce bank conflicts.
+
+Added `PC_IDX_SHIFT` template parameter (default 2). PCS5 config uses shift=5.
+Also shifts tag hash from `>> 4` to `>> 7`.
+
+### Results (6/20 traces completed before kill)
+
+| Trace | Baseline (>>2) | PCS5 (>>5) | Delta |
+|-------|---------------|------------|-------|
+| 505-mcf | 17.651 | 18.572 | +0.92 |
+| 508-namd | 5.013 | 5.061 | +0.05 |
+| 548-exchange2 | 5.980 | 7.117 | +1.14 |
+| 554-roms | 0.065 | 0.065 | 0.00 |
+| gcc-1 | 14.021 | 15.358 | +1.34 |
+| llvm-2 | 11.522 | 12.280 | +0.76 |
+
+rwram loss rates essentially unchanged (namd: T6 34.7% vs 34.7% baseline).
+
+**Verdict**: Strictly worse. Shifting PC by 5 discards 3 bits of PC entropy
+from the index, increasing aliasing without reducing bank conflicts. The
+fold register dominates the index for long-history tables, so changing which
+PC bits contribute has no effect on bank correlation. Killed after 6 traces.
+
+## Sweep 10: Bank Shift Decorrelation (2026-05-05)
+
+Motivation: with 8 banks and BANK_SHIFT=1 (baseline), the bank select bits
+`index[SHIFT+2:SHIFT]` are highly correlated between consecutive predict/train
+cycles for long-history tables (fold register shifts only 1 bit/cycle).
+Try varying BANK_SHIFT per table to pick less-correlated index bits.
+
+Max shift per table (constrained by `SHIFT + ceil_log2(banks) <= min(IDX, HYST_IDX)`):
+- T0 (512 entries, hyst=256): max shift = 5
+- T1-T4 (1024, hyst=512): max shift = 6
+- T5-T14 (2048, hyst=1024): max shift = 7
+
+### Single-trace results (505-mcf, 40M instr)
+
+| Config | Shift (T0→T14) | MPKI | T0 loss% | T7 loss% | T12-14 loss% |
+|--------|----------------|------|----------|----------|-------------|
+| Baseline | uniform 1 | 17.651 | 14.8 | 16.0 | 47.6 |
+| BS4 | uniform 4 | 17.636 | 14.4 | 15.5 | 24.2 |
+| GBS_531 | 5,5,4,4,3,3,3,2,2,2,1×5 | 17.500 | 17.4 | 16.0 | 47.7 |
+| **GBS_542** | **5,5,5,4,4,4,4,3,3,3,2×5** | **17.356** | 17.5 | 16.0 | 34.0 |
+| BS_MAX | 5,6,6,6,6,7×10 | 17.827 | 17.8 | 19.7 | 55.2 |
+| GBS_510 | 5,4,3,3,2,2,1,1,1,0×6 | 18.053 | 17.8 | 15.7 | 56.9 |
+
+Note: T0 = longest history (512 entries), T14 = shortest history (2048 entries).
+
+Key observations:
+- **GBS_542 best MPKI** (−0.3 vs baseline), reduces T12-14 loss 47.6→34.0%
+- BS4 (uniform 4) best T12-14 loss (24.2%) but less MPKI gain
+- High shift on T0 (long history) consistently hurts — T0 loss rises 14.8→17.5%
+- Aggressive shift everywhere (BS_MAX) or shift→0 (GBS_510) both degrade
+- Sweet spot: moderate shift on short-history tables, higher on long-history
+
+### Full 20-trace eval (GBS_542 vs baseline shift=1)
+
+| Trace | Baseline | GBS_542 | Delta |
+|-------|----------|---------|-------|
+| 502-gcc | 17.566 | 17.963 | +0.40 |
+| 505-mcf | 17.651 | 17.356 | −0.30 |
+| 508-namd | 5.013 | 5.096 | +0.08 |
+| 531-deepsjeng | 14.804 | 15.232 | +0.43 |
+| 548-exchange2 | 5.980 | 7.017 | +1.04 |
+| 554-roms | 0.065 | 0.057 | −0.01 |
+| dcapo-kafka | 6.382 | 6.348 | −0.03 |
+| gap-sssp | 37.253 | 37.232 | −0.02 |
+| gcc-1 | 14.021 | 14.508 | +0.49 |
+| java16 | 6.716 | 6.897 | +0.18 |
+| llvm-2 | 11.522 | 11.944 | +0.42 |
+| lua-3 | 2.632 | 2.639 | +0.01 |
+| nodejs-http2 | 9.738 | 9.948 | +0.21 |
+| nodejs-octane | 7.361 | 7.506 | +0.15 |
+| python3-dulwich | 5.420 | 5.674 | +0.25 |
+| rsbench | 42.737 | 42.531 | −0.21 |
+| sampleflow | 2.097 | 3.984 | +1.89 |
+| web_130 | 6.821 | 7.113 | +0.29 |
+| web_74 | 6.475 | 6.625 | +0.15 |
+| zstd | 8.390 | 8.457 | +0.07 |
+| **Mean** | **11.432** | **11.706** | **+0.27** |
+
+5 wins / 15 losses. Single-trace mcf result was misleading.
+
+**Verdict**: BANK_SHIFT decorrelation hurts overall. While it reduces rwram
+write loss on short-history tables (T12-14: 47.6%→34.0%), it changes the
+aliasing pattern in ways that degrade accuracy on most traces. The write loss
+reduction does not compensate for the aliasing disruption. BANK_SHIFT=1
+(baseline) remains optimal.
+
+## FB Banking: Address-banked Fallback RAM (2026-05-05)
+
+Split single 8K×7-bit fb RAM into 4 address banks × 7 per-group 1-bit RAMs
+= 28 RAMs of 2K×1-bit. Goal: reduce active SRAM area per cycle, improve
+floorplan packing. Bank select from low 2 bits of fb_idx (SHIFT=0).
+
+### Template TageAhead (eval-monitor, 20 traces, FREE_FANOUT)
+
+| Config | Description | MPKI | VFS | vs baseline |
+|--------|-------------|------|-----|-------------|
+| BPE1_8B | baseline (no FB banking) | 11.432 | — | — |
+| FB4 | 4 addr banks, per-group 1-bit, SHIFT=0 | 11.452 | — | +0.18% MPKI |
+| FB4_S6 | same but SHIFT=6 | — | — | (killed, same binary bug) |
+
+Accuracy neutral (+0.18%). EPI +5% from arr::select MUX overhead (FREE_FANOUT).
+
+### HC_IR Timing (gcc-1, 100K warmup + 100K measure, no FREE_FANOUT)
+
+| Config | P2 (ns) | EPI (fJ) | Misps |
+|--------|---------|----------|-------|
+| HC_IR MB2 (no FB banking) | 0.860 | 3056 | 2198 |
+| HC_IR MB2 + FB4 (arr::select MUX) | 1.040 | 3655 | 2198 |
+| HC_IR MB2 + FB4 (OR-fold execute_if) | 1.037 | 3132 | 2198 |
+
+MUX approach regressed P2 by +0.18ns (+21%). OR-fold (execute_if masking +
+fold_or) replaced 2-stage MUX<4> with AND+OR<4>. Result: timing barely
+changed (-0.003ns) but energy dropped -14% (3655→3132 fJ). The timing
+bottleneck is the 28 RAM reads' wiring, not the selection logic. All 4 banks
+still read every cycle (HARCOM cannot gate RAM reads).
+
+**Verdict**: FAILED. FB banking in HC_IR adds +0.18ns P2 regression (+21%)
+regardless of MUX approach (arr::select vs OR-fold). The 28 small RAM reads
+(4 banks × 7 groups, all read every cycle — HARCOM cannot gate reads)
+dominate the critical path vs the single 8K×7 RAM. Reverted to single RAM.
+FB banking remains viable in template TageAhead (FREE_FANOUT mode) where
+timing is unconstrained.
