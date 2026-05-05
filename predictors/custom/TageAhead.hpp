@@ -1325,12 +1325,6 @@ struct TageAhead : predictor {
     }
 #endif
 
-    // Save current resolution → train regs (for NEXT cycle's training)
-    train_match1[0] = match1.fo1();
-    train_provider_pred[0] = provider_pred;
-    train_provider_weak[0] = provider_weak.fo1();
-    train_altdiff[0] = altdiff.fo1();
-
     } // end if constexpr (NUM_GROUPS == 1)
 
     // ================================================================
@@ -1418,6 +1412,16 @@ struct TageAhead : predictor {
     val<1> t_pw =
         train_provider_weak[train_group].fo1(); // newly-alloc (hyst==0 & u==0) — meta
     val<1> t_ad = train_altdiff[train_group].fo1();
+
+    // Save current resolution → train regs (for NEXT cycle's training)
+    // Must happen AFTER training reads the previous cycle's values above.
+    if constexpr (NUM_GROUPS == 1) {
+      train_match1[0] = match1.fo1();
+      train_provider_pred[0] = provider_pred;
+      train_provider_weak[0] = provider_weak.fo1();
+      train_altdiff[0] = altdiff.fo1();
+    }
+    // NUM_GROUPS > 1: already saved inside per-group resolution loop above
 
     // Hyst-only weakness: computed from piped regs (not resolution chain)
     // to keep it off the resolution critical path. Gates pred/hyst counter
