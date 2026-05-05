@@ -664,6 +664,12 @@ using TA1C_BPE1_8B_FB4_S6 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 6, true>
 using TA1C_BPE1_8B_FB4_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true, 2>;
 // PC index shift: match Tage.hpp's block-aligned indexing (>> 5 instead of >> 2)
 using TA1C_BPE1_8B_PCS5 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 1, 5>;
+// GradedTag<11,7> with 8 banks, 15 tables (for monitor eval)
+using S9_TC_GT11_7_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                      ta::GradedTag<11, 7>, ta::GradedSize<512, 2048>,
+                                      ta::uniform_array<u64, 15>(1),
+                                      ta::uniform_array<u64, 15>(8)>;
+using TA1C_BPE1_8B_GT117 = TageAhead<S1_BPE1_8B_BASE(S9_TC_GT11_7_8B)>;
 
 // ============================================================================
 // Sweep 10: Bank shift decorrelation

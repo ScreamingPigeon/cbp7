@@ -876,6 +876,16 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
   u64 stat_lost = 0;          // buffered writes overwritten before flush
   u64 stat_flushed = 0;       // buffered writes successfully flushed
   u64 pending_bank_ = 0;      // which bank has the pending buffered write (bitmask)
+  u64 prev_read_bank_ = 0;    // previous cycle's read bank (bitmask)
+  u64 prev_read_addr_ = 0;    // previous cycle's read address
+  u64 stat_reads = 0;         // total read() calls
+  u64 stat_read_same_prev = 0; // read bank == previous read bank (consecutive correlation)
+  // XOR histogram: how many bits of the address change between consecutive reads
+  // idx_xor_hist[i] = count of cycles where popcount(addr XOR prev_addr) == i
+  static constexpr u64 XOR_HIST_SIZE = A + 1;
+  u64 idx_xor_hist[XOR_HIST_SIZE] = {};
+  // Bank-bits XOR histogram: how many of the BANK_BITS change
+  u64 bank_xor_hist[BANK_BITS + 1] = {};
 
   ta_rwram(const char *label = "") : bank{label}, name_{label} {}
 
@@ -906,6 +916,24 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
       return execute_if(banksel[i], [&]() { return bank[i].read(localaddr); });
     };
     read_bank = banksel.concat();
+#ifdef TAGE_MONITOR
+    {
+      u64 rb = static_cast<u64>(read_bank);
+      u64 av = static_cast<u64>(addr);
+      stat_reads++;
+      if (stat_reads > 1) {
+        if (rb == prev_read_bank_)
+          stat_read_same_prev++;
+        u64 xor_val = av ^ prev_read_addr_;
+        idx_xor_hist[std::popcount(xor_val)]++;
+        u64 bank_bits_now = (av >> BANK_SHIFT) & ((1u << BANK_BITS) - 1);
+        u64 bank_bits_prev = (prev_read_addr_ >> BANK_SHIFT) & ((1u << BANK_BITS) - 1);
+        bank_xor_hist[std::popcount(bank_bits_now ^ bank_bits_prev)]++;
+      }
+      prev_read_bank_ = rb;
+      prev_read_addr_ = av;
+    }
+#endif
     return data.fo1().fold_or();
   }
 
@@ -1008,7 +1036,22 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
        << " lost=" << stat_lost
        << " (" << (stat_buffered > 0 ? 100.0 * stat_lost / stat_buffered : 0.0) << "% of buffered)"
        << " flushed=" << stat_flushed
+       << " read_same_prev=" << stat_read_same_prev
+       << " (" << (stat_reads > 1 ? 100.0 * stat_read_same_prev / (stat_reads - 1) : 0.0) << "%)"
        << "\n";
+    // Print XOR histograms (only for pred RAMs to avoid spam)
+    if (stat_reads > 1) {
+      u64 total = stat_reads - 1;
+      os << "  idx_xor_popcount[" << name_ << "]:";
+      for (u64 i = 0; i < XOR_HIST_SIZE; i++)
+        if (idx_xor_hist[i] > 0)
+          os << " " << i << ":" << (100.0 * idx_xor_hist[i] / total) << "%";
+      os << "\n";
+      os << "  bank_xor_popcount[" << name_ << "]:";
+      for (u64 i = 0; i <= BANK_BITS; i++)
+        os << " " << i << ":" << (100.0 * bank_xor_hist[i] / total) << "%";
+      os << "\n";
+    }
   }
 };
 
