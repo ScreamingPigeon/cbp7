@@ -1135,6 +1135,38 @@ struct TageAhead : predictor {
       }
     }();
 
+    // NUM_GROUPS>1: pre-read ALL old train reg values BEFORE per-group resolution
+    // overwrites them. Training and any_provider_wrong use these pre-read values.
+    // (For NUM_GROUPS==1, reads happen after resolution — see below.)
+    u64 train_group = (NUM_GROUPS > 1)
+        ? BRANCH_TO_GROUP[num_branch > 0 ? num_branch - 1 : 0]
+        : 0;
+    // Pre-read all groups' provider predictions (needed by any_provider_wrong)
+    arr<val<PRED_BITS>, NUM_GROUPS> old_provider_pred = [&](u64 g) -> val<PRED_BITS> {
+      if constexpr (NUM_GROUPS > 1)
+        return val<PRED_BITS>{train_provider_pred[g].fo1()};
+      else
+        return val<PRED_BITS>{hard<0>{}}; // placeholder
+    };
+    val<MATCH_BITS> pre_read_match1 = [&]() {
+      if constexpr (NUM_GROUPS > 1)
+        return train_match1[train_group].fo1();
+      else
+        return val<MATCH_BITS>{hard<0>{}}; // placeholder, overwritten below
+    }();
+    val<1> pre_read_pw = [&]() -> val<1> {
+      if constexpr (NUM_GROUPS > 1)
+        return train_provider_weak[train_group].fo1();
+      else
+        return val<1>{hard<0>{}}; // placeholder
+    }();
+    val<1> pre_read_ad = [&]() -> val<1> {
+      if constexpr (NUM_GROUPS > 1)
+        return train_altdiff[train_group].fo1();
+      else
+        return val<1>{hard<0>{}}; // placeholder
+    }();
+
     if constexpr (NUM_GROUPS > 1) {
       // ---- Per-group resolution chains ----
       // Each group gets its own full_hits (htag_hit & group_id match & sec_tag)
@@ -1237,7 +1269,7 @@ struct TageAhead : predictor {
           }
         });
 
-        // Save per-group resolution → train regs
+        // Save per-group resolution → train regs (OK because training pre-reads old values above)
         train_match1[G] = m1.fo1();
         train_provider_pred[G] = pp;
         train_provider_weak[G] = pw.fo1();
@@ -1379,12 +1411,15 @@ struct TageAhead : predictor {
                                   >{}); // NOTE: @prakhar @claude audit
     });
 
-    // Select training group: the group of the last (mispredicting) branch.
-    // NUM_GROUPS==1: always 0. NUM_GROUPS>1: runtime lookup.
-    u64 train_group = (NUM_GROUPS > 1)
-        ? BRANCH_TO_GROUP[num_branch > 0 ? num_branch - 1 : 0]
-        : 0;
-    val<MATCH_BITS> t_match1 = train_match1[train_group].fo1();
+    // Read old train reg values for training.
+    // NUM_GROUPS>1: use pre-read values (read before per-group loop overwrote train regs).
+    // NUM_GROUPS==1: read now (resolution hasn't overwritten train regs yet).
+    val<MATCH_BITS> t_match1 = [&]() {
+      if constexpr (NUM_GROUPS > 1)
+        return pre_read_match1;
+      else
+        return train_match1[train_group].fo1();
+    }();
     t_match1.fanout(
         hard<2 + (FARALLOC_DIST > 0 ? 1 : 0)>{}); // make_array(1) +
                                                   // alloc_base(1) [+ FARALLOC
@@ -1398,30 +1433,34 @@ struct TageAhead : predictor {
     });
     if constexpr (FB_RECONCILE)
       t_m1[NT].fanout(hard<2>{}); // NOTE: @prakhar @claude audit
-    // NUM_GROUPS>1: train_provider_pred[train_group] is read here AND in
-    // any_provider_wrong (which iterates all groups). Fanout all elements to 2.
-    if constexpr (NUM_GROUPS > 1)
-      for (u64 g = 0; g < NUM_GROUPS; g++)
-        train_provider_pred[g].fanout(hard<2>{});
-    val<PRED_BITS> t_pp = [&]() {
+    val<PRED_BITS> t_pp = [&]() -> val<PRED_BITS> {
       if constexpr (NUM_GROUPS > 1)
-        return val<PRED_BITS>{train_provider_pred[train_group]};
+        return val<PRED_BITS>{old_provider_pred[train_group]};
       else
         return train_provider_pred[train_group].fo1();
     }();
-    val<1> t_pw =
-        train_provider_weak[train_group].fo1(); // newly-alloc (hyst==0 & u==0) — meta
-    val<1> t_ad = train_altdiff[train_group].fo1();
+    val<1> t_pw = [&]() -> val<1> {
+      if constexpr (NUM_GROUPS > 1)
+        return pre_read_pw;
+      else
+        return train_provider_weak[train_group].fo1();
+    }();
+    val<1> t_ad = [&]() -> val<1> {
+      if constexpr (NUM_GROUPS > 1)
+        return pre_read_ad;
+      else
+        return train_altdiff[train_group].fo1();
+    }();
 
     // Save current resolution → train regs (for NEXT cycle's training)
-    // Must happen AFTER training reads the previous cycle's values above.
+    // NUM_GROUPS==1: save here (after reads above).
+    // NUM_GROUPS>1: already saved in per-group loop (safe because pre-read above).
     if constexpr (NUM_GROUPS == 1) {
       train_match1[0] = match1.fo1();
       train_provider_pred[0] = provider_pred;
       train_provider_weak[0] = provider_weak.fo1();
       train_altdiff[0] = altdiff.fo1();
     }
-    // NUM_GROUPS > 1: already saved inside per-group resolution loop above
 
     // Hyst-only weakness: computed from piped regs (not resolution chain)
     // to keep it off the resolution critical path. Gates pred/hyst counter
@@ -1548,9 +1587,9 @@ struct TageAhead : predictor {
         else
           return (t_pp.fo1() ^ actual_dir_g[0]) != hard<0>{};
       } else {
-        // Per-group wrong, then fold_or
+        // Per-group wrong, then fold_or (use pre-read old predictions)
         arr<val<1>, NUM_GROUPS> gw = [&](u64 g) -> val<1> {
-          return (val<PRED_BITS>{train_provider_pred[g].fo1()} ^
+          return (val<PRED_BITS>{old_provider_pred[g]} ^
                   actual_dir_g[g]) != hard<0>{};
         };
         return gw.fo1().fold_or();
