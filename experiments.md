@@ -45,3 +45,68 @@ FB=8K, META MW=4/MC=2048, decay FixedThresh<8>, SecTagAll).
 | S7_H6_300 | MINHIST=6, MAXHIST=300 | | | |
 | S7_H5_150 | MINHIST=5, MAXHIST=150 | | | |
 | S7_H10_250 | MINHIST=10, MAXHIST=250 | | | |
+
+## BR_P_ENTRY: Per-Group Tag Encoding (2026-05-04)
+
+Encode group_id in tag so branches in different groups get independent resolution
+chains and providers. `NUM_GROUPS = ceil(N / BR_P_ENTRY)`. Contiguous grouping
+(INTERLEAVED=false). Same table/size/tag config as baseline 1C.
+
+### Timing (gcc trace, all configs meet 1-cycle)
+
+| Config | BR_P_ENTRY | NUM_GROUPS | P1 Latency (cycles) |
+|--------|-----------|------------|---------------------|
+| 1C     | 7 (=N)    | 1          | 0.677               |
+| BPE4   | 4         | 2          | 0.863               |
+| BPE2   | 2         | 4          | 0.820               |
+| BPE1   | 1         | 7          | 0.737               |
+
+### Accuracy (20 traces, eval-monitor 40M instr)
+
+| Trace | 1C | BPE4 | BPE2 | BPE1 |
+|-------|------|------|------|------|
+| 502-gcc | 652,742 | 652,814 | 620,352 | **584,626** |
+| 505-mcf | 685,446 | **661,175** | 688,652 | 668,608 |
+| 508-namd | 198,046 | 191,132 | 198,301 | **184,906** |
+| 531-deepsjeng | 876,443 | 874,463 | 858,298 | **817,062** |
+| 548-exchange2 | **527,595** | 492,623 | **469,314** | 611,536 |
+| 554-roms | 15,049 | **12,719** | 12,784 | 13,680 |
+| dcapo-kafka | **246,089** | 250,341 | 316,093 | 403,362 |
+| gap-sssp | 1,057,438 | 1,078,686 | 1,083,152 | **1,033,592** |
+| gcc-1 | 279,416 | 277,929 | 270,682 | **248,516** |
+| java16 | 380,819 | 376,433 | 360,273 | **329,676** |
+| llvm-2 | 254,813 | 249,482 | **244,629** | 247,276 |
+| lua-3 | 35,677 | 42,963 | **25,577** | 35,881 |
+| nodejs-http2 | 358,138 | 353,560 | 349,533 | **335,027** |
+| nodejs-octane | 352,280 | 342,387 | 340,671 | **304,558** |
+| python3-dulwich | 275,048 | 269,332 | 260,205 | **238,509** |
+| rsbench | 613,990 | 609,539 | 598,599 | **586,369** |
+| sampleflow | **99,889** | **74,557** | 100,213 | 135,795 |
+| web_130 | 622,304 | 626,916 | 620,588 | **598,124** |
+| web_74 | 457,590 | 464,210 | 449,798 | **419,462** |
+| zstd | **180,312** | 232,218 | 202,694 | 209,835 |
+| **Total** | **8,169,124** | **8,133,479 (-0.4%)** | **8,070,408 (-1.2%)** | **8,006,400 (-2.0%)** |
+
+BPE1 wins 12/20 traces (-2.0% aggregate). BPE1 regressions:
+- dcapo-kafka +63.9%, sampleflow +35.9%, exchange2 +15.9%, zstd +16.4%
+- These may be workloads where intra-block branch correlation benefits from
+  shared providers.
+
+### Bank Balance (mcf trace, write imbalance ratio B0:B1)
+
+| Table | 1C | BPE4 | BPE1 |
+|-------|------|------|------|
+| T0 | 78:1 | 36:1 | 1.2:1 |
+| T1 | 11:1 | 97:1 | 1.1:1 |
+| T2 | 1.1:1 | 1.5:1 | 1.0:1 |
+| T12 | 5.1:1 | 6.2:1 | 4.3:1 |
+| T13 | 4.0:1 | 5.9:1 | 2.9:1 |
+
+BPE1 fixes low-table imbalance completely. High-table imbalance persists
+(index hash bias, not group-related).
+
+### rwram conflict stats (1C, mcf)
+
+100% of writes buffered (read+write same cycle). 53% of buffered writes lost
+(overwritten before flush). Applies to all configs — structural issue with
+1-write-per-cycle ta_rwram.

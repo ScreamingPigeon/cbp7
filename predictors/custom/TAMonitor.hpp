@@ -18,7 +18,8 @@ using u64 = uint64_t;
 using i64 = int64_t;
 
 template <u64 NUM_TABLES, u64 N, u64 MAX_TABLE_ENTRIES = 2048,
-          bool USE_GSHARE = false, u64 FB_CAPACITY = 8192>
+          bool USE_GSHARE = false, u64 FB_CAPACITY = 8192,
+          u64 NUM_GROUPS = 1, u64 NUM_BANKS = 2>
 struct TAMonitor {
 
   static constexpr const char *FB_NAME = USE_GSHARE ? "Gshare" : "Bimodal";
@@ -324,17 +325,66 @@ struct TAMonitor {
     void reset() { *this = Counters{}; }
   };
 
+  // ======== Per-group stats ========
+  struct GroupCounters {
+    u64 branches = 0;
+    u64 mispredictions = 0;
+    std::array<u64, NUM_TABLES + 1> provider_count{};
+    std::array<u64, NUM_TABLES + 1> provider_correct{};
+    std::array<u64, NUM_TABLES> tag_lookups{};
+    std::array<u64, NUM_TABLES> tag_matches{};
+    std::array<u64, NUM_TABLES> sec_matches{};
+    std::array<u64, NUM_TABLES> full_matches{};
+    u64 alloc_attempts = 0;
+    u64 alloc_success = 0;
+    std::array<u64, NUM_TABLES> alloc_per_table{};
+    u64 meta_override_count = 0;
+    u64 meta_override_correct = 0;
+    void reset() { *this = GroupCounters{}; }
+  };
+
+  // ======== Per-bank stats (per table) ========
+  struct BankCounters {
+    u64 tag_hits = 0;
+    u64 sec_hits = 0;
+    u64 full_hits = 0;
+    u64 provider_count = 0;
+    u64 provider_correct = 0;
+    u64 alloc_writes = 0;
+    u64 pred_updates = 0;
+    u64 hyst_updates = 0;
+    u64 u_writes = 0;
+    u64 total_writes = 0;
+    void reset() { *this = BankCounters{}; }
+  };
+
   Counters cum;
   Counters win;
+  std::array<GroupCounters, NUM_GROUPS> group_cum{};
+  std::array<GroupCounters, NUM_GROUPS> group_win{};
+  std::array<std::array<BankCounters, NUM_BANKS>, NUM_TABLES> bank_cum{};
+  std::array<std::array<BankCounters, NUM_BANKS>, NUM_TABLES> bank_win{};
   u64 window_num = 0;
   bool header_printed = false;
 
-  // Per-table sizes
+  // Per-table sizes and bank info
   std::array<u64, NUM_TABLES> table_sizes{};
+  std::array<u64, NUM_TABLES> table_bank_shift{}; // BANK_SHIFT per table
+
+  // Helper: compute bank ID from full index for a given table
+  // clog2 for bank bits (NUM_BANKS is always power of 2)
+  static constexpr u64 BANK_BITS = NUM_BANKS <= 1 ? 0 :
+      NUM_BANKS <= 2 ? 1 : NUM_BANKS <= 4 ? 2 : NUM_BANKS <= 8 ? 3 : 4;
+  u64 get_bank(u64 table, u64 index) const {
+    if constexpr (NUM_BANKS <= 1) return 0;
+    return (index >> table_bank_shift[table]) & ((1u << BANK_BITS) - 1);
+  }
 
   // Table occupancy
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> tage_occupied{};
   std::array<u64, NUM_TABLES> tage_unique_entries{};
+  // Per-group occupancy
+  std::array<std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES>, NUM_GROUPS> group_occupied{};
   std::bitset<FB_CAPACITY> fb_occupied{};
   u64 fb_unique_entries = 0;
   u64 fb_writes = 0;
@@ -372,6 +422,10 @@ struct TAMonitor {
   };
   std::array<std::array<EntryLife, MAX_TABLE_ENTRIES>, NUM_TABLES> entry_life{};
   u64 global_branch_count = 0;
+
+  // Per-entry last access time (for staleness tracking)
+  static constexpr u64 STALENESS_WINDOW = 10000; // branches
+  std::array<std::array<u64, MAX_TABLE_ENTRIES>, NUM_TABLES> last_access_time{};
 
   // Feature 9: Entry utilization
   std::array<std::bitset<MAX_TABLE_ENTRIES>, NUM_TABLES> entry_ever_hit{};
@@ -463,6 +517,97 @@ struct TAMonitor {
     };
     record(cum);
     record(win);
+  }
+
+  // Per-group tag lookup: which group's resolution chain saw this hit?
+  void record_group_tag_lookup(u64 group, u64 table, bool tag_hit,
+                               bool sec_hit) {
+    if (group >= NUM_GROUPS) return;
+    auto &gc = group_cum[group];
+    auto &gw = group_win[group];
+    gc.tag_lookups[table]++;
+    gw.tag_lookups[table]++;
+    if (tag_hit) { gc.tag_matches[table]++; gw.tag_matches[table]++; }
+    if (sec_hit) { gc.sec_matches[table]++; gw.sec_matches[table]++; }
+    if (tag_hit && sec_hit) { gc.full_matches[table]++; gw.full_matches[table]++; }
+  }
+
+  // Per-group outcome: track accuracy per group's resolution chain
+  void record_group_outcome(u64 group, bool correct, bool mispredict,
+                            u64 provider) {
+    if (group >= NUM_GROUPS) return;
+    auto record = [&](GroupCounters &g) {
+      g.branches++;
+      if (mispredict) g.mispredictions++;
+      g.provider_count[provider]++;
+      if (correct) g.provider_correct[provider]++;
+    };
+    record(group_cum[group]);
+    record(group_win[group]);
+  }
+
+  // Per-group allocation
+  void record_group_allocation(u64 group, bool success, u64 table) {
+    if (group >= NUM_GROUPS) return;
+    auto record = [&](GroupCounters &g) {
+      g.alloc_attempts++;
+      if (success) { g.alloc_success++; g.alloc_per_table[table]++; }
+    };
+    record(group_cum[group]);
+    record(group_win[group]);
+  }
+
+  // Per-group occupancy: mark an entry as belonging to a group
+  void record_group_occupy(u64 group, u64 table, u64 index) {
+    if (group >= NUM_GROUPS || table >= NUM_TABLES) return;
+    if (index < MAX_TABLE_ENTRIES)
+      group_occupied[group][table].set(index);
+  }
+
+  // Per-bank tag hit: which bank did this tag match land in?
+  void record_bank_tag_hit(u64 table, u64 index, bool tag_hit, bool sec_hit) {
+    if (!tag_hit && !sec_hit) return;
+    u64 b = get_bank(table, index);
+    if (b >= NUM_BANKS) return;
+    auto &bc = bank_cum[table][b];
+    auto &bw = bank_win[table][b];
+    if (tag_hit) {
+      bc.tag_hits++; bw.tag_hits++;
+      // Stamp last access for staleness tracking
+      u64 idx = mask_index(table, index);
+      if (idx < MAX_TABLE_ENTRIES)
+        last_access_time[table][idx] = global_branch_count;
+    }
+    if (sec_hit) { bc.sec_hits++; bw.sec_hits++; }
+    if (tag_hit && sec_hit) { bc.full_hits++; bw.full_hits++; }
+  }
+
+  // Per-bank provider: which bank did the provider entry come from?
+  void record_bank_provider(u64 table, u64 index, bool correct) {
+    u64 b = get_bank(table, index);
+    if (b >= NUM_BANKS) return;
+    auto &bc = bank_cum[table][b];
+    auto &bw = bank_win[table][b];
+    bc.provider_count++; bw.provider_count++;
+    if (correct) { bc.provider_correct++; bw.provider_correct++; }
+  }
+
+  // Per-bank write: track what type of write hit which bank
+  enum class BankWriteType { ALLOC, PRED_UPDATE, HYST_UPDATE, U_WRITE };
+  void record_bank_write(u64 table, u64 index, BankWriteType type) {
+    u64 b = get_bank(table, index);
+    if (b >= NUM_BANKS) return;
+    auto record = [&](BankCounters &bc) {
+      bc.total_writes++;
+      switch (type) {
+        case BankWriteType::ALLOC: bc.alloc_writes++; break;
+        case BankWriteType::PRED_UPDATE: bc.pred_updates++; break;
+        case BankWriteType::HYST_UPDATE: bc.hyst_updates++; break;
+        case BankWriteType::U_WRITE: bc.u_writes++; break;
+      }
+    };
+    record(bank_cum[table][b]);
+    record(bank_win[table][b]);
   }
 
   void record_prediction(u64 rank, u64 match1_val, u64 match2_val,
@@ -675,6 +820,8 @@ struct TAMonitor {
       for (auto &[wpc, wd] : win_pc_diag)
         prev_window_pcs.insert(wpc);
       win.reset();
+      for (auto &g : group_win) g.reset();
+      for (auto &tbl : bank_win) for (auto &b : tbl) b.reset();
       win_pc_diag.clear();
       for (auto &b : win_entry_ever_hit) b.reset();
       window_num++;
@@ -840,6 +987,8 @@ struct TAMonitor {
     e.alloc_time = global_branch_count;
     e.pred_count = 0;
     e.correct_count = 0;
+    // Stamp access time so newly allocated entry counts as live
+    last_access_time[table][index] = global_branch_count;
     e.stored_pc = train_block_pc;
     e.valid = true;
     // Feature 8: per-PC alloc tracking
@@ -1888,6 +2037,141 @@ struct TAMonitor {
          << std::setprecision(1)
          << (c.ben_ctr_samples > 0
                  ? double(c.ben_ctr_sum) / c.ben_ctr_samples : 0.0) << "\n";
+    }
+
+    // ======== Per-Group Stats ========
+    if constexpr (NUM_GROUPS > 1) {
+      os << "\n--- Per-Group Resolution Stats ---\n";
+      os << "  Group | Branches  | Misp     | Misp%  | MPKI\n";
+      os << "  ------+-----------+----------+--------+------\n";
+      for (u64 g = 0; g < NUM_GROUPS; g++) {
+        auto &gc = group_cum[g];
+        double gmpki = c.total_block_instr > 0
+                           ? 1000.0 * gc.mispredictions / c.total_block_instr
+                           : 0;
+        os << "  G" << g << "    |" << std::setw(10) << gc.branches
+           << " |" << std::setw(9) << gc.mispredictions
+           << " |" << std::setw(6) << pct(gc.mispredictions, gc.branches) << "%"
+           << " |" << std::setprecision(3) << std::setw(6) << gmpki << "\n";
+      }
+
+      os << "\n  Per-Group Provider Distribution:\n";
+      for (u64 g = 0; g < NUM_GROUPS; g++) {
+        auto &gc = group_cum[g];
+        os << "  G" << g << ": ";
+        os << FB_NAME << "=" << gc.provider_count[NUM_TABLES]
+           << "(" << std::setprecision(1) << pct(gc.provider_correct[NUM_TABLES], gc.provider_count[NUM_TABLES]) << "%)";
+        for (u64 t = 0; t < NUM_TABLES; t++) {
+          if (gc.provider_count[t] > 0)
+            os << " T" << t << "=" << gc.provider_count[t]
+               << "(" << pct(gc.provider_correct[t], gc.provider_count[t]) << "%)";
+        }
+        os << "\n";
+      }
+
+      os << "\n  Per-Group Tag Match Rates:\n";
+      os << "  Group |";
+      for (u64 t = 0; t < NUM_TABLES; t++) os << " T" << std::setw(t >= 10 ? 1 : 2) << t << "  |";
+      os << "\n  ------+";
+      for (u64 t = 0; t < NUM_TABLES; t++) os << "------+";
+      os << "\n";
+      for (u64 g = 0; g < NUM_GROUPS; g++) {
+        auto &gc = group_cum[g];
+        os << "  G" << g << "    |";
+        for (u64 t = 0; t < NUM_TABLES; t++)
+          os << std::setw(5) << pct(gc.full_matches[t], gc.tag_lookups[t]) << "%|";
+        os << "\n";
+      }
+
+      os << "\n  Per-Group Allocation:\n";
+      for (u64 g = 0; g < NUM_GROUPS; g++) {
+        auto &gc = group_cum[g];
+        os << "  G" << g << ": attempts=" << gc.alloc_attempts
+           << " success=" << gc.alloc_success
+           << " (" << pct(gc.alloc_success, gc.alloc_attempts) << "%)";
+        os << " per-table:";
+        for (u64 t = 0; t < NUM_TABLES; t++)
+          if (gc.alloc_per_table[t] > 0) os << " T" << t << "=" << gc.alloc_per_table[t];
+        os << "\n";
+      }
+
+      os << "\n  Per-Group Occupancy (entries):\n";
+      for (u64 g = 0; g < NUM_GROUPS; g++) {
+        os << "  G" << g << ":";
+        for (u64 t = 0; t < NUM_TABLES; t++)
+          os << " T" << t << "=" << group_occupied[g][t].count();
+        os << "\n";
+      }
+    }
+
+    // ======== Per-Bank Stats ========
+    if constexpr (NUM_BANKS > 1) {
+      os << "\n--- Per-Bank Stats (per table) ---\n";
+      os << "  Table | Bank | TagHits  | SecHits  | FullHits | Prov    | ProvAcc | Alloc   | PredUpd | HystUpd | UWrites | Total\n";
+      os << "  ------+------+----------+----------+----------+---------+---------+---------+---------+---------+---------+------\n";
+      for (u64 t = 0; t < NUM_TABLES; t++) {
+        for (u64 b = 0; b < NUM_BANKS; b++) {
+          auto &bc = bank_cum[t][b];
+          os << "  T" << std::setw(t >= 10 ? 1 : 2) << t
+             << "   | B" << b << "   |"
+             << std::setw(9) << bc.tag_hits << " |"
+             << std::setw(9) << bc.sec_hits << " |"
+             << std::setw(9) << bc.full_hits << " |"
+             << std::setw(8) << bc.provider_count << " |"
+             << std::setw(6) << pct(bc.provider_correct, bc.provider_count) << "% |"
+             << std::setw(8) << bc.alloc_writes << " |"
+             << std::setw(8) << bc.pred_updates << " |"
+             << std::setw(8) << bc.hyst_updates << " |"
+             << std::setw(8) << bc.u_writes << " |"
+             << std::setw(8) << bc.total_writes << "\n";
+        }
+      }
+
+      // Bank balance: ratio of busier to quieter bank
+      os << "\n  Bank Balance (write imbalance per table):\n";
+      os << "  Table | B0 Writes | B1 Writes | Ratio\n";
+      os << "  ------+-----------+-----------+------\n";
+      for (u64 t = 0; t < NUM_TABLES; t++) {
+        u64 w0 = bank_cum[t][0].total_writes;
+        u64 w1 = NUM_BANKS > 1 ? bank_cum[t][1].total_writes : 0;
+        double ratio = (w0 + w1 > 0)
+                           ? double(std::max(w0, w1)) / std::max(u64(1), std::min(w0, w1))
+                           : 1.0;
+        os << "  T" << std::setw(t >= 10 ? 1 : 2) << t
+           << "   |" << std::setw(10) << w0
+           << " |" << std::setw(10) << w1
+           << " |" << std::setprecision(2) << std::setw(5) << ratio << "\n";
+      }
+
+      // Per-bank occupancy and staleness
+      os << "\n  Bank Occupancy & Staleness (window=" << STALENESS_WINDOW << " branches):\n";
+      os << "  Table | Bank | Occupied |  Occ% |   Live | Live% |  Stale | Stale%\n";
+      os << "  ------+------+----------+-------+--------+-------+--------+-------\n";
+      for (u64 t = 0; t < NUM_TABLES; t++) {
+        u64 tsize = table_sizes[t] > 0 ? table_sizes[t] : MAX_TABLE_ENTRIES;
+        u64 entries_per_bank = tsize / NUM_BANKS;
+        for (u64 b = 0; b < NUM_BANKS; b++) {
+          u64 occupied = 0, live = 0, stale = 0;
+          for (u64 idx = 0; idx < tsize; idx++) {
+            if (get_bank(t, idx) != b) continue;
+            if (tage_occupied[t].test(idx)) {
+              occupied++;
+              if (global_branch_count - last_access_time[t][idx] <= STALENESS_WINDOW)
+                live++;
+              else
+                stale++;
+            }
+          }
+          os << "  T" << std::setw(t >= 10 ? 1 : 2) << t
+             << "   | B" << b << "   |"
+             << std::setw(9) << occupied << " |"
+             << std::setw(5) << pct(occupied, entries_per_bank) << "% |"
+             << std::setw(7) << live << " |"
+             << std::setw(5) << pct(live, occupied) << "% |"
+             << std::setw(7) << stale << " |"
+             << std::setw(5) << pct(stale, occupied) << "%\n";
+          }
+      }
     }
 
     os << "\n=== End TageAhead Monitor ===\n\n";

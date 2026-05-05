@@ -1017,6 +1017,18 @@ struct TageDirectImpl : predictor {
   static constexpr u64 P1_INDEX_BITS = td::clog2(P1_TABLE_SIZE_V);
   static constexpr u64 LINEADDR_BITS = MAX_IDX_BITS;
   static constexpr u64 EPOCH_CTR_BITS = EPOCH_CTR_BITS_V;
+
+  // GCC 15 ICE workaround: type aliases for val<COMPUTED_CONSTEXPR>
+  using vLI  = val<LOG_LINEINST>;
+  using vLL  = val<LOG_LANES>;
+  using vPI  = val<P1_INDEX_BITS>;
+  using vMI  = val<MAX_IDX_BITS>;
+  using vMT  = val<MAX_TAG_WIDTH>;
+  using vMH  = val<MAX_HTAGBITS>;
+  using vEC  = val<EPOCH_CTR_BITS>;
+  using vNT  = val<NUM_TABLES>;
+  using vNT1 = val<NUM_TABLES + 1>;
+  using vLA  = val<LANES>;
   static constexpr u64 PATHBITS = PATH_BITS_V;
 
   static constexpr bool USE_PROB_DECAY = (DECAY_CTR_V > 0);
@@ -1121,7 +1133,7 @@ struct TageDirectImpl : predictor {
       rank; // one-hot: rank of current branch in block (gshareN_ahead pattern)
 
   // P1 storage
-  hcm::ram<val<LANES>, P1_ENTRIES> p1_pred{"P1 pred"};
+  hcm::ram<vLA, P1_ENTRIES> p1_pred{"P1 pred"};
   zone UPDATE_ONLY;
   hcm::ram<val<1>, P1_ENTRIES> p1_hyst[N]{"P1 hyst"};
 
@@ -1210,14 +1222,14 @@ struct TageDirectImpl : predictor {
     true_block.fanout(hard<4>{});
 
     // Block entry: numeric offset (gshareN_ahead_best pattern)
-    block_entry = select(true_block, val<LOG_LINEINST>{inst_pc >> 2},
-                         val<LOG_LINEINST>{block_entry + block_size});
+    block_entry = select(true_block, vLI{inst_pc >> 2},
+                         vLI{block_entry + block_size});
     block_entry.fanout(hard<LANES + 2>{});
 
     // Lane scrambling
     rank = select(true_block, val<N + 1>{1}, rank << num_branch);
     rank.fanout(hard<N + 2>{});
-    X = select(true_block, val<LOG_LANES>{inst_pc >> 2}.decode().concat(),
+    X = select(true_block, vLL{inst_pc >> 2}.decode().concat(),
                X.rotate_left(num_branch));
     X.fanout(hard<LANES>{});
 
@@ -1226,13 +1238,13 @@ struct TageDirectImpl : predictor {
       global_history1.fanout(hard<2>{});
     }
     execute_if(true_block, [&]() {
-      val<P1_INDEX_BITS> lineaddr = inst_pc >> 2;
+      vPI lineaddr = inst_pc >> 2;
       if constexpr (P1_USE_GSHARE_V) {
         if constexpr (P1_HIST_V <= P1_INDEX_BITS) {
-          index1 = lineaddr ^ (val<P1_INDEX_BITS>{global_history1}
+          index1 = lineaddr ^ (vPI{global_history1}
                                << (P1_INDEX_BITS - P1_HIST_V));
         } else {
-          index1 = global_history1.make_array(val<P1_INDEX_BITS>{})
+          index1 = global_history1.make_array(vPI{})
                        .append(lineaddr)
                        .fold_xor();
         }
@@ -1279,7 +1291,7 @@ struct TageDirectImpl : predictor {
     for (u64 i = 0; i < NUM_TABLES; i++) {
       if constexpr (USE_PATH_HIST_V) {
         gindex[i] =
-            lineaddr ^ gfolds.get_idx_fold(i) ^ val<MAX_IDX_BITS>{path_hist};
+            lineaddr ^ gfolds.get_idx_fold(i) ^ vMI{path_hist};
       } else {
         gindex[i] = lineaddr ^ gfolds.get_idx_fold(i);
       }
@@ -1324,12 +1336,12 @@ struct TageDirectImpl : predictor {
 
     // Compute hashed tags (parallel with RAM reads)
     for (u64 i = 0; i < NUM_TABLES; i++) {
-      htag[i] = val<MAX_HTAGBITS>{lineaddr}.reverse() ^ gfolds.get_tag_fold(i);
+      htag[i] = vMH{lineaddr}.reverse() ^ gfolds.get_tag_fold(i);
     }
     htag.fanout(hard<2>{});
 
     // Gather prediction bits per table
-    val<NUM_TABLES> gpreds = [&]() -> val<NUM_TABLES> {
+    vNT gpreds = [&]() -> vNT {
       if constexpr (MAX_CTR_WIDTH == 1) {
         return readc.concat();
       } else {
@@ -1344,7 +1356,7 @@ struct TageDirectImpl : predictor {
     // Per-rank preds: P1 gshare as fallback (position NUM_TABLES = bimodal
     // slot)
     pred.fanout(hard<LANES>{});
-    arr<val<NUM_TABLES + 1>, LANES> preds = [&](u64 r) {
+    arr<vNT1, LANES> preds = [&](u64 r) {
       return concat(pred[r], gpreds);
     };
     preds.fanout(hard<2 * LANES>{});
@@ -1360,7 +1372,7 @@ struct TageDirectImpl : predictor {
     // Per-rank tag match
     static_loop<LANES>([&]<u64 R>() {
       arr<val<1>, NUM_TABLES> tagcmp = [&](int i) {
-        return val<LOG_LANES>{readt[i] >> MAX_HTAGBITS} == hard<R>{};
+        return vLL{readt[i] >> MAX_HTAGBITS} == hard<R>{};
       };
       match[R] =
           concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp_reg.concat());
@@ -1392,7 +1404,7 @@ struct TageDirectImpl : predictor {
       arr<val<1>, NUM_TABLES> weakctr = [&](int i) {
         return readh[i] == hard<0>{};
       };
-      val<NUM_TABLES> coldctr = notumask & weakctr.fo1().concat();
+      vNT coldctr = notumask & weakctr.fo1().concat();
       coldctr.fanout(hard<LANES>{});
       val<1> metasign = (meta[METAPIPE_V - 1] >= hard<0>{});
       metasign.fanout(hard<LANES>{});
@@ -1524,7 +1536,7 @@ struct TageDirectImpl : predictor {
     // No RAM access here.
 
     // last_rank: which lane held the last conditional branch in this block
-    val<LOG_LANES> last_rank = val<LOG_LANES>{num_branch - 1};
+    vLL last_rank = vLL{num_branch - 1};
     last_rank.fanout(hard<4 * NUM_TABLES + 2>{});
 
     // Per-lane: was this lane used by a branch in this block?
@@ -1544,14 +1556,14 @@ struct TageDirectImpl : predictor {
     branch_taken.fanout(hard<3>{});
 
     // Restrict match vectors to lanes that actually had branches
-    arr<val<NUM_TABLES + 1>, LANES> actual_match1 = [&](u64 r) {
-      return select(is_branch[r], match1[r], val<NUM_TABLES + 1>{0});
+    arr<vNT1, LANES> actual_match1 = [&](u64 r) {
+      return select(is_branch[r], match1[r], vNT1{0});
     };
     actual_match1.fanout(hard<2>{});
 
     // primary_mask: OR of all per-lane provider matches — tells which
     // TAGE tables are the provider for at least one branch
-    val<NUM_TABLES> primary_mask = actual_match1.fold_or();
+    vNT primary_mask = actual_match1.fold_or();
     primary_mask.fanout(hard<2>{});
     arr<val<1>, NUM_TABLES> primary = primary_mask.make_array(val<1>{});
     primary.fanout(hard<3>{});
@@ -1563,10 +1575,10 @@ struct TageDirectImpl : predictor {
     static_loop<NUM_TABLES>([&]<u64 I>() {
       using Table = std::tuple_element_t<I, Tables>;
       static constexpr u64 PER_HTAG = Table::tag_width - LOG_LANES;
-      last_tagcmp_reg[I] = (val<LOG_LANES>{readt[I] >> PER_HTAG} == last_rank)
+      last_tagcmp_reg[I] = (vLL{readt[I] >> PER_HTAG} == last_rank)
                          & (val<PER_HTAG>{readt[I]} == val<PER_HTAG>{htag[I]});
     });
-    val<NUM_TABLES + 1> last_match1 =
+    vNT1 last_match1 =
         last_tagcmp_reg.fo1().append(1).concat().one_hot();
     if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_MISS)
       last_match1.fanout(hard<3>{});
@@ -1589,10 +1601,10 @@ struct TageDirectImpl : predictor {
       }
     }();
     alloc_trigger.fanout(hard<5>{});
-    val<NUM_TABLES> mispmask = alloc_trigger.replicate(hard<NUM_TABLES>{}).concat();
+    vNT mispmask = alloc_trigger.replicate(hard<NUM_TABLES>{}).concat();
 
     // Allocation action: probabilistic gating of allocation attempts
-    val<NUM_TABLES> gated_mispmask = [&]() -> val<NUM_TABLES> {
+    vNT gated_mispmask = [&]() -> vNT {
       if constexpr (AllocCfg::ALLOC_ACTION == AllocAction::STANDARD) {
         return mispmask;
       } else if constexpr (AllocCfg::ALLOC_ACTION == AllocAction::FILTERED) {
@@ -1609,16 +1621,16 @@ struct TageDirectImpl : predictor {
     }();
 
     // postmask: tables above the provider (candidates for allocation)
-    val<NUM_TABLES> postmask = [&]() -> val<NUM_TABLES> {
+    vNT postmask = [&]() -> vNT {
       if constexpr (AllocCfg::PROB_START > 0) {
         val<2> rstart = val<2>{static_cast<u64>(std::rand())};
-        val<NUM_TABLES> base = gated_mispmask & val<NUM_TABLES>(last_match1 - 1);
-        val<NUM_TABLES> skip1 = base & val<NUM_TABLES>(base - 1);
-        val<NUM_TABLES> skip2 = skip1 & val<NUM_TABLES>(skip1 - 1);
+        vNT base = gated_mispmask & vNT(last_match1 - 1);
+        vNT skip1 = base & vNT(base - 1);
+        vNT skip2 = skip1 & vNT(skip1 - 1);
         return select(rstart == hard<0>{}, skip2,
                       select(rstart == hard<1>{}, skip1, base));
       } else {
-        return gated_mispmask & val<NUM_TABLES>(last_match1 - 1);
+        return gated_mispmask & vNT(last_match1 - 1);
       }
     }();
     if constexpr (AllocCfg::UCTR_POLICY == UctrPolicy::PENALTY_NA)
@@ -1627,7 +1639,7 @@ struct TageDirectImpl : predictor {
       postmask.fanout(hard<2>{});
 
     // candallocmask: tables that are both above provider AND have u=0
-    val<NUM_TABLES> candallocmask = [&]() -> val<NUM_TABLES> {
+    vNT candallocmask = [&]() -> vNT {
       if constexpr (AllocCfg::CONF_GATE) {
         arr<val<1>, NUM_TABLES> weak_entry = [&](u64 i) -> val<1> {
           if constexpr (MAX_CTR_WIDTH == 1) return val<1>{1};
@@ -1644,32 +1656,32 @@ struct TageDirectImpl : predictor {
       }
     }();
     candallocmask.fanout(hard<2>{});
-    val<NUM_TABLES> collamask_raw = candallocmask.reverse();
+    vNT collamask_raw = candallocmask.reverse();
     // Apply target policy functor (may skip closest candidates)
     u64 ap_val = [&]() -> u64 { if constexpr (ALLOC_PRESS_W > 0) return alloc_pressure; else return 0; }();
     u64 acp_val = [&]() -> u64 { if constexpr (ACC_PRESS_W > 0) return accuracy_pressure; else return 0; }();
-    val<NUM_TABLES> collamask = AllocCfg::TARGET_POLICY::template apply<NUM_TABLES>(
+    vNT collamask = AllocCfg::TARGET_POLICY::template apply<NUM_TABLES>(
         collamask_raw, ap_val, acp_val);
     collamask.fanout(hard<2>{});
-    val<NUM_TABLES> collamask1 = collamask.one_hot();
+    vNT collamask1 = collamask.one_hot();
     collamask1.fanout(hard<3>{});
 
     // allocate[i]: final per-table allocation decision (one-hot or two-hot)
     arr<val<1>, NUM_TABLES> allocate = [&]() -> arr<val<1>, NUM_TABLES> {
       if constexpr (AllocCfg::MAX_ALLOC >= 2) {
-        val<NUM_TABLES> pick2 = [&]() -> val<NUM_TABLES> {
-          val<NUM_TABLES> basic2 = (collamask ^ collamask1).one_hot();
+        vNT pick2 = [&]() -> vNT {
+          vNT basic2 = (collamask ^ collamask1).one_hot();
           if constexpr (AllocCfg::NON_CONSECUTIVE) {
-            val<NUM_TABLES> neighbors = (collamask1 << 1) | (collamask1 >> 1);
-            val<NUM_TABLES> nc_mask = (collamask ^ collamask1) & ~neighbors;
-            val<NUM_TABLES> nc_pick = nc_mask.reverse().one_hot();
+            vNT neighbors = (collamask1 << 1) | (collamask1 >> 1);
+            vNT nc_mask = (collamask ^ collamask1) & ~neighbors;
+            vNT nc_pick = nc_mask.reverse().one_hot();
             return select(nc_mask != hard<0>{}, nc_pick, basic2);
           } else { return basic2; }
         }();
         return (collamask1 | pick2).reverse().make_array(val<1>{});
       } else {
-        val<NUM_TABLES> collamask2 = (collamask ^ collamask1).one_hot();
-        val<NUM_TABLES> collamask12 =
+        vNT collamask2 = (collamask ^ collamask1).one_hot();
+        vNT collamask12 =
             select(val<2>{std::rand()} == hard<0>{}, collamask2.fo1(), collamask1);
         return collamask12.fo1().reverse().make_array(val<1>{});
       }
@@ -1681,8 +1693,8 @@ struct TageDirectImpl : predictor {
     // bdir[i]: branch direction for the rank stored in table i's tag.
     // On allocation, uses last_rank instead.
     arr<val<1>, NUM_TABLES> bdir = [&](u64 i) {
-      val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
-      val<LOG_LANES> use_rank = select(allocate[i], last_rank, stored_rank.fo1());
+      vLL stored_rank = readt[i] >> MAX_HTAGBITS;
+      vLL use_rank = select(allocate[i], last_rank, stored_rank.fo1());
       return branch_dir.select(use_rank);
     };
     bdir.fanout(hard<2>{});
@@ -1700,13 +1712,13 @@ struct TageDirectImpl : predictor {
         if constexpr (MAX_CTR_WIDTH == 1) return readc[i];
         else return readc[i] >> hard<MAX_CTR_WIDTH - 1>{};
       }();
-      val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
+      vLL stored_rank = readt[i] >> MAX_HTAGBITS;
       return pred_dir != pred2_tage.select(stored_rank.fo1());
     };
 
     // goodpred[i]: was this table's prediction correct for its stored rank?
     arr<val<1>, NUM_TABLES> goodpred = [&](u64 i) {
-      val<LOG_LANES> stored_rank = readt[i] >> MAX_HTAGBITS;
+      vLL stored_rank = readt[i] >> MAX_HTAGBITS;
       return (stored_rank.fo1() != last_rank) | correct_pred;
     };
     goodpred.fanout(hard<2>{});
@@ -1721,8 +1733,8 @@ struct TageDirectImpl : predictor {
     g_weak.fanout(hard<2>{});
 
     // P1 vs P2 disagreement — need extra cycle to update P1
-    val<LANES> p1_concat = pred.concat();
-    val<LANES> disagree_mask = (p1_concat ^ p2) & is_branch.concat();
+    vLA p1_concat = pred.concat();
+    vLA disagree_mask = (p1_concat ^ p2) & is_branch.concat();
     disagree_mask.fanout(hard<2>{});
 
     // U-bit clear helpers (combinational)
@@ -1737,7 +1749,7 @@ struct TageDirectImpl : predictor {
       noalloc.fanout(hard<3>{});
     else
       noalloc.fanout(hard<2>{});
-    val<NUM_TABLES> uclearmask =
+    vNT uclearmask =
         postmask & noalloc.replicate(hard<NUM_TABLES>{}).concat();
     arr<val<1>, NUM_TABLES> uclear = uclearmask.fo1().make_array(val<1>{});
     uclear.fanout(hard<2>{});
@@ -1749,15 +1761,15 @@ struct TageDirectImpl : predictor {
     // block. access[i] = OR of all X.rotate_left(branch_rank) masks — 1 if lane
     // i was used.
     arr<val<1>, LANES> access =
-        arr<val<LANES>, LANES>{[&](u64 i) -> val<LANES> {
-          return X.rotate_left(i) & val<LANES>{-(i < num_branch)};
+        arr<vLA, LANES>{[&](u64 i) -> vLA {
+          return X.rotate_left(i) & vLA{-(i < num_branch)};
         }}.fold_or()
             .make_array(val<1>{});
 
     // Combinational: identify the lane that holds the mispredicted branch.
     // misp_bank is a one-hot mask ANDed with mispredict — all zero on correct
     // prediction.
-    val<LANES> misp_bank = X.rotate_left(num_branch - 1) &
+    vLA misp_bank = X.rotate_left(num_branch - 1) &
                            mispredict.replicate(hard<LANES>{}).concat();
     arr<val<1>, LANES> mispredicted = misp_bank.fo1().make_array(val<1>{});
     mispredicted.fanout(hard<2>{});
@@ -2123,7 +2135,7 @@ struct TageDirectImpl : predictor {
     // UctrPolicy dispatch: compute uctr increment signal
     val<1> uctr_incr = [&]() -> val<1> {
       if constexpr (AllocCfg::UCTR_POLICY == UctrPolicy::FARALLOC) {
-        val<NUM_TABLES> allocmask1 = collamask1.reverse();
+        vNT allocmask1 = collamask1.reverse();
         allocmask1.fanout(hard<2>{});
         return (((last_match1 >> 3) | allocmask1).one_hot() ^ allocmask1) == hard<0>{};
       } else if constexpr (AllocCfg::UCTR_POLICY == UctrPolicy::NOALLOC) {

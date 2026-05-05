@@ -5,7 +5,7 @@
 #include "predictors/custom/TageAhead.hpp"
 #include "predictors/custom/TageAheadHC.hpp"
 #include "predictors/custom/TageDirect.hpp"
-#include "predictors/custom/TageDirectBim.hpp"
+// #include "predictors/custom/TageDirectBim.hpp"
 #include "predictors/experiment_perceptron.hpp"
 #include "predictors/gshare.hpp"
 #include "predictors/gshareN.hpp"
@@ -23,14 +23,7 @@ template <auto... Args> using perceptron = experiment_perceptron<Args...>;
 // Competition configs: 1-cycle and 2-cycle tracks
 // ============================================================================
 
-// 1-cycle config: 14 tables, GradedSize 2048→512, P2 ≈ 0.99
-using TageAhead1C =
-    TageAhead<TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
-                            ta::UniformTag<11>, ta::GradedSize<512, 2048>>,
-              7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,
-              UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6,
-              2, 1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,
-              SiblingPolicy::ALL>;
+// 1-cycle config: see TageAhead1C typedef below TA1C_BASE macro
 
 // ============================================================================
 // Sweep helpers: 1C base macro, parameterized by AllocConfig
@@ -38,10 +31,32 @@ using TageAhead1C =
 #define TA1C_BASE(ALLOC_CFG)                                                   \
   TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
-      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      7, false, /* BR_P_ENTRY=N, INTERLEAVED=false */                          \
+      2, 2,                                                                    \
       UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
       1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
       0, 10, 10
+
+using TageAhead1C = TageAhead<TA1C_BASE(TAAllocPressSkip)>;
+
+// BR_P_ENTRY sweep: test per-group tag encoding
+#define TA1C_BPE(BPE, INTLV, ALLOC_CFG)                                       \
+  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      BPE, INTLV,                                                              \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
+      0, 10, 10
+
+using TA1C_BPE4 = TageAhead<TA1C_BPE(4, false, TAAllocPressSkip)>;  // NUM_GROUPS=2
+using TA1C_BPE2 = TageAhead<TA1C_BPE(2, false, TAAllocPressSkip)>;  // NUM_GROUPS=4
+using TA1C_BPE1 = TageAhead<TA1C_BPE(1, false, TAAllocPressSkip)>;  // NUM_GROUPS=7
+using TA1C_BPE4I = TageAhead<TA1C_BPE(4, true, TAAllocPressSkip)>;  // NUM_GROUPS=2, interleaved
+using TA1C_BPE2I = TageAhead<TA1C_BPE(2, true, TAAllocPressSkip)>;  // NUM_GROUPS=4, interleaved
+using TA1C_BPE1I = TageAhead<TA1C_BPE(1, true, TAAllocPressSkip)>;  // NUM_GROUPS=7, interleaved
 
 // S1 base with variable SecTagPolicy (STP)
 // S1 decay params + all defaults through REVERSE_TABLE_ORDER, then STP
@@ -82,6 +97,7 @@ using TageAhead1C =
       1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
       0, 10, 10
 
+#if 0 // temporarily disabled for FLOORPLAN build
 // ============================================================================
 // Sweep 4: Sec-tag policy tuning on S1 base
 // ============================================================================
@@ -552,8 +568,35 @@ using HS_N2_L256_H200 = TageAhead<HISTSWEEP(2, 256, 8, 200)>;
 using HS_N2_L256_H400 = TageAhead<HISTSWEEP(2, 256, 16, 400)>;
 using HS_N2_L256_H600 = TageAhead<HISTSWEEP(2, 256, 24, 600)>;
 
+#endif // #if 0
+
+// ============================================================================
+// TageDirect matching TageAheadHC structural params (no ahead pipeline)
+// ============================================================================
+using TD_HC_TC = td::TDTableConfig<14, 1024, 11, 1, 2, 2, 8, 200, 1,
+                                    td::HistSeries::GEOMETRIC,
+                                    td::UniformTag<11>,
+                                    td::StepSize<1024, 2048, 5>>;
+using TD_HC = TageDirect<TD_HC_TC,
+                         td::TDDefaultAllocConfig,
+                         256,   // LINEINST
+                         7,     // N
+                         8, 2,  // DECAY_CTR (8-bit LFSR), DECAY_GRAN
+                         td::TDDecayMild,
+                         true, 8192, // P1_USE_GSHARE, P1_TABLE_SIZE
+                         6,     // P1_HIST
+                         true, 4, // USE_META, METABITS
+                         2,     // METAPIPE
+                         false, // USE_PATH_HIST
+                         27, 6, // PATH_HIST_WIDTH, PATH_BITS
+                         td::XORFold,
+                         8, 1,  // RWRAM_BANKS=8, BANK_SHIFT=1
+                         8,     // EPOCH_CTR_BITS
+                         true,  // SHARED_HYS
+                         false>; // USE_DIR_HIST
+
 #ifdef PREDICTOR
 using branch_predictor = PREDICTOR;
 #else
-using branch_predictor = TageAhead1C;
+using branch_predictor = TageAheadHC;
 #endif

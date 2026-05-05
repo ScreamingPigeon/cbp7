@@ -62,6 +62,8 @@ template <
     typename SecTagHashFn =
         ta::DefaultSecTagHash, // sec_tag hash: PC → val<SEC_TAG_BITS>
     u64 CTR_WIDTH = 1,         // prediction counter width per lane
+    u64 BR_P_ENTRY = N,        // branches per entry (N=all share, 1=each independent)
+    bool INTERLEAVED = false,  // grouping: false=contiguous, true=interleaved
     u64 HYST_WIDTH = 2,        // hysteresis width (separate from ctr)
     u64 U_WIDTH = 2,           // usefulness counter width
     UMispPolicy U_MISP = UMispPolicy::UNTOUCHED, // u-bit on provider mispredict
@@ -121,6 +123,8 @@ struct TageAhead : predictor {
   //                   (USE_SEC_TAG && NUM_PATHS == (u64(1) << SEC_TAG_BITS)),
   //               "NUM_PATHS must be 1 or 2^SEC_TAG_BITS with USE_SEC_TAG");
   static_assert(NUM_PATHS <= 4, "NUM_PATHS > 4 not yet supported");
+  static_assert(BR_P_ENTRY >= 1 && BR_P_ENTRY <= N,
+                "BR_P_ENTRY must be in [1, N]");
 
   static constexpr u64 NT = TableCfg::NUM_TABLES;
   static constexpr u64 LOGLINEINST = ta::clog2(LINEINST);
@@ -128,8 +132,65 @@ struct TageAhead : predictor {
   static constexpr u64 MAX_TAG_WIDTH = ta::array_max(TableCfg::TAG_WIDTH);
   static constexpr u64 MAX_TABLE_SIZE = ta::array_max(TableCfg::TABLE_SIZE);
   static constexpr u64 MAX_IDX_BITS = ta::clog2(MAX_TABLE_SIZE);
+  static constexpr u64 MAX_BANKS = ta::array_max(TableCfg::RWRAM_BANKS);
 
   static constexpr u64 MATCH_BITS = NT + 1; // NT tables + fallback
+
+  // ---- Per-group tag encoding (BR_P_ENTRY) ----
+  static constexpr u64 NUM_GROUPS =
+      (BR_P_ENTRY == N) ? 1 : (N + BR_P_ENTRY - 1) / BR_P_ENTRY;
+  static constexpr u64 GROUP_BITS =
+      (NUM_GROUPS > 1) ? ta::clog2(NUM_GROUPS) : 0;
+  static constexpr u64 MAX_HTAG_WIDTH = MAX_TAG_WIDTH - GROUP_BITS;
+  // Ensure enough tag bits remain for htag after group_id
+  static_assert(GROUP_BITS == 0 || MAX_TAG_WIDTH > GROUP_BITS,
+                "TAG_WIDTH must be > GROUP_BITS when BR_P_ENTRY < N");
+  // Multi-path × multi-group not yet supported
+  static_assert(NUM_PATHS == 1 || NUM_GROUPS == 1,
+                "NUM_PATHS > 1 with NUM_GROUPS > 1 not yet supported");
+
+  // Map branch position → group index
+  static constexpr auto BRANCH_TO_GROUP = []() {
+    std::array<u64, N> b2g{};
+    for (u64 i = 0; i < N; i++) {
+      if constexpr (INTERLEAVED)
+        b2g[i] = i % NUM_GROUPS;
+      else
+        b2g[i] = i / BR_P_ENTRY;
+    }
+    return b2g;
+  }();
+
+  // Map branch position → position within its group
+  static constexpr auto BRANCH_IN_GROUP = []() {
+    std::array<u64, N> big{};
+    for (u64 i = 0; i < N; i++) {
+      if constexpr (INTERLEAVED)
+        big[i] = i / NUM_GROUPS;
+      else
+        big[i] = i % BR_P_ENTRY;
+    }
+    return big;
+  }();
+
+  // Number of branches in each group (last group may be smaller)
+  static constexpr auto GROUP_SIZE = []() {
+    std::array<u64, NUM_GROUPS> gs{};
+    for (u64 i = 0; i < N; i++)
+      gs[BRANCH_TO_GROUP[i]]++;
+    return gs;
+  }();
+
+  // First branch index in each group (for contiguous fb extraction)
+  static constexpr auto GROUP_START = []() {
+    std::array<u64, NUM_GROUPS> s{};
+    for (u64 g = 0; g < NUM_GROUPS; g++) {
+      for (u64 i = 0; i < N; i++) {
+        if (BRANCH_TO_GROUP[i] == g) { s[g] = i; break; }
+      }
+    }
+    return s;
+  }();
 
   // ---- Sec-tag adaptive benefit counter ----
   static constexpr u64 BENEFIT_WIDTH = [] {
@@ -149,8 +210,10 @@ struct TageAhead : predictor {
     return fo;
   }();
 
-  // Prediction bits per entry: one CTR_WIDTH counter per branch
-  static constexpr u64 PRED_BITS = N * CTR_WIDTH;
+  // Prediction bits per entry: one CTR_WIDTH counter per branch-in-group
+  static constexpr u64 PRED_BITS = BR_P_ENTRY * CTR_WIDTH;
+  // Fallback stays N-wide (direct-mapped, no tags/groups)
+  static constexpr u64 FB_PRED_BITS = N * CTR_WIDTH;
 
   // ======================================================================
   // Predict-path Registers (declared before tables → at first table loc)
@@ -161,8 +224,8 @@ struct TageAhead : predictor {
   // ---- Fallback Predictor (ahead-pipelined) ----
   // USE_GSHARE=false: bimodal (PC-indexed)
   // USE_GSHARE=true:  gshare (PC ^ folded_history indexed)
-  reg<PRED_BITS> prefetch_fb;
-  reg<PRED_BITS> current_fb;
+  reg<FB_PRED_BITS> prefetch_fb;
+  reg<FB_PRED_BITS> current_fb;
   static constexpr u64 FB_IDX_BITS = ta::clog2(FB_CAPACITY);
   reg<FB_IDX_BITS> prefetch_fb_idx;
   reg<FB_IDX_BITS> current_fb_idx;
@@ -198,13 +261,15 @@ struct TageAhead : predictor {
   // ---- Pipeline Regs [NT] ----
   // prefetch_*: written in predict1 (ahead reads for next block)
   reg<MAX_TAG_WIDTH> prefetch_tag[NT];
-  reg<1> prefetch_tag_hit[NT]; // primary tag match (computed off crit path)
+  reg<1> prefetch_tag_hit[NT]; // full tag match (NUM_GROUPS==1) or htag match
   reg<PRED_BITS> prefetch_pred[NT];
   reg<SEC_TAG_BITS> prefetch_sec[NT];
   reg<MAX_IDX_BITS> prefetch_idx[NT];
   reg<std::max(u64(1), HYST_WIDTH)> prefetch_hyst[NT];
   reg<U_WIDTH> prefetch_u[NT];
   reg<MAX_TAG_WIDTH> prefetch_ctag[NT]; // computed tag for allocation piping
+  // Per-group tag encoding: stored group_id extracted from tag upper bits
+  reg<std::max(u64(1), GROUP_BITS)> prefetch_group_id[NT];
 
   // current_*: shifted from prefetch, used for prediction
   reg<MAX_TAG_WIDTH> current_tag[NT];
@@ -215,6 +280,7 @@ struct TageAhead : predictor {
   reg<std::max(u64(1), HYST_WIDTH)> current_hyst[NT];
   reg<U_WIDTH> current_u[NT];
   reg<MAX_TAG_WIDTH> current_ctag[NT]; // piped computed tag for allocation
+  reg<std::max(u64(1), GROUP_BITS)> current_group_id[NT];
 
   // ---- Prediction reg (shared by
   // predict1/reuse_predict1/predict2/reuse_predict2) ----
@@ -230,8 +296,8 @@ struct TageAhead : predictor {
   // ======================================================================
   // ---- Table tuple (per-table tag width and table size) ----
   using Tables = typename TAMakeTableTuple<
-      TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, N, SHARED_HYS,
-      REVERSE_TABLE_ORDER, std::make_index_sequence<NT>>::type;
+      TableCfg, CTR_WIDTH, HYST_WIDTH, U_WIDTH, SEC_TAG_BITS, BR_P_ENTRY,
+      SHARED_HYS, REVERSE_TABLE_ORDER, std::make_index_sequence<NT>>::type;
   Tables tables;
 
   // Access logical table I (remaps through reversed storage when needed)
@@ -260,19 +326,20 @@ struct TageAhead : predictor {
       train_pred[NT]; // per-table pred for per-table training signals
   reg<std::max(u64(1), HYST_WIDTH)> train_hyst[NT];
   reg<U_WIDTH> train_u[NT];
-  reg<PRED_BITS> train_fb;
+  reg<FB_PRED_BITS> train_fb;
   reg<FB_IDX_BITS> train_fb_idx;
   reg<1> train_fb_hyst; // piped fb hyst for reconciliation
   reg<ALLOC_PC_BITS> train_pc;
   reg<MAX_TAG_WIDTH> train_ctag[NT]; // piped computed tag for allocation
   reg<SEC_TAG_BITS> train_sec_tag;   // piped sec_tag for allocation writes
+  reg<std::max(u64(1), GROUP_BITS)> train_group_id[NT]; // per-group tag encoding
 
   // Piped resolution values from previous update_cycle (block A's resolution)
-  reg<MATCH_BITS> train_match1;
-  reg<PRED_BITS> train_provider_pred;
-  reg<1>
-      train_provider_weak; // newly-allocated weakness (hyst==0 & u==0) — meta
-  reg<1> train_altdiff;
+  // When NUM_GROUPS > 1, these are per-group arrays.
+  reg<MATCH_BITS> train_match1[NUM_GROUPS];
+  reg<PRED_BITS> train_provider_pred[NUM_GROUPS];
+  reg<1> train_provider_weak[NUM_GROUPS];
+  reg<1> train_altdiff[NUM_GROUPS];
 
   // Guard: skip training until piped resolution regs have been populated
   reg<1> train_valid = 0;
@@ -294,7 +361,7 @@ struct TageAhead : predictor {
       DECAY_ENABLE ? ta::array_max(DECAY_LFSR_WIDTHS) : 1;
 
 #ifdef TAGE_MONITOR
-  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY> mon;
+  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, NUM_GROUPS, MAX_BANKS> mon;
   ~TageAhead() {
     mon.print_summary();
     print_params(std::cerr);
@@ -410,6 +477,7 @@ struct TageAhead : predictor {
   val<1> predict1([[maybe_unused]] val<64> inst_pc) {
 #ifdef TAGE_MONITOR
     mon.table_sizes = TableCfg::TABLE_SIZE;
+    mon.table_bank_shift = TableCfg::RWRAM_BANK_SHIFT;
     mon.record_predict1();
     mon.shadow_block_pc = static_cast<u64>(inst_pc);
 #endif
@@ -453,10 +521,20 @@ struct TageAhead : predictor {
 
       auto stored_tag = t.tag_ram.read(idx);
       // NOTE: @prakhar @claude audit
-      stored_tag.fanout(hard<2>{});
+      stored_tag.fanout(hard<(NUM_GROUPS > 1) ? 3 : 2>{});
       prefetch_tag[I] = stored_tag;
-      prefetch_tag_hit[I] =
-          val<MAX_TAG_WIDTH>{stored_tag} == val<MAX_TAG_WIDTH>{computed_tag};
+      if constexpr (NUM_GROUPS > 1) {
+        // Split tag comparison: compare only htag portion (lower bits)
+        static constexpr u64 PER_HTAG = t.tag_width - GROUP_BITS;
+        prefetch_tag_hit[I] =
+            val<PER_HTAG>{stored_tag} == val<PER_HTAG>{computed_tag};
+        // Extract stored group_id from upper bits of tag
+        prefetch_group_id[I] =
+            val<GROUP_BITS>{stored_tag >> PER_HTAG};
+      } else {
+        prefetch_tag_hit[I] =
+            val<MAX_TAG_WIDTH>{stored_tag} == val<MAX_TAG_WIDTH>{computed_tag};
+      }
       prefetch_ctag[I] = computed_tag;
       prefetch_pred[I] = t.pred_ram.read(idx);
       if constexpr (USE_SEC_TAG)
@@ -588,6 +666,8 @@ struct TageAhead : predictor {
       train_u[I] = current_u[I].fo1();
       train_ctag[I] = current_ctag[I].fo1();
       train_tag_hit[I] = current_tag_hit[I].fo1();
+      if constexpr (NUM_GROUPS > 1)
+        train_group_id[I] = current_group_id[I].fo1();
       if constexpr (USE_SEC_TAG) {
         train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I].fo1()} ==
                             val<SEC_TAG_BITS>{curr_sec_tag});
@@ -607,23 +687,28 @@ struct TageAhead : predictor {
       train_sec_tag = curr_sec_tag;
 
     // Fanout on prefetch_* regs: read twice (shift + resolution chain bypass)
+    // Resolution chains: NUM_PATHS when NUM_GROUPS==1, NUM_GROUPS when NUM_PATHS==1
+    static constexpr u64 NUM_CHAINS = std::max(NUM_PATHS, NUM_GROUPS);
     static_loop<NT>([&]<u64 I>() {
       // NOTE: @prakhar @claude audit
       prefetch_tag_hit[I].fanout(
-          hard<1 + NUM_PATHS>{}); // shift + full_hits (1 per chain)
+          hard<1 + NUM_CHAINS>{}); // shift + full_hits (1 per chain)
       prefetch_pred[I].fanout(
-          hard<1 + NUM_PATHS>{}); // shift + table_preds (1 per chain)
+          hard<1 + NUM_CHAINS>{}); // shift + table_preds (1 per chain)
       // NOTE: @prakhar @claude audit
       prefetch_hyst[I].fanout(hard<2>{}); // shift + weak_mask
       // NOTE: @prakhar @claude audit
       prefetch_u[I].fanout(hard<2>{}); // shift + weak_mask
       if constexpr (USE_SEC_TAG)
         prefetch_sec[I].fanout(
-            hard<1 + NUM_PATHS>{}); // shift + full_hits (1 per chain)
+            hard<1 + NUM_CHAINS>{}); // shift + full_hits (1 per chain)
+      if constexpr (NUM_GROUPS > 1)
+        prefetch_group_id[I].fanout(
+            hard<1 + NUM_GROUPS>{}); // shift + group_id cmp (1 per group)
     });
     // NOTE: @prakhar @claude audit
     prefetch_fb.fanout(
-        hard<1 + NUM_PATHS>{}); // shift + table_preds (1 per chain)
+        hard<1 + NUM_CHAINS>{}); // shift + table_preds (1 per chain)
 
     static_loop<NT>([&]<u64 I>() {
       current_tag[I] = prefetch_tag[I].fo1();
@@ -635,6 +720,8 @@ struct TageAhead : predictor {
       current_hyst[I] = prefetch_hyst[I];
       current_u[I] = prefetch_u[I];
       current_ctag[I] = prefetch_ctag[I].fo1();
+      if constexpr (NUM_GROUPS > 1)
+        current_group_id[I] = prefetch_group_id[I];
     });
     current_fb = prefetch_fb;
     current_fb_idx = prefetch_fb_idx.fo1();
@@ -753,17 +840,30 @@ struct TageAhead : predictor {
 
 #ifdef TAGE_MONITOR
     for (u64 i = 0; i < NT; i++) {
+      u64 idx_val = static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]});
       if constexpr (USE_SEC_TAG) {
         // Use pre-shift values (mon_tag_hit/mon_sec_hit) to match the
         // pipeline stage being trained.  Post-shift current_sec[i] holds
         // the *next* block's prefetch data — comparing it against
         // sec_tag_now was off by one stage.
         mon.record_tag_lookup(i, mon_tag_hit[i], mon_sec_hit[i]);
+        // Per-bank: which bank did this hit land in?
+        mon.record_bank_tag_hit(i, idx_val, mon_tag_hit[i], mon_sec_hit[i]);
       } else {
-        mon.record_tag_lookup(i, static_cast<u64>(current_tag_hit[i]), false);
+        bool th = static_cast<u64>(current_tag_hit[i]);
+        mon.record_tag_lookup(i, th, false);
+        mon.record_bank_tag_hit(i, idx_val, th, false);
       }
-      mon.record_collision_check(
-          i, static_cast<u64>(val<MAX_IDX_BITS>{current_idx[i]}),
+      // Per-group tag lookup: attribute hit to the group stored in this entry
+      if constexpr (NUM_GROUPS > 1) {
+        bool th = USE_SEC_TAG ? mon_tag_hit[i] : (bool)static_cast<u64>(current_tag_hit[i]);
+        bool sh = USE_SEC_TAG ? mon_sec_hit[i] : false;
+        if (th) {
+          u64 gid = static_cast<u64>(val<GROUP_BITS>{current_group_id[i]});
+          mon.record_group_tag_lookup(gid, i, th, sh);
+        }
+      }
+      mon.record_collision_check(i, idx_val,
           static_cast<u64>(current_tag_hit[i]), mon.current_block_pc);
     }
 #endif
@@ -783,12 +883,13 @@ struct TageAhead : predictor {
       };
       return w.fo1().concat(); // rvalue → fo1 per element (each used once)
     }();
-    // weak_mask read once per resolve_chain call (NUM_PATHS calls total)
+    // weak_mask read once per resolve_chain call (NUM_CHAINS calls total)
     // NOTE: @prakhar @claude audit
-    if constexpr (NUM_PATHS >= 2)
-      weak_mask.fanout(hard<NUM_PATHS>{});
+    if constexpr (NUM_CHAINS >= 2)
+      weak_mask.fanout(hard<NUM_CHAINS>{});
 
-    auto resolve_chain = [&](arr<val<1>, NT> full_hits) {
+    auto resolve_chain = [&](arr<val<1>, NT> full_hits,
+                             val<PRED_BITS> fb_pred) {
       val<MATCH_BITS> match = concat(val<1>{1}, full_hits.fo1().concat());
       // NOTE: @prakhar @claude audit
       match.fanout(hard<3>{}); // ha(>>1) + one_hot + remainder(^match1)
@@ -808,7 +909,7 @@ struct TageAhead : predictor {
       arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
         if (i < NT)
           return val<PRED_BITS>{prefetch_pred[i]};
-        return val<PRED_BITS>{prefetch_fb};
+        return fb_pred;
       };
       // NOTE: @prakhar @claude audit: pmask + amask = 2
       table_preds.fanout(hard<2>{});
@@ -837,7 +938,7 @@ struct TageAhead : predictor {
       // weak_mask, then check nonzero. Single gate after match1 instead
       // of fold_or over NT+1 terms.
       auto pw_mask = [&]() -> val<NT> {
-        if constexpr (NUM_PATHS == 1)
+        if constexpr (NUM_CHAINS == 1)
           return weak_mask.fo1();
         else
           return weak_mask;
@@ -845,10 +946,10 @@ struct TageAhead : predictor {
       val<1> pw = (val<NT>{match1} & pw_mask.fo1()) != hard<0>{};
       // NOTE: @prakhar @claude audit: ua_comp(1) + return(1) = 2
       pw.fanout(hard<2>{});
-      // meta_use_alt: fo1() only safe for NUM_PATHS==1 (single chain call).
-      // For NUM_PATHS>1 use lvalue copy (fanout declared above).
+      // meta_use_alt: fo1() only safe for single chain call.
+      // For multi-chain use lvalue copy (fanout declared above).
       auto mua = [&]() -> val<1> {
-        if constexpr (NUM_PATHS == 1)
+        if constexpr (NUM_CHAINS == 1)
           return meta_use_alt.fo1();
         else
           return val<1>{meta_use_alt};
@@ -887,14 +988,16 @@ struct TageAhead : predictor {
           return val<1>{prefetch_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<0>{});
         };
-        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] = resolve_chain(fh0.fo1());
+        auto [m1_0, m2_0, pp0, ap0, pw0, ad0, ua0] =
+            resolve_chain(fh0.fo1(), val<PRED_BITS>{prefetch_fb});
 
         // Chain 1: stored sec_tag == 1 (compile-time constant)
         arr<val<1>, NT> fh1 = [&](u64 i) {
           return val<1>{prefetch_tag_hit[i]} &
                  (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<1>{});
         };
-        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] = resolve_chain(fh1.fo1());
+        auto [m1_1, m2_1, pp1, ap1, pw1, ad1, ua1] =
+            resolve_chain(fh1.fo1(), val<PRED_BITS>{prefetch_fb});
 
         // Fields muxed through NP select: m1, m2, pp, ap, pw, ad, ua.
         static constexpr u64 MUX_FIELDS = 7;
@@ -916,13 +1019,15 @@ struct TageAhead : predictor {
             return val<1>{prefetch_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<2>{});
           };
-          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] = resolve_chain(fh2.fo1());
+          auto [m1_2, m2_2, pp2, ap2, pw2, ad2, ua2] =
+              resolve_chain(fh2.fo1(), val<PRED_BITS>{prefetch_fb});
 
           arr<val<1>, NT> fh3 = [&](u64 i) {
             return val<1>{prefetch_tag_hit[i]} &
                    (val<SEC_TAG_BITS>{prefetch_sec[i]} == hard<3>{});
           };
-          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] = resolve_chain(fh3.fo1());
+          auto [m1_3, m2_3, pp3, ap3, pw3, ad3, ua3] =
+              resolve_chain(fh3.fo1(), val<PRED_BITS>{prefetch_fb});
 
           // 4-to-1 mux tree: derive sel directly from next_pc (bypass reg)
           val<SEC_TAG_BITS> sec_idx =
@@ -948,7 +1053,7 @@ struct TageAhead : predictor {
               mux4(ua0, ua1, ua2, ua3)};
         }
       } else {
-        // Single chain: sec-tag policy controls per-table enforcement.
+        // Single-path: sec-tag policy controls per-table enforcement.
         // sec_tag_now fanout already declared above (covers all reads)
 
         // Precompute per-table sec-tag enforcement (compile-time).
@@ -981,28 +1086,22 @@ struct TageAhead : predictor {
         }();
         if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME &&
                       SEC_ENFORCE_COUNT > 1)
-          sec_rt_gate.fanout(hard<SEC_ENFORCE_COUNT>{});
+          sec_rt_gate.fanout(hard<SEC_ENFORCE_COUNT * NUM_GROUPS>{});
 
-        arr<val<1>, NT> full_hits = [&](u64 i) {
+        // Helper: build per-table sec-tag-filtered hit, shared by all groups
+        auto sec_filtered_hit = [&](u64 i) -> val<1> {
           if constexpr (!USE_SEC_TAG || SEC_ENFORCE_COUNT == 0) {
-            // No sec-tag at all
             return val<1>{prefetch_tag_hit[i]};
           } else {
             val<1> sec_match =
                 val<SEC_TAG_BITS>{prefetch_sec[i]} ==
                 val<SEC_TAG_BITS>{sec_tag_now};
             if constexpr (!SecTagPolicy::RUNTIME) {
-              // Compile-time only: skip sec-tag for non-enforced tables
-              // sec_enforce[i] is constexpr but i is runtime — compiler
-              // unrolls the arr lambda, so this becomes a per-element branch.
               if (sec_enforce[i])
                 return val<1>{prefetch_tag_hit[i]} & sec_match;
               else
                 return val<1>{prefetch_tag_hit[i]};
             } else {
-              // Runtime gate: full_hit = tag_hit & (sec_match | !gate)
-              // For tables the policy says to skip at compile time, just
-              // return tag_hit directly (no gate needed).
               if (sec_enforce[i])
                 return val<1>{prefetch_tag_hit[i]} &
                        (sec_match | ~sec_rt_gate);
@@ -1011,19 +1110,142 @@ struct TageAhead : predictor {
             }
           }
         };
+
+        if constexpr (NUM_GROUPS == 1) {
+          // Original single-chain path
+          arr<val<1>, NT> full_hits = [&](u64 i) {
+            return sec_filtered_hit(i);
+          };
 #ifdef DEBUG_PRINT
-        std::cerr << "--- sec-tag path ---\n";
-        sec_tag_now.print("  sec_tag_now=", "\n", true, std::cerr);
-        if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME)
-          sec_rt_gate.print("  sec_rt_gate=", "\n", true, std::cerr);
-        for (u64 i = 0; i < NT; i++) {
-          std::cerr << "  sec_enforce[" << i << "]=" << sec_enforce[i];
-          full_hits[i].print("  full_hit=", "\n", true, std::cerr);
-        }
+          std::cerr << "--- sec-tag path ---\n";
+          sec_tag_now.print("  sec_tag_now=", "\n", true, std::cerr);
+          if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME)
+            sec_rt_gate.print("  sec_rt_gate=", "\n", true, std::cerr);
+          for (u64 i = 0; i < NT; i++) {
+            std::cerr << "  sec_enforce[" << i << "]=" << sec_enforce[i];
+            full_hits[i].print("  full_hit=", "\n", true, std::cerr);
+          }
 #endif
-        return resolve_chain(full_hits.fo1());
+          return resolve_chain(full_hits.fo1(), val<PRED_BITS>{prefetch_fb});
+        }
+        // NUM_GROUPS > 1: return dummy values (per-group block below does real work)
+        return std::tuple{val<MATCH_BITS>{hard<0>{}}, val<MATCH_BITS>{hard<0>{}},
+                          val<PRED_BITS>{hard<0>{}}, val<PRED_BITS>{hard<0>{}},
+                          val<1>{hard<0>{}}, val<1>{hard<0>{}}, val<1>{hard<0>{}}};
       }
     }();
+
+    if constexpr (NUM_GROUPS > 1) {
+      // ---- Per-group resolution chains ----
+      // Each group gets its own full_hits (htag_hit & group_id match & sec_tag)
+      // and its own resolve_chain call. Results stored in per-group arrays.
+
+      // Precompute sec-tag enforcement (same as single-chain path above)
+      static constexpr auto sec_enforce = []() {
+        std::array<bool, NT> a{};
+        auto fill = [&]<u64... Is>(std::index_sequence<Is...>) {
+          ((a[Is] = SecTagPolicy::template apply<Is, NT>()), ...);
+        };
+        fill(std::make_index_sequence<NT>{});
+        return a;
+      }();
+      static constexpr u64 SEC_ENFORCE_COUNT = []() {
+        u64 n = 0;
+        for (u64 i = 0; i < NT; i++) if (sec_enforce[i]) n++;
+        return n;
+      }();
+
+      [[maybe_unused]] val<1> sec_rt_gate = [&]() -> val<1> {
+        if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME &&
+                      SEC_ENFORCE_COUNT > 0) {
+          return SecTagPolicy::template gate<0, NT>(
+              val<ACC_WIDTH>{acc_ctr}, val<ALLOC_WIDTH>{alloc_ctr},
+              val<BENEFIT_REG_WIDTH>{benefit_ctr});
+        } else {
+          return val<1>{hard<1>{}};
+        }
+      }();
+      if constexpr (USE_SEC_TAG && SecTagPolicy::RUNTIME &&
+                    SEC_ENFORCE_COUNT > 1)
+        sec_rt_gate.fanout(hard<SEC_ENFORCE_COUNT * NUM_GROUPS>{});
+
+      // Extract per-group fb bits from N-wide fallback
+      auto extract_group_fb = [&]<u64 G>() -> val<PRED_BITS> {
+        // Gather BR_P_ENTRY bits for group G from the N-wide fb
+        arr<val<CTR_WIDTH>, BR_P_ENTRY> fb_bits = [&](u64 j) {
+          u64 branch_idx = (j < GROUP_SIZE[G])
+              ? [&]() {
+                  // Find the j-th branch in group G
+                  u64 count = 0;
+                  for (u64 b = 0; b < N; b++) {
+                    if (BRANCH_TO_GROUP[b] == G) {
+                      if (count == j) return b;
+                      count++;
+                    }
+                  }
+                  return u64(0); // unreachable
+                }()
+              : u64(0);
+          return val<CTR_WIDTH>{prefetch_fb >> (branch_idx * CTR_WIDTH)};
+        };
+        return fb_bits.concat();
+      };
+
+      static_loop<NUM_GROUPS>([&]<u64 G>() {
+        // Per-group full_hits: htag_hit & (group_id == G) & sec_tag
+        arr<val<1>, NT> group_hits = [&](u64 i) -> val<1> {
+          val<1> htag_ok = val<1>{prefetch_tag_hit[i]};
+          val<1> group_ok =
+              val<GROUP_BITS>{prefetch_group_id[i]} == hard<G>{};
+          val<1> base_hit = htag_ok & group_ok;
+          // Apply sec-tag filtering
+          if constexpr (!USE_SEC_TAG || SEC_ENFORCE_COUNT == 0) {
+            return base_hit;
+          } else {
+            val<1> sec_match =
+                val<SEC_TAG_BITS>{prefetch_sec[i]} ==
+                val<SEC_TAG_BITS>{sec_tag_now};
+            if constexpr (!SecTagPolicy::RUNTIME) {
+              if (sec_enforce[i])
+                return base_hit & sec_match;
+              else
+                return base_hit;
+            } else {
+              if (sec_enforce[i])
+                return base_hit & (sec_match | ~sec_rt_gate);
+              else
+                return base_hit;
+            }
+          }
+        };
+
+        val<PRED_BITS> fb_g = extract_group_fb.template operator()<G>();
+        auto [m1, m2, pp, ap, pw, ad, ua] =
+            resolve_chain(group_hits.fo1(), fb_g);
+
+        // Scatter: assign pred[I] for branches belonging to this group
+        // NOTE: @prakhar @claude audit
+        pp.fanout(hard<2>{}); // make_array + train save
+        if constexpr (GROUP_SIZE[G] >= 2)
+          ua.fanout(hard<GROUP_SIZE[G]>{}); // one per branch in group
+        arr<val<1>, PRED_BITS> pp_bits = pp.make_array(val<1>{});
+        arr<val<1>, PRED_BITS> ap_bits = ap.fo1().make_array(val<1>{});
+        static_loop<N>([&]<u64 I>() {
+          if constexpr (BRANCH_TO_GROUP[I] == G) {
+            static constexpr u64 POS = BRANCH_IN_GROUP[I];
+            pred[I] = select(ua, ap_bits[POS].fo1(), pp_bits[POS].fo1());
+          }
+        });
+
+        // Save per-group resolution → train regs
+        train_match1[G] = m1.fo1();
+        train_provider_pred[G] = pp;
+        train_provider_weak[G] = pw.fo1();
+        train_altdiff[G] = ad.fo1();
+      });
+    }
+
+    if constexpr (NUM_GROUPS == 1) {
 
     // Per-branch 1-bit scatter: split pp/ap into per-bit arrays to reduce
     // fanout on the wide values (fanout(3) + N×fo1 vs fanout(N+2) on each).
@@ -1096,9 +1318,20 @@ struct TageAhead : predictor {
           if (static_cast<u64>(pred[r]) == static_cast<u64>(branch_dir[r]))
             nc++;
         mon.record_provider_entry(prov, prov_index, num_branch, nc);
+        // Per-bank: which bank provided?
+        bool all_correct = (nc == num_branch);
+        mon.record_bank_provider(prov, prov_index, all_correct);
       }
     }
 #endif
+
+    // Save current resolution → train regs (for NEXT cycle's training)
+    train_match1[0] = match1.fo1();
+    train_provider_pred[0] = provider_pred;
+    train_provider_weak[0] = provider_weak.fo1();
+    train_altdiff[0] = altdiff.fo1();
+
+    } // end if constexpr (NUM_GROUPS == 1)
 
     // ================================================================
     // Training (for block A, using old_pred[], branch_dir[],
@@ -1142,10 +1375,22 @@ struct TageAhead : predictor {
       if constexpr (SEC_HIT_READS > 1)
         train_sec_hit[I].fanout(hard<SEC_HIT_READS>{});
       // TAG/SEC_HIT_READS==1 → use fo1() at point of use; ==0 → unreferenced
-      train_idx[I].fanout(hard<5>{}); // NOTE: @prakhar @claude audit
+      // train_group_id: sibling detection only (entry_actual_dir no longer needs it).
+      // When SIBLING_ACTIVE: 1 read in candallocmask. Otherwise unused in HW.
+      // (Monitor peeks via CHEATING_MODE are free.)
+      train_idx[I].fanout(hard<5
+#ifdef TAGE_MONITOR
+                                  + 2
+#endif
+                                  >{}); // NOTE: @prakhar @claude audit
     });
 
-    val<MATCH_BITS> t_match1 = train_match1.fo1();
+    // Select training group: the group of the last (mispredicting) branch.
+    // NUM_GROUPS==1: always 0. NUM_GROUPS>1: runtime lookup.
+    u64 train_group = (NUM_GROUPS > 1)
+        ? BRANCH_TO_GROUP[num_branch > 0 ? num_branch - 1 : 0]
+        : 0;
+    val<MATCH_BITS> t_match1 = train_match1[train_group].fo1();
     t_match1.fanout(
         hard<2 + (FARALLOC_DIST > 0 ? 1 : 0)>{}); // make_array(1) +
                                                   // alloc_base(1) [+ FARALLOC
@@ -1159,10 +1404,20 @@ struct TageAhead : predictor {
     });
     if constexpr (FB_RECONCILE)
       t_m1[NT].fanout(hard<2>{}); // NOTE: @prakhar @claude audit
-    val<PRED_BITS> t_pp = train_provider_pred.fo1();
+    // NUM_GROUPS>1: train_provider_pred[train_group] is read here AND in
+    // any_provider_wrong (which iterates all groups). Fanout all elements to 2.
+    if constexpr (NUM_GROUPS > 1)
+      for (u64 g = 0; g < NUM_GROUPS; g++)
+        train_provider_pred[g].fanout(hard<2>{});
+    val<PRED_BITS> t_pp = [&]() {
+      if constexpr (NUM_GROUPS > 1)
+        return val<PRED_BITS>{train_provider_pred[train_group]};
+      else
+        return train_provider_pred[train_group].fo1();
+    }();
     val<1> t_pw =
-        train_provider_weak.fo1(); // newly-alloc (hyst==0 & u==0) — meta
-    val<1> t_ad = train_altdiff.fo1();
+        train_provider_weak[train_group].fo1(); // newly-alloc (hyst==0 & u==0) — meta
+    val<1> t_ad = train_altdiff[train_group].fo1();
 
     // Hyst-only weakness: computed from piped regs (not resolution chain)
     // to keep it off the resolution critical path. Gates pred/hyst counter
@@ -1175,12 +1430,6 @@ struct TageAhead : predictor {
       return val<1>{0};
     };
     val<1> t_phw = t_hyst_weak_arr.fo1().fold_or();
-
-    // Save current resolution → train regs (for NEXT cycle's training)
-    train_match1 = match1.fo1();
-    train_provider_pred = provider_pred;
-    train_provider_weak = provider_weak.fo1();
-    train_altdiff = altdiff.fo1();
 
     // Read train_valid BEFORE setting it to 1 (regs may be immediate-write)
     val<1> do_train = train_valid.fo1();
@@ -1231,9 +1480,18 @@ struct TageAhead : predictor {
 #ifdef TAGE_MONITOR
     mon.record_block(static_cast<u64>(val<LOGLINEINST>{block_entry}),
                      block_size, num_branch, static_cast<u64>(mispredict));
-    for (u64 r = 0; r < num_branch; r++)
-      mon.record_outcome(r, static_cast<u64>(branch_dir[r]),
-                         r == num_branch - 1 && static_cast<u64>(mispredict));
+    for (u64 r = 0; r < num_branch; r++) {
+      bool actual = static_cast<u64>(branch_dir[r]);
+      bool is_misp = r == num_branch - 1 && static_cast<u64>(mispredict);
+      mon.record_outcome(r, actual, is_misp);
+      // Per-group: attribute this branch's outcome to its group's chain
+      if constexpr (NUM_GROUPS > 1) {
+        u64 g = BRANCH_TO_GROUP[r];
+        bool pred_correct = (mon.shadow_pred[r] == actual);
+        u64 prov = mon.shadow_provider[r];
+        mon.record_group_outcome(g, pred_correct, is_misp, prov);
+      }
+    }
     if (!static_cast<u64>(do_train))
       mon.record_train_skip();
 #endif
@@ -1245,24 +1503,54 @@ struct TageAhead : predictor {
 #endif
 
     // ---- Compute training signals ----
-    val<PRED_BITS> actual_dir = arr<val<1>, N>{[&](u64 i) -> val<1> {
-                                  return val<1>{branch_dir[i]};
-                                }}.concat();
+    // Per-group actual direction: each group's branches concatenated into
+    // PRED_BITS = BR_P_ENTRY * CTR_WIDTH bits.
+    // NUM_GROUPS==1: single val<PRED_BITS> from all N branches (same as before).
+    // NUM_GROUPS>1: arr of NUM_GROUPS vals, each BR_P_ENTRY*CTR_WIDTH bits.
+    arr<val<PRED_BITS>, NUM_GROUPS> actual_dir_g = [&](u64 g) -> val<PRED_BITS> {
+      arr<val<CTR_WIDTH>, BR_P_ENTRY> bits = [&](u64 j) -> val<CTR_WIDTH> {
+        // Find the j-th branch in group g
+        u64 branch_idx = 0;
+        u64 count = 0;
+        for (u64 b = 0; b < N; b++) {
+          if (BRANCH_TO_GROUP[b] == g) {
+            if (count == j) { branch_idx = b; break; }
+            count++;
+          }
+        }
+        return val<CTR_WIDTH>{branch_dir[branch_idx]};
+      };
+      return bits.concat();
+    };
+    // actual_dir_g[0] used directly (no fo1 alias — multiple reads needed)
 
     // Provider wrong on any branch? (uses piped provider_pred)
-    // NOTE: @prakhar @claude audit: any_provider_wrong(1) [+
-    // fb_tage_disagree(1) if FB_RECONCILE]
-    if constexpr (FB_RECONCILE)
-      t_pp.fanout(hard<2>{}); // any_provider_wrong + fb_tage_disagree
-    // NOTE: @prakhar @claude audit: any_provider_wrong(1) + table_wrong×NT(NT)
-    //   + pred_ram.write×NT(NT) + fb_changed(1) + fb_ctr.write(1) = 3+2*NT
+    // NUM_GROUPS==1: single comparison. NUM_GROUPS>1: per-group, fold_or.
     // NOTE: @prakhar @claude audit
-    actual_dir.fanout(hard<3 + 2 * NT>{});
-    val<1> any_provider_wrong = [&]() {
+    if constexpr (NUM_GROUPS == 1) {
       if constexpr (FB_RECONCILE)
-        return (t_pp ^ actual_dir) != hard<0>{};
-      else
-        return (t_pp.fo1() ^ actual_dir) != hard<0>{};
+        t_pp.fanout(hard<2>{}); // any_provider_wrong + fb_tage_disagree
+      // NOTE: @prakhar @claude audit
+      // actual_dir_g[0] reads: any_provider_wrong(1) + actual_dir_full(1) + entry_actual_dir×NT
+      actual_dir_g.fanout(hard<2 + NT>{});
+    } else {
+      // Per-group: each actual_dir_g[G] read for any_provider_wrong + table_wrong selects
+      actual_dir_g.fanout(hard<2 + NT>{}); // any_prov_wrong(1) + fb_changed(1) + table_wrong×NT
+    }
+    val<1> any_provider_wrong = [&]() {
+      if constexpr (NUM_GROUPS == 1) {
+        if constexpr (FB_RECONCILE)
+          return (t_pp ^ actual_dir_g[0]) != hard<0>{};
+        else
+          return (t_pp.fo1() ^ actual_dir_g[0]) != hard<0>{};
+      } else {
+        // Per-group wrong, then fold_or
+        arr<val<1>, NUM_GROUPS> gw = [&](u64 g) -> val<1> {
+          return (val<PRED_BITS>{train_provider_pred[g].fo1()} ^
+                  actual_dir_g[g]) != hard<0>{};
+        };
+        return gw.fo1().fold_or();
+      }
     }();
     // NOTE: @prakhar @claude audit: meta_update(1) [+ alloc_trigger(1) if
     // TAGE_WRONG]
@@ -1330,13 +1618,21 @@ struct TageAhead : predictor {
       if constexpr (USE_SEC_TAG && SIBLING_POLICY == SiblingPolicy::ALL) {
         // Allocation promotion (Cai/Deshmukh/Patt ISCA'25 Sec 4.3):
         // Skip entries with same primary tag but different sec_tag (siblings).
+        // NUM_GROUPS>1: also skip if same htag but different group_id.
+        // Sibling = htag_hit & ~(group_match & sec_hit).
         // Promotes allocation to the next higher table.
         // SIBLING_TABLE_FLOOR: only skip for tables >= floor index.
-        // Below floor: always 1 (never skip). At/above floor: check sec_tag.
-        // Compile-time constant mask for the floor boundary.
+        // Below floor: always 1 (never skip). At/above floor: check.
         static constexpr u64 FLOOR_MASK =
             SIBLING_TABLE_FLOOR >= NT ? ~u64(0)
                                       : ~((u64(1) << SIBLING_TABLE_FLOOR) - 1);
+        // For NUM_GROUPS>1, compute alloc_group_id: the group of the
+        // mispredicting (last) branch, used to check group_match.
+        [[maybe_unused]] val<std::max(u64(1), GROUP_BITS)> alloc_gid_sib =
+            val<std::max(u64(1), GROUP_BITS)>{
+                NUM_GROUPS > 1
+                    ? BRANCH_TO_GROUP[num_branch > 0 ? num_branch - 1 : 0]
+                    : u64(0)};
         arr<val<1>, NT> not_sibling = [&](u64 i) -> val<1> {
           // Read train_tag_hit/train_sec_hit for ALL tables (runtime i).
           // For tables below FLOOR_MASK, the result is masked out below.
@@ -1354,7 +1650,17 @@ struct TageAhead : predictor {
             else
               return train_sec_hit[i].fo1();
           }();
-          return ~(th.fo1() & ~sh.fo1());
+          if constexpr (NUM_GROUPS > 1) {
+            // Group-aware sibling: sibling if htag matches but
+            // (group differs OR sec_tag differs).
+            // not_sibling = ~htag_hit | (group_match & sec_hit)
+            auto gid = val<GROUP_BITS>{train_group_id[i].fo1()};
+            val<1> group_match =
+                gid.fo1() == val<GROUP_BITS>{alloc_gid_sib};
+            return ~th.fo1() | (group_match.fo1() & sh.fo1());
+          } else {
+            return ~(th.fo1() & ~sh.fo1());
+          }
         };
         // Apply floor: force not_sibling=1 for tables below floor.
         // FLOOR_MASK has bits set only for tables >= SIBLING_TABLE_FLOOR.
@@ -1445,8 +1751,12 @@ struct TageAhead : predictor {
     }();
     // NOTE: @prakhar @claude audit
     allocate.fanout(
-        hard<3 + (DECAY_ENABLE ? 1 : 0)>{}); // do_alloc(1) + alloc_target(1) +
-                                             // base_u_write(1) [+ decay(1)]
+        hard<3 + (DECAY_ENABLE ? 1 : 0)
+#ifdef TAGE_MONITOR
+             + (DECAY_ENABLE ? 1 : 0)
+#endif
+             >{}); // do_alloc(1) + alloc_target(1) +
+                   // base_u_write(1) [+ decay(1)] [+ monitor(1)]
     val<NT> alloc_target = [&]() {
       arr<val<1>, NT> a = allocate;
       return a.fo1().concat();
@@ -1475,7 +1785,7 @@ struct TageAhead : predictor {
     t_pw.print("  t_pw=", "\n", true, std::cerr);
     t_ad.print("  t_ad=", "\n", true, std::cerr);
     t_phw.print("  t_phw=", "\n", true, std::cerr);
-    actual_dir.print("  actual_dir=", "\n", true, std::cerr);
+    actual_dir_g[0].print("  actual_dir=", "\n", true, std::cerr);
     any_provider_wrong.print("  any_prov_wrong=", "\n", true, std::cerr);
     do_train.print("  do_train=", "\n", true, std::cerr);
     std::cerr << "--- allocation path ---\n";
@@ -1498,20 +1808,44 @@ struct TageAhead : predictor {
     {
       u64 at = static_cast<u64>(alloc_target);
       mon.record_allocation(at != 0, at);
+      // Per-group allocation: attribute to the mispredicting branch's group
+      if constexpr (NUM_GROUPS > 1) {
+        u64 alloc_group = num_branch > 0 ? BRANCH_TO_GROUP[num_branch - 1] : 0;
+        if (at != 0) {
+          for (u64 i = 0; i < NT; i++)
+            if (at & (u64(1) << i))
+              mon.record_group_allocation(alloc_group, true, i);
+        } else if (static_cast<u64>(alloc_trigger)) {
+          mon.record_group_allocation(alloc_group, false, 0);
+        }
+      }
       // Provider index for cascade tracking
       u64 prov_idx =
-          TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE,
-                    FB_CAPACITY>::decode_provider(static_cast<u64>(t_match1));
+          decltype(mon)::decode_provider(static_cast<u64>(t_match1));
       if (static_cast<u64>(alloc_trigger)) {
         if (static_cast<u64>(postmask) == 0)
           mon.record_alloc_blocked(); // fallback was provider, no candidates
         mon.record_alloc_cascade(prov_idx, at);
         if constexpr (USE_SEC_TAG) {
           u64 sibling = 0;
-          for (u64 i = 0; i < NT; i++)
-            if (static_cast<u64>(train_tag_hit[i]) &&
-                !static_cast<u64>(train_sec_hit[i]))
-              sibling |= (u64(1) << i);
+          u64 alloc_g = NUM_GROUPS > 1
+              ? BRANCH_TO_GROUP[num_branch > 0 ? num_branch - 1 : 0]
+              : 0;
+          for (u64 i = 0; i < NT; i++) {
+            bool th = static_cast<u64>(train_tag_hit[i]);
+            bool sh = static_cast<u64>(train_sec_hit[i]);
+            if constexpr (NUM_GROUPS > 1) {
+              u64 gid = static_cast<u64>(
+                  val<GROUP_BITS>{train_group_id[i]});
+              bool gm = (gid == alloc_g);
+              // Sibling: htag matches but (group or sec) differs
+              if (th && !(gm && sh))
+                sibling |= (u64(1) << i);
+            } else {
+              if (th && !sh)
+                sibling |= (u64(1) << i);
+            }
+          }
           sibling &= static_cast<u64>(postmask); // only above provider
           if (sibling)
             mon.record_alloc_sibling_skip(sibling);
@@ -1552,11 +1886,23 @@ struct TageAhead : predictor {
       train_fb.fanout(hard<2>{});      // NOTE: @prakhar @claude audit
       train_fb_idx.fanout(hard<3>{});  // NOTE: @prakhar @claude audit
     }
+    // Full N-wide actual direction for fb path (fb_ctr stores FB_PRED_BITS = N*CTR_WIDTH)
+    val<FB_PRED_BITS> actual_dir_full = [&]() -> val<FB_PRED_BITS> {
+      if constexpr (NUM_GROUPS == 1) {
+        return val<FB_PRED_BITS>{actual_dir_g[0]};
+      } else {
+        return arr<val<1>, N>{[&](u64 i) -> val<1> {
+          return val<1>{branch_dir[i]};
+        }}.concat();
+      }
+    }();
+    if constexpr (NUM_GROUPS > 1)
+      actual_dir_full.fanout(hard<2>{}); // fb_changed + fb_ctr.write
     val<1> fb_changed = [&]() -> val<1> {
       if constexpr (FB_RECONCILE)
-        return actual_dir != val<PRED_BITS>{train_fb};
+        return actual_dir_full != val<FB_PRED_BITS>{train_fb};
       else
-        return actual_dir != val<PRED_BITS>{train_fb.fo1()};
+        return actual_dir_full != val<FB_PRED_BITS>{train_fb.fo1()};
     }();
     // t_m1[NT]: fanout<2> declared above if FB_RECONCILE, else use fo1() here
     val<1> fb_gate = [&]() -> val<1> {
@@ -1570,9 +1916,9 @@ struct TageAhead : predictor {
                                // write_localaddr + write_data
     execute_if(fb_gate, [&]() {
       if constexpr (FB_RECONCILE)
-        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir);
+        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir_full);
       else
-        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir);
+        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir_full);
     });
 
     // 4b. Reconciliation (Tage.hpp P1/P2 pattern): when TAGE and fb disagree
@@ -1641,16 +1987,22 @@ struct TageAhead : predictor {
                                   // 1263(hyst gate) + 1269(alloc gate)
 
       // Per-table wrong: does THIS table's stored pred disagree with actual?
+      // We always compare against the training group's actual directions.
+      // Provider: stored group == train_group (group-aware resolution ensures this).
+      // Alloc: new entry is for train_group.
+      // No-write tables: value is unused.
+      auto entry_actual_dir = val<PRED_BITS>{actual_dir_g[train_group]};
+      entry_actual_dir.fanout(hard<2>{}); // table_wrong(1) + pred_ram.write(1)
       val<1> table_wrong =
-          (val<PRED_BITS>{train_pred[I].fo1()} ^ actual_dir) != hard<0>{};
+          (val<PRED_BITS>{train_pred[I].fo1()} ^ entry_actual_dir) != hard<0>{};
       // NOTE: @prakhar @claude audit
       // do_pred_update(1) + new_hyst(1) + u_correct(1) [+ u_wrong(1) if
       // !UNTOUCHED]
       table_wrong.fanout(
           hard<3 + (U_MISP != UMispPolicy::UNTOUCHED ? 1 : 0)>{});
 
-      // pred_ram: alloc writes actual_dir, update writes actual_dir → same
-      // data. Gated on hyst-only weakness (t_phw), not newly-alloc (t_pw). A
+      // pred_ram: alloc writes entry_actual_dir, update writes entry_actual_dir.
+      // Gated on hyst-only weakness (t_phw), not newly-alloc (t_pw). A
       // useful entry (u>0) with weak hyst that's wrong should still flip.
       // Silent: do_pred_update already requires table_wrong (pred != actual),
       // so non-alloc writes only fire when value changes.
@@ -1660,7 +2012,7 @@ struct TageAhead : predictor {
       // NOTE: @prakhar @claude audit
       gate_pred.fanout(hard<5>{}); // pred_ram ta_rwram B=2: B+3=5 writes
       execute_if(gate_pred, [&]() {
-        t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, actual_dir, hard<0>{});
+        t.pred_ram.write(val<t.IDX_BITS>{train_idx[I]}, entry_actual_dir, hard<0>{});
       });
 
       // hyst_ram: alloc writes 0, update writes new_hyst → mux on do_alloc.
@@ -1691,17 +2043,39 @@ struct TageAhead : predictor {
           hard<2>{}); // tag_ram hcm::ram(1) + sec_ram hcm::ram(1, USE_SEC_TAG)
       execute_if(gate_alloc, [&]() {
         // Use piped computed tag (from predict1 time, not current folds)
-        t.tag_ram.write(val<t.IDX_BITS>{train_idx[I]},
-                        val<t.tag_ram_width>{train_ctag[I].fo1()});
+        // NUM_GROUPS>1: prepend alloc_group_id to htag
+        if constexpr (NUM_GROUPS > 1) {
+          // alloc_group_id = group of the last (mispredicting) branch
+          static constexpr u64 PER_HTAG = t.tag_width - GROUP_BITS;
+          val<GROUP_BITS> alloc_gid =
+              val<GROUP_BITS>{BRANCH_TO_GROUP[num_branch > 0 ? num_branch - 1 : 0]};
+          auto full_tag = concat(alloc_gid, val<PER_HTAG>{train_ctag[I].fo1()});
+          t.tag_ram.write(val<t.IDX_BITS>{train_idx[I]},
+                          val<t.tag_ram_width>{full_tag});
+        } else {
+          t.tag_ram.write(val<t.IDX_BITS>{train_idx[I]},
+                          val<t.tag_ram_width>{train_ctag[I].fo1()});
+        }
         if constexpr (USE_SEC_TAG)
           t.sec_ram.write(val<t.IDX_BITS>{train_idx[I]},
                           val<SEC_TAG_BITS>{train_sec_tag});
       });
 #ifdef TAGE_MONITOR
-      if (static_cast<u64>(do_train & do_alloc)) {
+      {
         u64 tidx = static_cast<u64>(val<t.IDX_BITS>{train_idx[I]});
-        mon.record_tage_write(I, tidx);
-        mon.record_entry_alloc_diag(I, tidx);
+        if (static_cast<u64>(do_train & do_alloc)) {
+          mon.record_tage_write(I, tidx);
+          mon.record_entry_alloc_diag(I, tidx);
+          mon.record_bank_write(I, tidx, decltype(mon)::BankWriteType::ALLOC);
+          if constexpr (NUM_GROUPS > 1) {
+            u64 gid = static_cast<u64>(val<GROUP_BITS>{train_group_id[I]});
+            mon.record_group_occupy(gid, I, tidx);
+          }
+        }
+        if (static_cast<u64>(gate_pred))
+          mon.record_bank_write(I, tidx, decltype(mon)::BankWriteType::PRED_UPDATE);
+        if (static_cast<u64>(gate_hyst))
+          mon.record_bank_write(I, tidx, decltype(mon)::BankWriteType::HYST_UPDATE);
       }
 #endif
 
@@ -1796,6 +2170,9 @@ struct TageAhead : predictor {
       }();
       // Probabilistic decay: on tag/sec miss, random < threshold → decay u
       // Silent update elimination: only write when new != old (both paths).
+#ifdef TAGE_MONITOR
+      bool mon_is_base_write = false; // set inside lambda for decay fire detection
+#endif
       auto [newu, u_write] = [&]() -> std::pair<val<U_WIDTH>, val<1>> {
         if constexpr (!DECAY_ENABLE) {
           // NOTE: @prakhar @claude audit
@@ -1851,7 +2228,14 @@ struct TageAhead : predictor {
           // base_newu reads: != 0 (base_u_write) + select (merged) + return = 3
           base_newu.fanout(hard<3>{});
           val<1> base_u_write = (base_newu != hard<0>{}) | allocate[I];
-          base_u_write.fanout(hard<2>{}); // select(1) + merged_write(1)
+          base_u_write.fanout(hard<2
+#ifdef TAGE_MONITOR
+                                    + 1
+#endif
+                                    >{}); // select(1) + merged_write(1) [+ monitor(1)]
+#ifdef TAGE_MONITOR
+          mon_is_base_write = static_cast<u64>(base_u_write);
+#endif
 
           // Mux: if base write active, use base_newu; else if decay, use
           // decayed_u
@@ -1877,10 +2261,20 @@ struct TageAhead : predictor {
       }();
 
       // NOTE: @prakhar @claude audit
+#ifdef TAGE_MONITOR
+      u_write.fanout(hard<2>{}); // gate_u(1) + monitor peek(1)
+      newu.fanout(hard<2>{});    // u_ram.write(1) + monitor peek(1)
+      val<1> gate_u = do_train & u_write;
+#else
       val<1> gate_u = do_train & u_write.fo1();
+#endif
       gate_u.fanout(hard<5>{}); // u_ram ta_rwram B=2: B+3=5 writes
       execute_if(gate_u, [&]() {
+#ifdef TAGE_MONITOR
+        t.u_ram.write(val<t.IDX_BITS>{train_idx[I]}, newu, hard<0>{});
+#else
         t.u_ram.write(val<t.IDX_BITS>{train_idx[I]}, newu.fo1(), hard<0>{});
+#endif
       });
 #ifdef DEBUG_PRINT
       if constexpr (I == 0) {
@@ -1897,14 +2291,14 @@ struct TageAhead : predictor {
 #endif
 
 #ifdef TAGE_MONITOR
-      if (static_cast<u64>(do_train & u_write))
+      if (static_cast<u64>(gate_u)) {
         mon.record_u_write(I, static_cast<u64>(newu) != 0);
+        u64 tidx_u = static_cast<u64>(val<t.IDX_BITS>{train_idx[I]});
+        mon.record_bank_write(I, tidx_u, decltype(mon)::BankWriteType::U_WRITE);
+      }
       if constexpr (DECAY_ENABLE) {
         // Decay fire: u_write active but not from base logic.
-        // Reconstruct base_u_write from base_newu for monitor only.
-        bool mon_base_write =
-            (static_cast<u64>(base_newu) != 0) || static_cast<u64>(allocate[I]);
-        if (static_cast<u64>(do_train & u_write) && !mon_base_write)
+        if (static_cast<u64>(gate_u) && !mon_is_base_write)
           mon.record_decay_fire();
       }
 #endif
@@ -1999,9 +2393,9 @@ struct TageAhead : predictor {
       bool benefit_incr_val = true;
       if (sec_would_reject_all && num_branch > 0) {
         bool tage_right = (static_cast<u64>(train_pred[tag_only_prov]) & 1) ==
-                          (static_cast<u64>(actual_dir) & 1);
+                          (static_cast<u64>(actual_dir_g[0]) & 1);
         bool fb_right = (static_cast<u64>(train_fb) & 1) ==
-                        (static_cast<u64>(actual_dir) & 1);
+                        (static_cast<u64>(actual_dir_g[0]) & 1);
         if (fb_right != tage_right) {
           should_update = true;
           benefit_incr_val = fb_right; // true=incr (FB>TAGE, enforcement helps)
@@ -2025,8 +2419,8 @@ struct TageAhead : predictor {
 
 #ifdef TAGE_MONITOR
     if constexpr (DECAY_ENABLE || EPOCH_ENABLE)
-      mon.record_pressure(static_cast<u64>(acc_ctr),
-                          static_cast<u64>(alloc_ctr));
+      mon.record_pressure(static_cast<u64>(val<ACC_WIDTH>{acc_ctr}),
+                          static_cast<u64>(val<ALLOC_WIDTH>{alloc_ctr}));
 #endif
 
     // Decay LFSRs replaced by std::rand() — no tick needed.
