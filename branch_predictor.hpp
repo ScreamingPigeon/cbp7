@@ -662,6 +662,8 @@ using TA1C_BPE1_8B_MB7 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 7
 using TA1C_BPE1_8B_FB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true>;
 using TA1C_BPE1_8B_FB4_S6 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 6, true>;
 using TA1C_BPE1_8B_FB4_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true, 2>;
+// PC index shift: match Tage.hpp's block-aligned indexing (>> 5 instead of >> 2)
+using TA1C_BPE1_8B_PCS5 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 1, 5>;
 
 // ============================================================================
 // Sweep 10: Bank shift decorrelation

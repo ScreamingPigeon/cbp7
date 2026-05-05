@@ -118,7 +118,9 @@ template <
     u64 FB_BANK_SEL_SHIFT = 0, // bank select from fb_idx bits [SHIFT+SEL_BITS-1:SHIFT]
     bool FB_SPLIT_WIDTH = false, // split fb into per-group 1-bit RAMs
     // ---- Meta banking ----
-    u64 META_BANKS = 1>       // separate meta RAMs (each serves N/META_BANKS branches)
+    u64 META_BANKS = 1,       // separate meta RAMs (each serves N/META_BANKS branches)
+    // ---- PC index shift ----
+    u64 PC_IDX_SHIFT = 2>     // inst_pc >> PC_IDX_SHIFT for table index (2=word, 5=block)
 struct TageAhead : predictor {
 
   // ======== Derived Constants ========
@@ -565,11 +567,11 @@ struct TageAhead : predictor {
       // NOTE: @prakhar @claude audit
       t.fold_tag.fanout(hard<2>{}); // get() + compute_update
       auto fold_idx_val = t.fold_idx.get();
-      auto idx = fold_idx_val.fo1() ^ val<t.IDX_BITS>{inst_pc >> 2};
+      auto idx = fold_idx_val.fo1() ^ val<t.IDX_BITS>{inst_pc >> PC_IDX_SHIFT};
       // NOTE: @prakhar @claude audit
       idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
       auto fold_tag_val = t.fold_tag.get();
-      auto computed_tag = fold_tag_val.fo1() ^ val<t.tag_width>{inst_pc >> 4};
+      auto computed_tag = fold_tag_val.fo1() ^ val<t.tag_width>{inst_pc >> (PC_IDX_SHIFT + 2)};
       // NOTE: @prakhar @claude audit
       computed_tag.fanout(hard<2>{}); // tag comparison + prefetch_ctag write
 
@@ -623,9 +625,9 @@ struct TageAhead : predictor {
         // NOTE: @prakhar @claude audit
         fb_fold.fanout(hard<2>{}); // get() + compute_update
         auto fb_fold_val = fb_fold.get();
-        return val<FB_IDX_BITS>{inst_pc >> 2} ^ fb_fold_val.fo1();
+        return val<FB_IDX_BITS>{inst_pc >> PC_IDX_SHIFT} ^ fb_fold_val.fo1();
       } else
-        return val<FB_IDX_BITS>{inst_pc >> 2};
+        return val<FB_IDX_BITS>{inst_pc >> PC_IDX_SHIFT};
     }();
     // NOTE: @prakhar @claude audit
     fb_idx.fanout(
