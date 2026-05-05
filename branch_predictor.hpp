@@ -654,10 +654,14 @@ using S9_TC_U11_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOM
       ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
 
 using TA1C_BPE1_8B = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B)>;
-// META_BANKS variants: per-branch meta counters
-using TA1C_BPE1_8B_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 2>;
-using TA1C_BPE1_8B_MB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4>;
-using TA1C_BPE1_8B_MB7 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 7>;
+// META_BANKS variants: per-branch meta counters (FB defaults: 1 bank, no split)
+using TA1C_BPE1_8B_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 2>;
+using TA1C_BPE1_8B_MB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 4>;
+using TA1C_BPE1_8B_MB7 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 7>;
+// FB banking variants: address-banked + width-split
+using TA1C_BPE1_8B_FB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true>;
+using TA1C_BPE1_8B_FB4_S6 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 6, true>;
+using TA1C_BPE1_8B_FB4_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true, 2>;
 
 // BPE=1 (NUM_GROUPS=7, GROUP_BITS=3, eff = raw - 3)
 using S9_BPE1_U8      = TageAhead<S1_BPE1_BASE(S9_TC_U8)>;      // raw 8,  eff 5

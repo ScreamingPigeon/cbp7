@@ -113,6 +113,10 @@ template <
     // Controls which tables require sec-tag match. Only used when
     // USE_SEC_TAG=true and NUM_PATHS==1 (single-chain).
     typename SecTagPolicy = ta::SecTagAll,
+    // ---- Fallback banking ----
+    u64 FB_BANKS = 1,         // address-banked fb: 1=single RAM, 2/4/8=banked
+    u64 FB_BANK_SEL_SHIFT = 0, // bank select from fb_idx bits [SHIFT+SEL_BITS-1:SHIFT]
+    bool FB_SPLIT_WIDTH = false, // split fb into per-group 1-bit RAMs
     // ---- Meta banking ----
     u64 META_BANKS = 1>       // separate meta RAMs (each serves N/META_BANKS branches)
 struct TageAhead : predictor {
@@ -237,6 +241,20 @@ struct TageAhead : predictor {
   // Fallback stays N-wide (direct-mapped, no tags/groups)
   static constexpr u64 FB_PRED_BITS = N * CTR_WIDTH;
 
+  // ---- Fallback banking ----
+  static_assert(FB_BANKS >= 1 && (FB_BANKS & (FB_BANKS - 1)) == 0,
+                "FB_BANKS must be a power of 2");
+  static_assert(FB_CAPACITY % FB_BANKS == 0,
+                "FB_CAPACITY must be divisible by FB_BANKS");
+  static constexpr u64 FB_BANK_SEL_BITS = (FB_BANKS > 1) ? ta::clog2(FB_BANKS) : 0;
+  static constexpr u64 FB_BANK_CAPACITY = FB_CAPACITY / FB_BANKS;
+  static constexpr u64 FB_BANK_IDX_BITS = ta::clog2(FB_BANK_CAPACITY);
+  // Width per fb RAM: 1-bit per group when FB_SPLIT_WIDTH, else N-wide
+  static constexpr u64 FB_RAM_WIDTH = FB_SPLIT_WIDTH ? CTR_WIDTH : FB_PRED_BITS;
+  static constexpr u64 FB_NUM_WIDTH_RAMS = FB_SPLIT_WIDTH ? NUM_GROUPS : 1;
+  static_assert(!FB_SPLIT_WIDTH || NUM_GROUPS > 1,
+                "FB_SPLIT_WIDTH requires NUM_GROUPS > 1 (BPE < N)");
+
   // ======================================================================
   // Predict-path Registers (declared before tables → at first table loc)
   // ======================================================================
@@ -329,7 +347,11 @@ struct TageAhead : predictor {
   template <u64 I> const auto &table() const {
     return std::get<REVERSE_TABLE_ORDER ? (NT - 1 - I) : I>(tables);
   }
-  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
+  // Fallback RAMs: FB_NUM_WIDTH_RAMS × FB_BANKS, each FB_BANK_CAPACITY entries
+  // When FB_BANKS=1 && !FB_SPLIT_WIDTH: single N-wide RAM (baseline)
+  // When FB_BANKS>1: address-banked, only one bank active per access
+  // When FB_SPLIT_WIDTH: per-group 1-bit RAMs
+  hcm::ram<val<FB_RAM_WIDTH>, FB_BANK_CAPACITY> fb_ctr[FB_NUM_WIDTH_RAMS][FB_BANKS];
 
   // ======================================================================
   // Update-only RAMs and Registers (in update zone)
@@ -601,7 +623,42 @@ struct TageAhead : predictor {
         hard<2 + (FB_RECONCILE ? 1 : 0)>{}); // prefetch_fb_idx + fb_ctr.read [+
                                              // fb_hyst.read]
     prefetch_fb_idx = fb_idx;
-    prefetch_fb = fb_ctr.read(fb_idx);
+
+    // FB read: dispatch based on banking config
+    if constexpr (FB_BANKS == 1 && !FB_SPLIT_WIDTH) {
+      // Baseline: single N-wide RAM
+      prefetch_fb = fb_ctr[0][0].read(fb_idx);
+    } else if constexpr (FB_BANKS == 1 && FB_SPLIT_WIDTH) {
+      // Width-split only: N per-group 1-bit RAMs, no address banking
+      arr<val<1>, NUM_GROUPS> fb_bits = [&](u64 g) -> val<1> {
+        return fb_ctr[g][0].read(fb_idx);
+      };
+      prefetch_fb = fb_bits.concat();
+    } else if constexpr (FB_BANKS > 1 && !FB_SPLIT_WIDTH) {
+      // Address-banked only: FB_BANKS × N-wide RAMs
+      auto fb_bank_idx = val<FB_BANK_IDX_BITS>{fb_idx};
+      auto fb_bank_sel = val<FB_BANK_SEL_BITS>{fb_idx >> FB_BANK_SEL_SHIFT};
+      static_loop<FB_BANKS>([&]<u64 B>() {
+        val<1> bank_en = fb_bank_sel == hard<B>{};
+        execute_if(bank_en, [&]() {
+          prefetch_fb = fb_ctr[0][B].read(fb_bank_idx);
+        });
+      });
+    } else {
+      // Both: FB_BANKS × NUM_GROUPS 1-bit RAMs
+      auto fb_bank_idx = val<FB_BANK_IDX_BITS>{fb_idx};
+      auto fb_bank_sel = val<FB_BANK_SEL_BITS>{fb_idx >> FB_BANK_SEL_SHIFT};
+      static_loop<FB_BANKS>([&]<u64 B>() {
+        val<1> bank_en = fb_bank_sel == hard<B>{};
+        execute_if(bank_en, [&]() {
+          arr<val<1>, NUM_GROUPS> fb_bits = [&](u64 g) -> val<1> {
+            return fb_ctr[g][B].read(fb_bank_idx);
+          };
+          prefetch_fb = fb_bits.concat();
+        });
+      });
+    }
+
     if constexpr (FB_RECONCILE)
       prefetch_fb_hyst = fb_hyst.read(fb_idx);
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
@@ -2067,15 +2124,48 @@ struct TageAhead : predictor {
       else
         return do_train & t_m1[NT].fo1() & mispredict & fb_changed.fo1();
     }();
+    // Helper: write to banked fb RAMs
+    auto fb_write = [&](auto idx_val, auto data_val, val<1> gate) {
+      if constexpr (FB_BANKS == 1 && !FB_SPLIT_WIDTH) {
+        execute_if(gate, [&]() {
+          fb_ctr[0][0].write(idx_val, data_val);
+        });
+      } else if constexpr (FB_BANKS == 1 && FB_SPLIT_WIDTH) {
+        execute_if(gate, [&]() {
+          for (u64 g = 0; g < NUM_GROUPS; g++) {
+            fb_ctr[g][0].write(idx_val, val<1>{data_val >> g});
+          }
+        });
+      } else if constexpr (FB_BANKS > 1 && !FB_SPLIT_WIDTH) {
+        auto bank_idx = val<FB_BANK_IDX_BITS>{idx_val};
+        auto bank_sel = val<FB_BANK_SEL_BITS>{idx_val >> FB_BANK_SEL_SHIFT};
+        static_loop<FB_BANKS>([&]<u64 B>() {
+          val<1> bank_en = gate & (bank_sel == hard<B>{});
+          execute_if(bank_en, [&]() {
+            fb_ctr[0][B].write(bank_idx, data_val);
+          });
+        });
+      } else {
+        auto bank_idx = val<FB_BANK_IDX_BITS>{idx_val};
+        auto bank_sel = val<FB_BANK_SEL_BITS>{idx_val >> FB_BANK_SEL_SHIFT};
+        static_loop<FB_BANKS>([&]<u64 B>() {
+          val<1> bank_en = gate & (bank_sel == hard<B>{});
+          execute_if(bank_en, [&]() {
+            for (u64 g = 0; g < NUM_GROUPS; g++) {
+              fb_ctr[g][B].write(bank_idx, val<1>{data_val >> g});
+            }
+          });
+        });
+      }
+    };
+
     // NOTE: @prakhar @claude audit
     fb_gate.fanout(hard<5>{}); // fb_ctr.write: B=2 bank writes + write_bank +
                                // write_localaddr + write_data
-    execute_if(fb_gate, [&]() {
-      if constexpr (FB_RECONCILE)
-        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir_full);
-      else
-        fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir_full);
-    });
+    if constexpr (FB_RECONCILE)
+      fb_write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir_full, fb_gate);
+    else
+      fb_write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir_full, fb_gate);
 
     // 4b. Reconciliation (Tage.hpp P1/P2 pattern): when TAGE and fb disagree
     // persistently (fb_hyst weak), overwrite fb with TAGE's prediction.
@@ -2089,8 +2179,7 @@ struct TageAhead : predictor {
       // provider case handled above by fb_gate)
       val<1> reconcile_gate =
           do_train & fb_not_provider & fb_hyst_weak & fb_tage_disagree;
-      execute_if(reconcile_gate,
-                 [&]() { fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, t_pp); });
+      fb_write(val<FB_IDX_BITS>{train_fb_idx}, t_pp, reconcile_gate);
 
       // Update fb_hyst: 1 if agree, 0 if disagree — tracks recent consensus.
       // Silent update elimination: skip write when new == old.
