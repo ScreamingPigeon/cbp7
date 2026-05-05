@@ -39,6 +39,7 @@ struct TageAheadHC_IR : predictor {
   static constexpr u64 META_CAPACITY = 2048;
   static constexpr u64 META_IDX_BITS = 11; // clog2(2048)
   static constexpr u64 META_PIPE = 2;
+  static constexpr u64 META_BANKS = 2;
   static constexpr u64 MATCH_BITS = NT + 1; // = 15
   static constexpr u64 ALLOC_PC_BITS = TAG_WIDTH + 2; // = 13
   static constexpr u64 ACC_WIDTH = 10;
@@ -48,6 +49,11 @@ struct TageAheadHC_IR : predictor {
   // ======== IR (Independent Resolution) constants ========
   static constexpr u64 NUM_GROUPS = N;    // = 7, one group per branch
   static constexpr u64 GROUP_BITS = 3;    // clog2(7) rounded up
+  // Group-to-meta-bank mapping: i * META_BANKS / N
+  // Groups 0-3 → bank 0, groups 4-6 → bank 1
+  static constexpr std::array<u64, NUM_GROUPS> GROUP_TO_META_BANK = {
+    0, 0, 0, 0, 1, 1, 1
+  };
   static constexpr u64 PRED_BITS = 1;     // 1-bit prediction per entry
   static constexpr u64 FB_PRED_BITS = N * CTR_WIDTH; // = 7, fallback stays N-wide
   static constexpr u64 HTAG_WIDTH = TAG_WIDTH - GROUP_BITS; // = 8
@@ -124,9 +130,9 @@ struct TageAheadHC_IR : predictor {
   // Prediction regs (shared by predict1/2/reuse)
   arr<reg<1>, N> pred;
 
-  // Meta pipeline
-  reg<META_WIDTH, i64> meta_pipe[META_PIPE];
-  reg<META_IDX_BITS> meta_idx_pipe[META_PIPE];
+  // Meta pipeline (per-bank)
+  reg<META_WIDTH, i64> meta_pipe[META_BANKS][META_PIPE];
+  reg<META_IDX_BITS> meta_idx_pipe[META_BANKS][META_PIPE];
 
   // ====================================================================
   // RAMs — per-table clusters matching TATable declaration order:
@@ -289,9 +295,10 @@ struct TageAheadHC_IR : predictor {
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram13{"t13_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram13{"t13_u"};
 
-  // ---- Meta (update-only) ----
+  // ---- Meta (update-only, 2 banks) ----
   hcm::zone meta_zone;
-  ta_rwram<META_WIDTH, META_CAPACITY, 8, 1> meta_ctr{"meta"};
+  ta_rwram<META_WIDTH, META_CAPACITY, 8, 1> meta_ctr0{"meta0"};
+  ta_rwram<META_WIDTH, META_CAPACITY, 8, 1> meta_ctr1{"meta1"};
 
   // ======== Training regs ========
   reg<MAX_IDX_BITS> train_idx[NT];
@@ -541,21 +548,27 @@ struct TageAheadHC_IR : predictor {
     // would read the new RAM value instead of the properly delayed one.
     // ================================================================
 
-    for (u64 i = META_PIPE - 1; i > 0; i--) {
-      meta_pipe[i] = meta_pipe[i - 1].fo1();
-      meta_idx_pipe[i] = meta_idx_pipe[i - 1].fo1();
+    for (u64 mb = 0; mb < META_BANKS; mb++) {
+      for (u64 i = META_PIPE - 1; i > 0; i--) {
+        meta_pipe[mb][i] = meta_pipe[mb][i - 1].fo1();
+        meta_idx_pipe[mb][i] = meta_idx_pipe[mb][i - 1].fo1();
+      }
     }
     {
       auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
-      meta_idx.fanout(hard<2>{}); // meta_ctr.read + meta_idx_pipe[0] write
-      meta_pipe[0] = meta_ctr.read(meta_idx);
-      meta_idx_pipe[0] = meta_idx;
+      meta_idx.fanout(hard<1 + META_BANKS>{}); // meta_idx_pipe[0] + K reads
+      meta_pipe[0][0] = meta_ctr0.read(meta_idx);
+      meta_pipe[1][0] = meta_ctr1.read(meta_idx);
+      meta_idx_pipe[0][0] = meta_idx;
+      meta_idx_pipe[1][0] = meta_idx;
     }
-    // meta_pipe[1]: read twice — meta_use_alt here + old_meta in training
-    meta_pipe[META_PIPE - 1].fanout(hard<2>{});
-    // meta_use_alt >= 0 means "trust alt over provider when provider is weak"
-    val<1> meta_use_alt =
-        val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
+    // meta_pipe[][1]: read twice — meta_use_alt here + old_meta in training
+    meta_pipe[0][META_PIPE - 1].fanout(hard<2>{});
+    meta_pipe[1][META_PIPE - 1].fanout(hard<2>{});
+    // Per-bank meta_use_alt >= 0 means "trust alt over provider when provider is weak"
+    arr<val<1>, META_BANKS> meta_use_alt = [&](u64 mb) -> val<1> {
+      return val<META_WIDTH, i64>{meta_pipe[mb][META_PIPE - 1]} >= hard<0>{};
+    };
 
     // ================================================================
     // Stage 4: Per-group resolution chains (Independent Resolution)
@@ -600,8 +613,9 @@ struct TageAheadHC_IR : predictor {
     }();
     weak_mask.fanout(hard<NUM_GROUPS>{}); // one read per group chain
 
-    // meta_use_alt: one read per group chain
-    meta_use_alt.fanout(hard<NUM_GROUPS>{});
+    // meta_use_alt: each bank serves its groups
+    // Bank 0: groups 0-3 (4 reads), Bank 1: groups 4-6 (3 reads)
+    meta_use_alt.fanout(hard<4>{});
 
     // Pre-read ALL old train reg values BEFORE per-group resolution
     // overwrites them. Training uses these pre-read values.
@@ -610,11 +624,17 @@ struct TageAheadHC_IR : predictor {
       return val<PRED_BITS>{train_provider_pred[g].fo1()};
     };
     val<MATCH_BITS> pre_read_match1 = train_match1[train_group].fo1();
-    val<1> pre_read_pw = train_provider_weak[train_group].fo1();
-    val<1> pre_read_ad = train_altdiff[train_group].fo1();
+    // Per-group pw/ad needed for per-bank meta training
+    arr<val<1>, NUM_GROUPS> pre_read_pw = [&](u64 g) -> val<1> {
+      return train_provider_weak[g].fo1();
+    };
+    arr<val<1>, NUM_GROUPS> pre_read_ad = [&](u64 g) -> val<1> {
+      return train_altdiff[g].fo1();
+    };
 
     // ---- resolve_chain lambda (1-bit version) ----
-    auto resolve_chain = [&](arr<val<1>, NT> fh, val<PRED_BITS> fb_g) {
+    auto resolve_chain = [&](arr<val<1>, NT> fh, val<PRED_BITS> fb_g,
+                             u64 meta_bank = 0) {
       val<MATCH_BITS> match = concat(val<1>{1}, fh.fo1().concat());
       match.fanout(hard<3>{});
 
@@ -653,7 +673,7 @@ struct TageAheadHC_IR : predictor {
       val<1> pw = (val<NT>{match1} & weak_mask) != hard<0>{};
       pw.fanout(hard<2>{});
 
-      val<1> ua = pw & meta_use_alt & ha.fo1();
+      val<1> ua = pw & meta_use_alt[meta_bank] & ha.fo1();
 
       // 1-bit: XOR is already the disagreement bit
       auto pp_xor_ap = pp ^ ap;
@@ -681,7 +701,7 @@ struct TageAheadHC_IR : predictor {
       val<PRED_BITS> fb_g = fb_bits[G].fo1();
 
       auto [m1, m2, pp, ap, pw, ad, ua] =
-          resolve_chain(group_hits.fo1(), fb_g);
+          resolve_chain(group_hits.fo1(), fb_g, GROUP_TO_META_BANK[G]);
 
       // pp is read twice: select + train save
       pp.fanout(hard<2>{});
@@ -734,8 +754,8 @@ struct TageAheadHC_IR : predictor {
     });
     // t_m1[NT]: 1 read (fb_gate). FB_RECONCILE=false, no extra fanout needed.
 
-    val<1> t_pw = pre_read_pw;
-    val<1> t_ad = pre_read_ad;
+    // t_pw not needed — per-bank meta uses pre_read_pw[g] directly
+    val<1> t_ad = pre_read_ad[train_group];
 
     // Hyst-only weakness: provider has hyst==0 (regardless of u).
     arr<val<1>, NT + 1> t_hyst_weak_arr = [&](u64 i) -> val<1> {
@@ -791,7 +811,8 @@ struct TageAheadHC_IR : predictor {
     need_extra_cycle(mispredict);
 
     // do_train gates all RAM writes: 4 per table + fb + meta
-    do_train.fanout(hard<4 * NT + 2>{});
+    // fb(1) + meta_banks(2) + 4 per table
+    do_train.fanout(hard<4 * NT + 1 + META_BANKS>{});
 
     // Full N-wide actual direction for fb path
     val<FB_PRED_BITS> actual_dir_full = arr<val<1>, N>{[&](u64 i) -> val<1> {
@@ -800,18 +821,15 @@ struct TageAheadHC_IR : predictor {
     // fb_changed(1) + fb_ctr.write(1)
     actual_dir_full.fanout(hard<2>{});
 
-    // Per-group provider wrong, fold_or across groups
-    val<1> any_provider_wrong = [&]() {
-      arr<val<1>, NUM_GROUPS> gw = [&](u64 g) -> val<1> {
-        return (val<PRED_BITS>{old_provider_pred[g]} ^
-                val<1>{branch_dir[g]}) != hard<0>{};
-      };
-      return gw.fo1().fold_or();
-    }();
+    // Per-group provider wrong (used by per-bank meta training)
+    arr<val<1>, NUM_GROUPS> per_group_wrong = [&](u64 g) -> val<1> {
+      return (val<PRED_BITS>{old_provider_pred[g]} ^
+              val<1>{branch_dir[g]}) != hard<0>{};
+    };
 
-    t_pw.fanout(hard<2>{});    // meta_gate + meta_update_dir
+    // t_pw no longer used directly (per-bank meta uses pre_read_pw per-group)
     t_phw.fanout(hard<NT>{});  // do_pred_update per table
-    t_ad.fanout(hard<NT + 1>{});
+    t_ad.fanout(hard<NT>{});   // u_correct per table
 
     // ================================================================
     // Stage 7: Allocation
@@ -918,17 +936,53 @@ struct TageAheadHC_IR : predictor {
     // decrement when provider was right (trust provider more).
     // ================================================================
 
-    auto old_meta = val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]};
-    old_meta.fanout(hard<2>{}); // ta_update_ctr + (new != old)
-    auto new_meta = ta_update_ctr(old_meta, any_provider_wrong.fo1());
-    new_meta.fanout(hard<2>{}); // (new != old) + meta_ctr.write
-    // Gate: train valid AND provider weak AND provider/alt disagree AND value changed
-    val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
-    meta_gate.fanout(hard<11>{}); // meta_ctr ta_rwram: B=8 + 3
-    execute_if(meta_gate, [&]() {
-      meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1].fo1()},
-                     new_meta, hard<0>{});
-    });
+    // Per-bank meta training with corrected gating:
+    // bank_gate = OR_g(pw_g & ad_g) for groups in this bank
+    // bank_wrong_dir = OR_g(pw_g & ad_g & wrong_g) — direction from gated groups
+    // Bank 0: groups 0-3
+    {
+      arr<val<1>, 4> gate0_arr = [&](u64 j) -> val<1> {
+        return pre_read_pw[j] & pre_read_ad[j];
+      };
+      arr<val<1>, 4> dir0_arr = [&](u64 j) -> val<1> {
+        return pre_read_pw[j] & pre_read_ad[j] & per_group_wrong[j];
+      };
+      val<1> bank0_gate = gate0_arr.fo1().fold_or();
+      val<1> bank0_dir = dir0_arr.fo1().fold_or();
+
+      auto old_meta0 = val<META_WIDTH, i64>{meta_pipe[0][META_PIPE - 1]};
+      old_meta0.fanout(hard<2>{});
+      auto new_meta0 = ta_update_ctr(old_meta0, bank0_dir);
+      new_meta0.fanout(hard<2>{});
+      val<1> meta_gate0 = do_train & bank0_gate & (new_meta0 != old_meta0);
+      meta_gate0.fanout(hard<11>{});
+      execute_if(meta_gate0, [&]() {
+        meta_ctr0.write(val<META_IDX_BITS>{meta_idx_pipe[0][META_PIPE - 1].fo1()},
+                        new_meta0, hard<0>{});
+      });
+    }
+    // Bank 1: groups 4-6
+    {
+      arr<val<1>, 3> gate1_arr = [&](u64 j) -> val<1> {
+        return pre_read_pw[j + 4] & pre_read_ad[j + 4];
+      };
+      arr<val<1>, 3> dir1_arr = [&](u64 j) -> val<1> {
+        return pre_read_pw[j + 4] & pre_read_ad[j + 4] & per_group_wrong[j + 4];
+      };
+      val<1> bank1_gate = gate1_arr.fo1().fold_or();
+      val<1> bank1_dir = dir1_arr.fo1().fold_or();
+
+      auto old_meta1 = val<META_WIDTH, i64>{meta_pipe[1][META_PIPE - 1]};
+      old_meta1.fanout(hard<2>{});
+      auto new_meta1 = ta_update_ctr(old_meta1, bank1_dir);
+      new_meta1.fanout(hard<2>{});
+      val<1> meta_gate1 = do_train & bank1_gate & (new_meta1 != old_meta1);
+      meta_gate1.fanout(hard<11>{});
+      execute_if(meta_gate1, [&]() {
+        meta_ctr1.write(val<META_IDX_BITS>{meta_idx_pipe[1][META_PIPE - 1].fo1()},
+                        new_meta1, hard<0>{});
+      });
+    }
 
     // ================================================================
     // Stage 10: Per-table merged writes
