@@ -629,34 +629,30 @@ struct TageAhead : predictor {
       // Baseline: single N-wide RAM
       prefetch_fb = fb_ctr[0][0].read(fb_idx);
     } else if constexpr (FB_BANKS == 1 && FB_SPLIT_WIDTH) {
-      // Width-split only: N per-group 1-bit RAMs, no address banking
+      // Width-split only: NUM_GROUPS per-group 1-bit RAMs, no address banking
       arr<val<1>, NUM_GROUPS> fb_bits = [&](u64 g) -> val<1> {
         return fb_ctr[g][0].read(fb_idx);
       };
       prefetch_fb = fb_bits.concat();
     } else if constexpr (FB_BANKS > 1 && !FB_SPLIT_WIDTH) {
-      // Address-banked only: FB_BANKS × N-wide RAMs
+      // Address-banked only: read all banks, MUX by bank_sel
       auto fb_bank_idx = val<FB_BANK_IDX_BITS>{fb_idx};
       auto fb_bank_sel = val<FB_BANK_SEL_BITS>{fb_idx >> FB_BANK_SEL_SHIFT};
-      static_loop<FB_BANKS>([&]<u64 B>() {
-        val<1> bank_en = fb_bank_sel == hard<B>{};
-        execute_if(bank_en, [&]() {
-          prefetch_fb = fb_ctr[0][B].read(fb_bank_idx);
-        });
-      });
+      arr<val<FB_PRED_BITS>, FB_BANKS> bank_reads = [&](u64 b) -> val<FB_PRED_BITS> {
+        return fb_ctr[0][b].read(fb_bank_idx);
+      };
+      prefetch_fb = bank_reads.select(fb_bank_sel);
     } else {
-      // Both: FB_BANKS × NUM_GROUPS 1-bit RAMs
+      // Both: read all banks per group, MUX by bank_sel
       auto fb_bank_idx = val<FB_BANK_IDX_BITS>{fb_idx};
       auto fb_bank_sel = val<FB_BANK_SEL_BITS>{fb_idx >> FB_BANK_SEL_SHIFT};
-      static_loop<FB_BANKS>([&]<u64 B>() {
-        val<1> bank_en = fb_bank_sel == hard<B>{};
-        execute_if(bank_en, [&]() {
-          arr<val<1>, NUM_GROUPS> fb_bits = [&](u64 g) -> val<1> {
-            return fb_ctr[g][B].read(fb_bank_idx);
-          };
-          prefetch_fb = fb_bits.concat();
-        });
-      });
+      arr<val<1>, NUM_GROUPS> fb_bits = [&](u64 g) -> val<1> {
+        arr<val<1>, FB_BANKS> grp_bank_reads = [&](u64 b) -> val<1> {
+          return fb_ctr[g][b].read(fb_bank_idx);
+        };
+        return grp_bank_reads.select(fb_bank_sel);
+      };
+      prefetch_fb = fb_bits.concat();
     }
 
     if constexpr (FB_RECONCILE)
