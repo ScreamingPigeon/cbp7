@@ -112,7 +112,9 @@ template <
     // ---- Per-table sec-tag policy ----
     // Controls which tables require sec-tag match. Only used when
     // USE_SEC_TAG=true and NUM_PATHS==1 (single-chain).
-    typename SecTagPolicy = ta::SecTagAll>
+    typename SecTagPolicy = ta::SecTagAll,
+    // ---- Meta banking ----
+    u64 META_BANKS = 1>       // separate meta RAMs (each serves N/META_BANKS branches)
 struct TageAhead : predictor {
 
   // ======== Derived Constants ========
@@ -190,6 +192,24 @@ struct TageAhead : predictor {
       }
     }
     return s;
+  }();
+
+  // ---- Meta banking (per-branch meta counters) ----
+  static_assert(META_BANKS >= 1 && META_BANKS <= N,
+                "META_BANKS must be in [1, N]");
+  // Map branch position → meta bank index
+  static constexpr auto BRANCH_TO_META_BANK = []() {
+    std::array<u64, N> b2m{};
+    for (u64 i = 0; i < N; i++)
+      b2m[i] = i * META_BANKS / N;
+    return b2m;
+  }();
+  // Map group → meta bank (for NUM_GROUPS>1: group's first branch determines)
+  static constexpr auto GROUP_TO_META_BANK = []() {
+    std::array<u64, NUM_GROUPS> g2m{};
+    for (u64 g = 0; g < NUM_GROUPS; g++)
+      g2m[g] = GROUP_START[g] * META_BANKS / N;
+    return g2m;
   }();
 
   // ---- Sec-tag adaptive benefit counter ----
@@ -288,8 +308,8 @@ struct TageAhead : predictor {
 
   // ---- Meta pipeline (shifted each update_cycle) ----
   static constexpr u64 META_IDX_BITS = ta::clog2(META_CAPACITY);
-  reg<META_WIDTH, i64> meta_pipe[META_PIPE];
-  reg<META_IDX_BITS> meta_idx_pipe[META_PIPE];
+  reg<META_WIDTH, i64> meta_pipe[META_BANKS][META_PIPE];
+  reg<META_IDX_BITS> meta_idx_pipe[META_BANKS][META_PIPE];
 
   // ======================================================================
   // Storage
@@ -317,7 +337,7 @@ struct TageAhead : predictor {
   // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
   // Only accessed when FB_RECONCILE=true; zero cost otherwise.
   hcm::ram<val<1>, FB_CAPACITY> fb_hyst{"fb_hyst"};
-  ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr{"meta"};
+  ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr[META_BANKS];
 
   // train_*: saved from current_* before pipeline shift, used for training
   // (training is for block A, resolution is for block B)
@@ -361,7 +381,7 @@ struct TageAhead : predictor {
       DECAY_ENABLE ? ta::array_max(DECAY_LFSR_WIDTHS) : 1;
 
 #ifdef TAGE_MONITOR
-  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, NUM_GROUPS, MAX_BANKS> mon;
+  TAMonitor<NT, N, MAX_TABLE_SIZE, USE_GSHARE, FB_CAPACITY, NUM_GROUPS, MAX_BANKS, META_BANKS> mon;
   ~TageAhead() {
     mon.print_summary();
     print_params(std::cerr);
@@ -373,7 +393,8 @@ struct TageAhead : predictor {
       t.hyst_ram.print_conflict_stats();
       t.u_ram.print_conflict_stats();
     });
-    meta_ctr.print_conflict_stats();
+    for (u64 mb = 0; mb < META_BANKS; mb++)
+      meta_ctr[mb].print_conflict_stats();
     std::cerr << "=================================\n";
   }
   void print_params(std::ostream &os) const {
@@ -416,7 +437,7 @@ struct TageAhead : predictor {
       os << "  GsHist: " << GS_HIST;
     os << "  Reconcile: " << (FB_RECONCILE ? "yes" : "no") << "\n";
     os << "Meta: width=" << META_WIDTH << " cap=" << META_CAPACITY
-       << " pipe=" << META_PIPE << "\n";
+       << " pipe=" << META_PIPE << " banks=" << META_BANKS << "\n";
     os << "Alloc: trigger="
        << (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT ? "MISPREDICT"
            : AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG ? "TAGE_WRONG"
@@ -793,30 +814,35 @@ struct TageAhead : predictor {
     // Meta pipeline: shift FIRST, then write [0].
     // Fixes stale-value bug where meta_pipe[META_PIPE-1] reads the
     // new RAM value instead of the properly delayed old value.
+    // META_BANKS separate RAMs: each bank has its own pipe.
     // ================================================================
-    for (u64 i = META_PIPE - 1; i > 0; i--) {
-      meta_pipe[i] = meta_pipe[i - 1].fo1();
-      meta_idx_pipe[i] = meta_idx_pipe[i - 1].fo1();
+    for (u64 mb = 0; mb < META_BANKS; mb++) {
+      for (u64 i = META_PIPE - 1; i > 0; i--) {
+        meta_pipe[mb][i] = meta_pipe[mb][i - 1].fo1();
+        meta_idx_pipe[mb][i] = meta_idx_pipe[mb][i - 1].fo1();
+      }
     }
     {
       auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
       // NOTE: @prakhar @claude audit
-      meta_idx.fanout(hard<2>{}); // meta_ctr.read + meta_idx_pipe[0] write
-      meta_pipe[0] = meta_ctr.read(meta_idx);
-      meta_idx_pipe[0] = meta_idx;
+      meta_idx.fanout(hard<1 + META_BANKS>{}); // meta_idx_pipe[0] + K reads
+      for (u64 mb = 0; mb < META_BANKS; mb++) {
+        meta_pipe[mb][0] = meta_ctr[mb].read(meta_idx);
+        meta_idx_pipe[mb][0] = meta_idx;
+      }
     }
     // NOTE: @prakhar @claude audit
-    // meta_pipe[META_PIPE-1] read twice: meta_use_alt + old_meta in training
-    meta_pipe[META_PIPE - 1].fanout(hard<2>{});
-    // meta_idx_pipe[META_PIPE-1] read once in training
-    val<1> meta_use_alt =
-        val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]} >= hard<0>{};
-    // When NUM_PATHS > 1, resolve_chain is called NUM_PATHS times, each reading
-    // meta_use_alt. fo1() would set read_credit=-1 permanently on the first
-    // call so we use lvalue reads (fanout credits) for multi-chain configs.
-    // NOTE: @prakhar @claude audit
-    if constexpr (NUM_PATHS >= 2)
-      meta_use_alt.fanout(hard<NUM_PATHS>{});
+    // meta_pipe[mb][META_PIPE-1] read twice: meta_use_alt + old_meta in training
+    arr<val<1>, META_BANKS> meta_use_alt = [&](u64 mb) -> val<1> {
+      meta_pipe[mb][META_PIPE - 1].fanout(hard<2>{});
+      return val<META_WIDTH, i64>{meta_pipe[mb][META_PIPE - 1]} >= hard<0>{};
+    };
+    // For multi-path configs, each meta_use_alt[mb] needs NUM_PATHS reads.
+    // For multi-group (BPE1), each is read once by its group's resolve_chain.
+    if constexpr (NUM_PATHS >= 2) {
+      for (u64 mb = 0; mb < META_BANKS; mb++)
+        meta_use_alt[mb].fanout(hard<NUM_PATHS>{});
+    }
 
     // ================================================================
     // Provider / altpred resolution via bitmask + one_hot
@@ -889,7 +915,8 @@ struct TageAhead : predictor {
       weak_mask.fanout(hard<NUM_CHAINS>{});
 
     auto resolve_chain = [&](arr<val<1>, NT> full_hits,
-                             val<PRED_BITS> fb_pred) {
+                             val<PRED_BITS> fb_pred,
+                             u64 meta_bank = 0) {
       val<MATCH_BITS> match = concat(val<1>{1}, full_hits.fo1().concat());
       // NOTE: @prakhar @claude audit
       match.fanout(hard<3>{}); // ha(>>1) + one_hot + remainder(^match1)
@@ -946,13 +973,13 @@ struct TageAhead : predictor {
       val<1> pw = (val<NT>{match1} & pw_mask.fo1()) != hard<0>{};
       // NOTE: @prakhar @claude audit: ua_comp(1) + return(1) = 2
       pw.fanout(hard<2>{});
-      // meta_use_alt: fo1() only safe for single chain call.
-      // For multi-chain use lvalue copy (fanout declared above).
+      // meta_use_alt: select the appropriate bank's counter.
+      // For single-bank configs (META_BANKS==1), bank is always 0.
       auto mua = [&]() -> val<1> {
-        if constexpr (NUM_CHAINS == 1)
-          return meta_use_alt.fo1();
+        if constexpr (META_BANKS == 1 && NUM_CHAINS == 1)
+          return meta_use_alt[0].fo1();
         else
-          return val<1>{meta_use_alt};
+          return val<1>{meta_use_alt[meta_bank]};
       }();
       val<1> ua = pw & mua.fo1() & ha.fo1();
       // ua: no internal reads, returned via fo1; outside binding gets fanout(N)
@@ -1154,18 +1181,26 @@ struct TageAhead : predictor {
       else
         return val<MATCH_BITS>{hard<0>{}}; // placeholder, overwritten below
     }();
-    val<1> pre_read_pw = [&]() -> val<1> {
-      if constexpr (NUM_GROUPS > 1)
-        return train_provider_weak[train_group].fo1();
-      else
+    // Pre-read pw/ad for all groups (META_BANKS>1 needs per-group training).
+    // For META_BANKS==1, only train_group is needed (backward compat).
+    arr<val<1>, NUM_GROUPS> pre_read_pw = [&](u64 g) -> val<1> {
+      if constexpr (NUM_GROUPS > 1) {
+        if constexpr (META_BANKS > 1)
+          return train_provider_weak[g].fo1();
+        else
+          return (g == u64(train_group)) ? train_provider_weak[g].fo1() : val<1>{hard<0>{}};
+      } else
         return val<1>{hard<0>{}}; // placeholder
-    }();
-    val<1> pre_read_ad = [&]() -> val<1> {
-      if constexpr (NUM_GROUPS > 1)
-        return train_altdiff[train_group].fo1();
-      else
+    };
+    arr<val<1>, NUM_GROUPS> pre_read_ad = [&](u64 g) -> val<1> {
+      if constexpr (NUM_GROUPS > 1) {
+        if constexpr (META_BANKS > 1)
+          return train_altdiff[g].fo1();
+        else
+          return (g == u64(train_group)) ? train_altdiff[g].fo1() : val<1>{hard<0>{}};
+      } else
         return val<1>{hard<0>{}}; // placeholder
-    }();
+    };
 
     if constexpr (NUM_GROUPS > 1) {
       // ---- Per-group resolution chains ----
@@ -1253,7 +1288,7 @@ struct TageAhead : predictor {
 
         val<PRED_BITS> fb_g = extract_group_fb.template operator()<G>();
         auto [m1, m2, pp, ap, pw, ad, ua] =
-            resolve_chain(group_hits.fo1(), fb_g);
+            resolve_chain(group_hits.fo1(), fb_g, GROUP_TO_META_BANK[G]);
 
         // Scatter: assign pred[I] for branches belonging to this group
         // NOTE: @prakhar @claude audit
@@ -1274,6 +1309,73 @@ struct TageAhead : predictor {
         train_provider_pred[G] = pp;
         train_provider_weak[G] = pw.fo1();
         train_altdiff[G] = ad.fo1();
+
+#ifdef TAGE_MONITOR
+        // Record per-group provider info for monitor
+        {
+          u64 m1v = static_cast<u64>(m1);
+          u64 m2v = static_cast<u64>(m2);
+          bool meta_overrode = static_cast<u64>(pw) &&
+              ((m2v & ((1ULL << NT) - 1)) != 0);
+          bool meta_chose = static_cast<u64>(ua);
+          u64 prov = decltype(mon)::decode_provider(m1v);
+          bool has_tage = (prov < NT);
+
+          // any_tag_hit for this group: htag matched AND group_id==G
+          // (ignoring sec_tag — that's the counterfactual question)
+          bool any_tag_hit_g = false;
+          u64 tag_only_provider_g = NT; // highest matching table ignoring sec
+          for (u64 i = 0; i < NT; i++) {
+            if (mon_tag_hit[i]) {
+              // Check if this entry's group_id matches G
+              u64 gid = static_cast<u64>(val<GROUP_BITS>{current_group_id[i]});
+              if (gid == G) {
+                if (!any_tag_hit_g) tag_only_provider_g = i;
+                any_tag_hit_g = true;
+              }
+            }
+          }
+
+          // tag_only_pred: what would tag-only provider (ignoring sec) predict?
+          // Use software-only reads to avoid creating hardware
+          u64 tag_only_pred_val = 0;
+          if (tag_only_provider_g < NT) {
+            tag_only_pred_val = static_cast<u64>(prefetch_pred[tag_only_provider_g]);
+          } else {
+            // No tag match at all — use fb prediction (software read)
+            tag_only_pred_val = static_cast<u64>(prefetch_fb);
+          }
+
+          // Attribute to each branch in this group
+          static_loop<N>([&]<u64 I>() {
+            if constexpr (BRANCH_TO_GROUP[I] == G) {
+              static constexpr u64 POS = BRANCH_IN_GROUP[I];
+              bool pred_taken = static_cast<u64>(pred[I]);
+              bool tag_only_taken = (tag_only_pred_val >> POS) & 1;
+              mon.record_prediction(I, m1v, m2v, meta_overrode, meta_chose,
+                                    pred_taken, any_tag_hit_g, has_tage,
+                                    tag_only_taken, GROUP_TO_META_BANK[G]);
+            }
+          });
+
+          // Record provider entry lifetime + bank
+          if (has_tage) {
+            u64 prov_index = static_cast<u64>(val<MAX_IDX_BITS>{current_idx[prov]});
+            // Count correct predictions for this group's branches
+            u64 nc = 0, nb = 0;
+            static_loop<N>([&]<u64 I>() {
+              if constexpr (BRANCH_TO_GROUP[I] == G) {
+                nb++;
+                if (static_cast<u64>(pred[I]) == static_cast<u64>(branch_dir[I]))
+                  nc++;
+              }
+            });
+            mon.record_provider_entry(prov, prov_index, nb, nc);
+            bool all_correct = (nc == nb);
+            mon.record_bank_provider(prov, prov_index, all_correct);
+          }
+        }
+#endif
       });
     }
 
@@ -1441,13 +1543,13 @@ struct TageAhead : predictor {
     }();
     val<1> t_pw = [&]() -> val<1> {
       if constexpr (NUM_GROUPS > 1)
-        return pre_read_pw;
+        return pre_read_pw[train_group];
       else
         return train_provider_weak[train_group].fo1();
     }();
     val<1> t_ad = [&]() -> val<1> {
       if constexpr (NUM_GROUPS > 1)
-        return pre_read_ad;
+        return pre_read_ad[train_group];
       else
         return train_altdiff[train_group].fo1();
     }();
@@ -1994,25 +2096,31 @@ struct TageAhead : predictor {
 #endif
 
     // ---- Step 5: Meta counter update ----
-    auto old_meta = val<META_WIDTH, i64>{meta_pipe[META_PIPE - 1]};
-    // NOTE: @prakhar @claude audit
-    old_meta.fanout(hard<2>{}); // ta_update_ctr(1) + (new_meta != old_meta)(1)
-    auto new_meta = [&]() {
-      if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG)
-        return ta_update_ctr(old_meta, any_provider_wrong);
-      else
-        return ta_update_ctr(old_meta, any_provider_wrong.fo1());
-    }();
-    // NOTE: @prakhar @claude audit
-    new_meta.fanout(hard<2>{}); // (new_meta != old_meta)(1) + meta_ctr.write(1)
-    val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
-    // NOTE: @prakhar @claude audit
-    meta_gate.fanout(hard<5>{}); // meta_ctr.write: B=2 bank writes + write_bank
-                                 // + write_localaddr + write_data
-    execute_if(meta_gate, [&]() {
-      meta_ctr.write(val<META_IDX_BITS>{meta_idx_pipe[META_PIPE - 1].fo1()},
-                     new_meta, hard<0>{});
-    });
+    // META_BANKS>1: each bank is an independent meta RAM. Training updates
+    // the bank corresponding to train_group's meta bank.
+    {
+      u64 tmb = (NUM_GROUPS > 1) ? GROUP_TO_META_BANK[train_group] : 0;
+      auto old_meta = val<META_WIDTH, i64>{meta_pipe[tmb][META_PIPE - 1]};
+      // NOTE: @prakhar @claude audit
+      old_meta.fanout(hard<2>{}); // ta_update_ctr(1) + (new_meta != old_meta)(1)
+      auto new_meta = [&]() {
+        if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG)
+          return ta_update_ctr(old_meta, any_provider_wrong);
+        else
+          return ta_update_ctr(old_meta, any_provider_wrong.fo1());
+      }();
+      // NOTE: @prakhar @claude audit
+      new_meta.fanout(hard<2>{}); // (new_meta != old_meta)(1) + meta_ctr.write(1)
+      val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
+      // NOTE: @prakhar @claude audit
+      meta_gate.fanout(hard<5>{}); // meta_ctr.write: B=2 bank writes + write_bank
+                                   // + write_localaddr + write_data
+      execute_if(meta_gate, [&]() {
+        meta_ctr[tmb].write(
+            val<META_IDX_BITS>{meta_idx_pipe[tmb][META_PIPE - 1].fo1()},
+            new_meta, hard<0>{});
+      });
+    }
 
     // ---- Merged per-table writes (one write per RAM per table) ----
     // For each table: alloc takes priority over update. Mux selects data.

@@ -19,7 +19,7 @@ using i64 = int64_t;
 
 template <u64 NUM_TABLES, u64 N, u64 MAX_TABLE_ENTRIES = 2048,
           bool USE_GSHARE = false, u64 FB_CAPACITY = 8192,
-          u64 NUM_GROUPS = 1, u64 NUM_BANKS = 2>
+          u64 NUM_GROUPS = 1, u64 NUM_BANKS = 2, u64 NUM_META_BANKS = 1>
 struct TAMonitor {
 
   static constexpr const char *FB_NAME = USE_GSHARE ? "Gshare" : "Bimodal";
@@ -207,6 +207,18 @@ struct TAMonitor {
     u64 meta_chose_alt_correct = 0;
     u64 meta_chose_pri = 0;
     u64 meta_chose_pri_correct = 0;
+
+    // Per-meta-bank stats (META_BANKS separate meta RAMs)
+    struct MetaBankStats {
+      u64 override_count = 0;   // meta was involved (pw & ad)
+      u64 override_correct = 0;
+      u64 chose_alt = 0;        // meta chose alt pred
+      u64 chose_alt_correct = 0;
+      u64 chose_pri = 0;        // meta chose primary (TAGE)
+      u64 chose_pri_correct = 0;
+      u64 total = 0;            // total branches using this meta bank
+    };
+    std::array<MetaBankStats, NUM_META_BANKS> meta_bank_stats{};
 
     // Provider source breakdown (per branch):
     //   no_tag_match:   no TAGE table had a tag match at all
@@ -400,10 +412,11 @@ struct TAMonitor {
   std::array<u64, N> shadow_pc{};
   // Feature 24: shadow fallback prediction per branch
   std::array<bool, N> shadow_fb_pred{};
-  // Provider source breakdown shadow
-  bool shadow_any_tag_hit = false;
-  bool shadow_has_tage_provider = false;
+  // Provider source breakdown shadow (per-rank for NUM_GROUPS>1 correctness)
+  std::array<bool, N> shadow_any_tag_hit{};
+  std::array<bool, N> shadow_has_tage_provider{};
   std::array<bool, N> shadow_tag_only_pred{};
+  std::array<u64, N> shadow_meta_bank{};
 
   // Per-PC diagnostics
   std::unordered_map<u64, PCDiag> pc_diag;
@@ -615,16 +628,18 @@ struct TAMonitor {
                           bool pred_taken,
                           bool any_tag_hit = false,
                           bool has_tage_provider = false,
-                          bool tag_only_pred = false) {
+                          bool tag_only_pred = false,
+                          u64 meta_bank = 0) {
     u64 prov = decode_provider(match1_val);
     shadow_provider[rank] = prov;
     shadow_alt[rank] = decode_provider(match2_val);
     shadow_meta_overrode[rank] = meta_overrode;
     shadow_meta_chose_alt[rank] = meta_chose_alt;
     shadow_pred[rank] = pred_taken;
-    shadow_any_tag_hit = any_tag_hit;
-    shadow_has_tage_provider = has_tage_provider;
+    shadow_any_tag_hit[rank] = any_tag_hit;
+    shadow_has_tage_provider[rank] = has_tage_provider;
     shadow_tag_only_pred[rank] = tag_only_pred;
+    shadow_meta_bank[rank] = meta_bank;
   }
 
   // Feature 24: record fallback prediction per branch (call from TageAhead)
@@ -665,11 +680,31 @@ struct TAMonitor {
         }
       }
 
+      // Per-meta-bank tracking
+      {
+        u64 mb = shadow_meta_bank[rank];
+        if (mb < NUM_META_BANKS) {
+          auto &mbs = c.meta_bank_stats[mb];
+          mbs.total++;
+          if (shadow_meta_overrode[rank]) {
+            mbs.override_count++;
+            if (correct) mbs.override_correct++;
+            if (shadow_meta_chose_alt[rank]) {
+              mbs.chose_alt++;
+              if (correct) mbs.chose_alt_correct++;
+            } else {
+              mbs.chose_pri++;
+              if (correct) mbs.chose_pri_correct++;
+            }
+          }
+        }
+      }
+
       // Provider source breakdown
-      if (!shadow_any_tag_hit) {
+      if (!shadow_any_tag_hit[rank]) {
         c.prov_no_tag_match++;
         if (correct) c.prov_no_tag_match_correct++;
-      } else if (!shadow_has_tage_provider) {
+      } else if (!shadow_has_tage_provider[rank]) {
         c.prov_sec_tag_reject++;
         if (correct) c.prov_sec_tag_reject_correct++;
         // Counterfactual: would tag-only provider have been correct?
@@ -1135,6 +1170,10 @@ struct TAMonitor {
       os << "prov_no_tag%,prov_sec_rej%,prov_meta_alt%,prov_meta_pri%,prov_no_meta%,";
       os << "cf_sec_fb_acc%,cf_sec_tage_acc%,";
       os << "ben_rej%,ben_incr%,ben_decr%,ben_ctr_avg";
+      if constexpr (NUM_META_BANKS > 1) {
+        for (u64 mb = 0; mb < NUM_META_BANKS; mb++)
+          os << ",mb" << mb << "_ovrd%,mb" << mb << "_acc%";
+      }
       os << "\n";
       header_printed = true;
     }
@@ -1236,6 +1275,14 @@ struct TAMonitor {
        << "," << pct(w.ben_decr, w.ben_reject_all)
        << "," << (w.ben_ctr_samples > 0
                       ? double(w.ben_ctr_sum) / w.ben_ctr_samples : 0.0);
+
+    if constexpr (NUM_META_BANKS > 1) {
+      for (u64 mb = 0; mb < NUM_META_BANKS; mb++) {
+        auto &mbs = w.meta_bank_stats[mb];
+        os << "," << pct(mbs.override_count, mbs.total)
+           << "," << pct(mbs.override_correct, mbs.override_count);
+      }
+    }
 
     os << "\n";
   }
@@ -1347,6 +1394,24 @@ struct TAMonitor {
     os << "  Chose primary: " << c.meta_chose_pri
        << "  Correct: " << c.meta_chose_pri_correct << " ("
        << pct(c.meta_chose_pri_correct, c.meta_chose_pri) << "%)\n";
+
+    // Per-meta-bank breakdown
+    if constexpr (NUM_META_BANKS > 1) {
+      os << "\nMeta Bank Breakdown (" << NUM_META_BANKS << " banks):\n";
+      os << "  Bank | Branches | Override | OvrdAcc% | Alt%   | AltAcc% | Pri%   | PriAcc%\n";
+      os << "  -----+----------+----------+----------+--------+---------+--------+--------\n";
+      for (u64 mb = 0; mb < NUM_META_BANKS; mb++) {
+        auto &mbs = c.meta_bank_stats[mb];
+        os << "  M" << mb << std::setw(3 - (mb >= 10 ? 1 : 0)) << "" << "|"
+           << std::setw(9) << mbs.total << " |"
+           << std::setw(9) << mbs.override_count << " |"
+           << std::setw(8) << pct(mbs.override_correct, mbs.override_count) << "% |"
+           << std::setw(6) << pct(mbs.chose_alt, mbs.total) << "% |"
+           << std::setw(7) << pct(mbs.chose_alt_correct, mbs.chose_alt) << "% |"
+           << std::setw(6) << pct(mbs.chose_pri, mbs.total) << "% |"
+           << std::setw(7) << pct(mbs.chose_pri_correct, mbs.chose_pri) << "%\n";
+      }
+    }
 
     // Provider source breakdown
     u64 prov_total = c.prov_no_tag_match + c.prov_sec_tag_reject +
@@ -2127,20 +2192,46 @@ struct TAMonitor {
         }
       }
 
-      // Bank balance: ratio of busier to quieter bank
+      // Bank balance: ratio of busiest to quietest bank per table
       os << "\n  Bank Balance (write imbalance per table):\n";
-      os << "  Table | B0 Writes | B1 Writes | Ratio\n";
-      os << "  ------+-----------+-----------+------\n";
-      for (u64 t = 0; t < NUM_TABLES; t++) {
-        u64 w0 = bank_cum[t][0].total_writes;
-        u64 w1 = NUM_BANKS > 1 ? bank_cum[t][1].total_writes : 0;
-        double ratio = (w0 + w1 > 0)
-                           ? double(std::max(w0, w1)) / std::max(u64(1), std::min(w0, w1))
-                           : 1.0;
-        os << "  T" << std::setw(t >= 10 ? 1 : 2) << t
-           << "   |" << std::setw(10) << w0
-           << " |" << std::setw(10) << w1
-           << " |" << std::setprecision(2) << std::setw(5) << ratio << "\n";
+      if constexpr (NUM_BANKS <= 2) {
+        os << "  Table | B0 Writes | B1 Writes | Ratio\n";
+        os << "  ------+-----------+-----------+------\n";
+        for (u64 t = 0; t < NUM_TABLES; t++) {
+          u64 w0 = bank_cum[t][0].total_writes;
+          u64 w1 = NUM_BANKS > 1 ? bank_cum[t][1].total_writes : 0;
+          double ratio = (w0 + w1 > 0)
+                             ? double(std::max(w0, w1)) / std::max(u64(1), std::min(w0, w1))
+                             : 1.0;
+          os << "  T" << std::setw(t >= 10 ? 1 : 2) << t
+             << "   |" << std::setw(10) << w0
+             << " |" << std::setw(10) << w1
+             << " |" << std::setprecision(2) << std::setw(5) << ratio << "\n";
+        }
+      } else {
+        // Multi-bank: show all banks with min/max/ratio
+        os << "  Table |";
+        for (u64 b = 0; b < NUM_BANKS; b++)
+          os << " B" << b << std::setw(6) << " |";
+        os << " MaxMin Ratio\n";
+        os << "  ------+";
+        for (u64 b = 0; b < NUM_BANKS; b++)
+          os << "---------+";
+        os << "-------------\n";
+        for (u64 t = 0; t < NUM_TABLES; t++) {
+          u64 mn = UINT64_MAX, mx = 0;
+          os << "  T" << std::setw(t >= 10 ? 1 : 2) << t << "   |";
+          for (u64 b = 0; b < NUM_BANKS; b++) {
+            u64 w = bank_cum[t][b].total_writes;
+            if (w < mn) mn = w;
+            if (w > mx) mx = w;
+            os << std::setw(8) << w << " |";
+          }
+          double ratio = (mx + mn > 0)
+                             ? double(mx) / std::max(u64(1), mn)
+                             : 1.0;
+          os << std::setprecision(2) << std::setw(10) << ratio << "\n";
+        }
       }
 
       // Per-bank occupancy and staleness

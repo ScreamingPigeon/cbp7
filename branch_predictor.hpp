@@ -30,7 +30,7 @@ template <auto... Args> using perceptron = experiment_perceptron<Args...>;
 // Sweep helpers: 1C base macro, parameterized by AllocConfig
 // ============================================================================
 #define TA1C_BASE(ALLOC_CFG)                                                   \
-  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+  TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
       7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
       7, false, /* BR_P_ENTRY=N, INTERLEAVED=false */                          \
@@ -43,7 +43,7 @@ using TageAhead1C = TageAhead<TA1C_BASE(TAAllocPressSkip)>;
 
 // BR_P_ENTRY sweep: test per-group tag encoding
 #define TA1C_BPE(BPE, INTLV, ALLOC_CFG)                                       \
-  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+  TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
       7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
       BPE, INTLV,                                                              \
@@ -64,34 +64,34 @@ using TA1C_BPE1I = TageAhead<TA1C_BPE(1, true, TAAllocPressSkip)>;  // NUM_GROUP
 #define S1_STP(STP)                                                            \
   TA1C_BASE(TAAllocPressSkip),                                                 \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
-      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
       ta::DefaultEpochTrigger, false, true, false, 0, false, STP
 
 // S1 base with variable META_WIDTH (MW) and META_CAPACITY (MC)
 #define S1_META(MW, MC)                                                        \
-  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+  TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
       7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
       UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, MW,    \
       MC, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                    \
       SiblingPolicy::ALL, 0, 10, 10,                                           \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
-      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false
 
 // S1 base with variable META_WIDTH/CAPACITY and doubled bimodal (16384)
 #define S1_META_BIM2X(MW, MC)                                                  \
-  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+  TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
       7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
       UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, MW,   \
       MC, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                    \
       SiblingPolicy::ALL, 0, 10, 10,                                           \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
-      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false
 
 // 1C base with doubled bimodal (16384 entries)
 #define TA1C_BASE_BIM2X(ALLOC_CFG)                                             \
-  TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
+  TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,           \
                 ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
       7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1, 2, 2,                         \
       UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 16384, false, 6, 2,    \
@@ -635,6 +635,28 @@ using S9_GT_GT11_7  = TageAhead<S1_GT_BASE(S9_TC_GT11_7)>;  // graded 11→7
 using S9_GT_GT12_8  = TageAhead<S1_GT_BASE(S9_TC_GT12_8)>;  // graded 12→8
 using S9_GT_GT13_9  = TageAhead<S1_GT_BASE(S9_TC_GT13_9)>;  // graded 13→9
 using S9_GT_GT14_8  = TageAhead<S1_GT_BASE(S9_TC_GT14_8)>;  // graded 14→8
+
+// BPE=1 with 8 banks, 15 tables (matching HC_IR hardware config) for monitor runs
+using S9_TC_U11_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                   ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                   ta::uniform_array<u64, 15>(1),
+                                   ta::uniform_array<u64, 15>(8)>;
+#define S1_BPE1_8B_BASE(TABLE_CFG)                                             \
+  TABLE_CFG,                                                                   \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      1, false, /* BR_P_ENTRY=1, INTERLEAVED=false */                          \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
+
+using TA1C_BPE1_8B = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B)>;
+// META_BANKS variants: per-branch meta counters
+using TA1C_BPE1_8B_MB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4>;
+using TA1C_BPE1_8B_MB7 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 7>;
 
 // BPE=1 (NUM_GROUPS=7, GROUP_BITS=3, eff = raw - 3)
 using S9_BPE1_U8      = TageAhead<S1_BPE1_BASE(S9_TC_U8)>;      // raw 8,  eff 5

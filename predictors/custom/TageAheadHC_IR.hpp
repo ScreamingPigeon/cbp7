@@ -22,7 +22,7 @@ using namespace hcm;
 struct TageAheadHC_IR : predictor {
 
   // ======== Constants (hardcoded from S3_MW4_MC2048 + BPE1) ========
-  static constexpr u64 NT = 15;           // number of tables
+  static constexpr u64 NT = 14;           // number of tables
   static constexpr u64 N = 7;             // max conditional branches per block
   static constexpr u64 PATHBITS = 6;
   static constexpr u64 SEC_TAG_BITS = 5;
@@ -39,7 +39,7 @@ struct TageAheadHC_IR : predictor {
   static constexpr u64 META_CAPACITY = 2048;
   static constexpr u64 META_IDX_BITS = 11; // clog2(2048)
   static constexpr u64 META_PIPE = 2;
-  static constexpr u64 MATCH_BITS = NT + 1; // = 16
+  static constexpr u64 MATCH_BITS = NT + 1; // = 15
   static constexpr u64 ALLOC_PC_BITS = TAG_WIDTH + 2; // = 13
   static constexpr u64 ACC_WIDTH = 10;
   static constexpr u64 ALLOC_WIDTH = 10;
@@ -55,19 +55,19 @@ struct TageAheadHC_IR : predictor {
   // Per-table sizes: T0 bumped to 1024 (was GradedSize<512, 2048>)
   static constexpr std::array<u64, NT> TABLE_SIZE = {
     1024, 1024, 1024, 1024, 1024,
-    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048
+    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048
   };
-  // Per-table history lengths: geometric_hist<15>(8, 200)
+  // Per-table history lengths: geometric_hist<14>(8, 200)
   static constexpr std::array<u64, NT> HIST_LEN =
       ta::geometric_hist<NT>(8, 200);
   // Per-table IDX bits
   static constexpr std::array<u64, NT> IDX_BITS = {
-    10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11
+    10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11
   };
   // Per-table hyst sizes (shared hyst: TABLE_SIZE/2)
   static constexpr std::array<u64, NT> HYST_SIZE = {
     512, 512, 512, 512, 512,
-    1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024
+    1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024
   };
 
   // Per-bit GH fanout (USE_GSHARE=false, so no fb_fold contribution)
@@ -196,16 +196,6 @@ struct TageAheadHC_IR : predictor {
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram4{"t4_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram4{"t4_u"};
 
-  // ---- Table 14 (2048 entries, IDX=11) — placed here to fill gap ----
-  hcm::ram<val<TAG_WIDTH>, 2048> tag_ram14{"t14_tag"};
-  ta_folded_gh<11> fold_idx14;
-  ta_folded_gh<TAG_WIDTH> fold_tag14;
-  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram14{"t14_sec"};
-  hcm::zone zone14;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram14{"t14_pred"};
-  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram14{"t14_hyst"};
-  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram14{"t14_u"};
-
   // ---- Table 5 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram5{"t5_tag"};
   ta_folded_gh<11> fold_idx5;
@@ -236,7 +226,7 @@ struct TageAheadHC_IR : predictor {
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram7{"t7_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram7{"t7_u"};
 
-  // ---- Fallback RAM (mid-array) ----
+  // ---- Fallback RAM (mid-array, between T7 and T8) ----
   hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
 
   // ---- Table 8 (2048 entries, IDX=11) ----
@@ -347,8 +337,7 @@ struct TageAheadHC_IR : predictor {
     else if constexpr (I == 10) return name##10;                               \
     else if constexpr (I == 11) return name##11;                               \
     else if constexpr (I == 12) return name##12;                               \
-    else if constexpr (I == 13) return name##13;                               \
-    else return name##14;                                                      \
+    else return name##13;                                                      \
   }
   HC_DISPATCH(tag_ram)
   HC_DISPATCH(pred_ram)
@@ -361,7 +350,7 @@ struct TageAheadHC_IR : predictor {
 
   // Per-table HYST_IDX_BITS
   static constexpr std::array<u64, NT> HYST_IDX_BITS = {
-    9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
+    9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10
   };
 
   // ======== Helpers ========
@@ -583,7 +572,7 @@ struct TageAheadHC_IR : predictor {
     branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
 
     // Precompute per-table sec_tag match (once, not per-group × per-table)
-    // Reduces sec_tag_now fanout from NT*NUM_GROUPS+1=113 to NT+1=17
+    // Reduces sec_tag_now fanout from NT*NUM_GROUPS+1=99 to NT+1=15
     arr<val<1>, NT> sec_matches = [&](u64 i) -> val<1> {
       return val<SEC_TAG_BITS>{prefetch_sec[i]} ==
              val<SEC_TAG_BITS>{sec_tag_now};
