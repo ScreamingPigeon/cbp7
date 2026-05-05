@@ -249,6 +249,15 @@ struct TageAhead : predictor {
   static constexpr u64 FB_BANK_SEL_BITS = (FB_BANKS > 1) ? ta::clog2(FB_BANKS) : 0;
   static constexpr u64 FB_BANK_CAPACITY = FB_CAPACITY / FB_BANKS;
   static constexpr u64 FB_BANK_IDX_BITS = ta::clog2(FB_BANK_CAPACITY);
+  // Upper bits above the bank-select field: fb_idx[IDX-1 : SHIFT+SEL]
+  static constexpr u64 FB_BANK_UPPER_BITS =
+      (FB_BANKS > 1) ? (ta::clog2(FB_CAPACITY) - FB_BANK_SEL_SHIFT - FB_BANK_SEL_BITS) : 0;
+  static_assert(FB_BANKS == 1 ||
+                FB_BANK_SEL_SHIFT + FB_BANK_SEL_BITS <= ta::clog2(FB_CAPACITY),
+                "FB_BANK_SEL_SHIFT + SEL_BITS exceeds FB_IDX_BITS");
+  static_assert(FB_BANKS == 1 ||
+                FB_BANK_UPPER_BITS + FB_BANK_SEL_SHIFT == FB_BANK_IDX_BITS,
+                "bank index bits must equal upper + lower bits around select field");
   // Width per fb RAM: 1-bit per group when FB_SPLIT_WIDTH, else N-wide
   static constexpr u64 FB_RAM_WIDTH = FB_SPLIT_WIDTH ? CTR_WIDTH : FB_PRED_BITS;
   static constexpr u64 FB_NUM_WIDTH_RAMS = FB_SPLIT_WIDTH ? NUM_GROUPS : 1;
@@ -636,16 +645,31 @@ struct TageAhead : predictor {
       prefetch_fb = fb_bits.concat();
     } else if constexpr (FB_BANKS > 1 && !FB_SPLIT_WIDTH) {
       // Address-banked only: read all banks, MUX by bank_sel
-      auto fb_bank_idx = val<FB_BANK_IDX_BITS>{fb_idx};
       auto fb_bank_sel = val<FB_BANK_SEL_BITS>{fb_idx >> FB_BANK_SEL_SHIFT};
+      // Remove bank-select bits: idx = {upper, lower} around sel field
+      auto fb_bank_idx = [&]() {
+        if constexpr (FB_BANK_SEL_SHIFT == 0)
+          return val<FB_BANK_IDX_BITS>{fb_idx >> FB_BANK_SEL_BITS};
+        else
+          return val<FB_BANK_IDX_BITS>{
+            concat(val<FB_BANK_UPPER_BITS>{fb_idx >> (FB_BANK_SEL_SHIFT + FB_BANK_SEL_BITS)},
+                   val<FB_BANK_SEL_SHIFT>{fb_idx})};
+      }();
       arr<val<FB_PRED_BITS>, FB_BANKS> bank_reads = [&](u64 b) -> val<FB_PRED_BITS> {
         return fb_ctr[0][b].read(fb_bank_idx);
       };
       prefetch_fb = bank_reads.select(fb_bank_sel);
     } else {
       // Both: read all banks per group, MUX by bank_sel
-      auto fb_bank_idx = val<FB_BANK_IDX_BITS>{fb_idx};
       auto fb_bank_sel = val<FB_BANK_SEL_BITS>{fb_idx >> FB_BANK_SEL_SHIFT};
+      auto fb_bank_idx = [&]() {
+        if constexpr (FB_BANK_SEL_SHIFT == 0)
+          return val<FB_BANK_IDX_BITS>{fb_idx >> FB_BANK_SEL_BITS};
+        else
+          return val<FB_BANK_IDX_BITS>{
+            concat(val<FB_BANK_UPPER_BITS>{fb_idx >> (FB_BANK_SEL_SHIFT + FB_BANK_SEL_BITS)},
+                   val<FB_BANK_SEL_SHIFT>{fb_idx})};
+      }();
       arr<val<1>, NUM_GROUPS> fb_bits = [&](u64 g) -> val<1> {
         arr<val<1>, FB_BANKS> grp_bank_reads = [&](u64 b) -> val<1> {
           return fb_ctr[g][b].read(fb_bank_idx);
@@ -2133,8 +2157,15 @@ struct TageAhead : predictor {
           }
         });
       } else if constexpr (FB_BANKS > 1 && !FB_SPLIT_WIDTH) {
-        auto bank_idx = val<FB_BANK_IDX_BITS>{idx_val};
         auto bank_sel = val<FB_BANK_SEL_BITS>{idx_val >> FB_BANK_SEL_SHIFT};
+        auto bank_idx = [&]() {
+          if constexpr (FB_BANK_SEL_SHIFT == 0)
+            return val<FB_BANK_IDX_BITS>{idx_val >> FB_BANK_SEL_BITS};
+          else
+            return val<FB_BANK_IDX_BITS>{
+              concat(val<FB_BANK_UPPER_BITS>{idx_val >> (FB_BANK_SEL_SHIFT + FB_BANK_SEL_BITS)},
+                     val<FB_BANK_SEL_SHIFT>{idx_val})};
+        }();
         static_loop<FB_BANKS>([&]<u64 B>() {
           val<1> bank_en = gate & (bank_sel == hard<B>{});
           execute_if(bank_en, [&]() {
@@ -2142,8 +2173,15 @@ struct TageAhead : predictor {
           });
         });
       } else {
-        auto bank_idx = val<FB_BANK_IDX_BITS>{idx_val};
         auto bank_sel = val<FB_BANK_SEL_BITS>{idx_val >> FB_BANK_SEL_SHIFT};
+        auto bank_idx = [&]() {
+          if constexpr (FB_BANK_SEL_SHIFT == 0)
+            return val<FB_BANK_IDX_BITS>{idx_val >> FB_BANK_SEL_BITS};
+          else
+            return val<FB_BANK_IDX_BITS>{
+              concat(val<FB_BANK_UPPER_BITS>{idx_val >> (FB_BANK_SEL_SHIFT + FB_BANK_SEL_BITS)},
+                     val<FB_BANK_SEL_SHIFT>{idx_val})};
+        }();
         static_loop<FB_BANKS>([&]<u64 B>() {
           val<1> bank_en = gate & (bank_sel == hard<B>{});
           execute_if(bank_en, [&]() {

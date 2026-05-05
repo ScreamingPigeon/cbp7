@@ -663,6 +663,62 @@ using TA1C_BPE1_8B_FB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true>;
 using TA1C_BPE1_8B_FB4_S6 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 6, true>;
 using TA1C_BPE1_8B_FB4_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4, 0, true, 2>;
 
+// ============================================================================
+// Sweep 10: Bank shift decorrelation
+//
+// With 8 banks and BANK_SHIFT=1 (baseline), predict and train indices share
+// bank bits on long-history tables because the folded index changes slowly.
+// Higher BANK_SHIFT picks higher-order index bits for bank select, which
+// change more between the 2-cycle predict/train gap.
+//
+// Table layout (T0=longest history, T14=shortest):
+//   T0: 512 entries (IDX=9),  max shift = 6 (9-3)
+//   T1-T4: 1024 entries (IDX=10), max shift = 7
+//   T5-T14: 2048 entries (IDX=11), max shift = 8
+//
+// Graded shifts: high shift on long-history tables, low on short-history.
+// ============================================================================
+
+// Max shift per table: shift + ceil_log2(banks) <= min(IDX, HYST_IDX)
+//   T0 (512 entries, hyst=256, IDX=9, HYST_IDX=8): max shift = 5
+//   T1-T4 (1024, hyst=512, IDX=10, HYST_IDX=9):   max shift = 6
+//   T5-T14 (2048, hyst=1024, IDX=11, HYST_IDX=10): max shift = 7
+
+// S10a: uniform shift=4 (mid-range baseline)
+using S10_TC_BS4 = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                 ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                 ta::uniform_array<u64, 15>(4),
+                                 ta::uniform_array<u64, 15>(8)>;
+using S10_BS4 = TageAhead<S1_BPE1_8B_BASE(S10_TC_BS4)>;
+
+// S10b: graded 5-3-1 (long→short history, respecting per-table max)
+using S10_TC_GBS_531 = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                     ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                     std::array<u64, 15>{5,5,4,4,3,3,3,2,2,2,1,1,1,1,1},
+                                     ta::uniform_array<u64, 15>(8)>;
+using S10_GBS_531 = TageAhead<S1_BPE1_8B_BASE(S10_TC_GBS_531)>;
+
+// S10c: graded 5-4-2 (gentler slope)
+using S10_TC_GBS_542 = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                     ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                     std::array<u64, 15>{5,5,5,4,4,4,4,3,3,3,2,2,2,2,2},
+                                     ta::uniform_array<u64, 15>(8)>;
+using S10_GBS_542 = TageAhead<S1_BPE1_8B_BASE(S10_TC_GBS_542)>;
+
+// S10d: max shift per table (aggressive — each table at its limit)
+using S10_TC_BS_MAX = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                    ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                    std::array<u64, 15>{5,6,6,6,6,7,7,7,7,7,7,7,7,7,7},
+                                    ta::uniform_array<u64, 15>(8)>;
+using S10_BS_MAX = TageAhead<S1_BPE1_8B_BASE(S10_TC_BS_MAX)>;
+
+// S10e: graded 5-1-0 (long-history max, short-history no shift)
+using S10_TC_GBS_510 = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                     ta::UniformTag<11>, ta::GradedSize<512, 2048>,
+                                     std::array<u64, 15>{5,4,3,3,2,2,1,1,1,0,0,0,0,0,0},
+                                     ta::uniform_array<u64, 15>(8)>;
+using S10_GBS_510 = TageAhead<S1_BPE1_8B_BASE(S10_TC_GBS_510)>;
+
 // BPE=1 (NUM_GROUPS=7, GROUP_BITS=3, eff = raw - 3)
 using S9_BPE1_U8      = TageAhead<S1_BPE1_BASE(S9_TC_U8)>;      // raw 8,  eff 5
 using S9_BPE1_U9      = TageAhead<S1_BPE1_BASE(S9_TC_U9)>;      // raw 9,  eff 6
