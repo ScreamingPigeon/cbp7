@@ -138,18 +138,21 @@ struct TageAheadHC_IR : predictor {
   // ====================================================================
 
   // ============================================================
-  // Per-table zone layout (Exp 6 — best):
-  //   tag, fold_idx, fold_tag, pred, sec, zone, hyst, u
-  // 14 zones: one per table separating predict/update paths.
+  // Per-table zone layout (IR-optimized):
+  //   tag, fold_idx, fold_tag, sec, zone, pred, hyst, u
+  // With 1-bit pred_rams (tiny), move them into the update zone
+  // to let the predict cluster (tag/fold/sec) pack tightly.
+  // pred_ram is read in predict1 (ahead pipeline) so the extra
+  // wiring from the update zone is small — 1-bit value travels.
   // ============================================================
 
   // ---- Table 0 (1024 entries, IDX=10) ----
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram0{"t0_tag"};
   ta_folded_gh<10> fold_idx0;
   ta_folded_gh<TAG_WIDTH> fold_tag0;
-  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram0{"t0_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram0{"t0_sec"};
   hcm::zone zone0;
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram0{"t0_pred"};
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram0{"t0_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram0{"t0_u"};
 
@@ -157,9 +160,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram1{"t1_tag"};
   ta_folded_gh<10> fold_idx1;
   ta_folded_gh<TAG_WIDTH> fold_tag1;
-  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram1{"t1_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram1{"t1_sec"};
   hcm::zone zone1;
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram1{"t1_pred"};
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram1{"t1_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram1{"t1_u"};
 
@@ -167,9 +170,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram2{"t2_tag"};
   ta_folded_gh<10> fold_idx2;
   ta_folded_gh<TAG_WIDTH> fold_tag2;
-  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram2{"t2_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram2{"t2_sec"};
   hcm::zone zone2;
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram2{"t2_pred"};
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram2{"t2_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram2{"t2_u"};
 
@@ -177,9 +180,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram3{"t3_tag"};
   ta_folded_gh<10> fold_idx3;
   ta_folded_gh<TAG_WIDTH> fold_tag3;
-  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram3{"t3_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram3{"t3_sec"};
   hcm::zone zone3;
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram3{"t3_pred"};
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram3{"t3_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram3{"t3_u"};
 
@@ -187,9 +190,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 1024> tag_ram4{"t4_tag"};
   ta_folded_gh<10> fold_idx4;
   ta_folded_gh<TAG_WIDTH> fold_tag4;
-  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram4{"t4_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 1024> sec_ram4{"t4_sec"};
   hcm::zone zone4;
+  ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram4{"t4_pred"};
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram4{"t4_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram4{"t4_u"};
 
@@ -197,9 +200,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram5{"t5_tag"};
   ta_folded_gh<11> fold_idx5;
   ta_folded_gh<TAG_WIDTH> fold_tag5;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram5{"t5_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram5{"t5_sec"};
   hcm::zone zone5;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram5{"t5_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram5{"t5_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram5{"t5_u"};
 
@@ -207,9 +210,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram6{"t6_tag"};
   ta_folded_gh<11> fold_idx6;
   ta_folded_gh<TAG_WIDTH> fold_tag6;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram6{"t6_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram6{"t6_sec"};
   hcm::zone zone6;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram6{"t6_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram6{"t6_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram6{"t6_u"};
 
@@ -217,9 +220,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram7{"t7_tag"};
   ta_folded_gh<11> fold_idx7;
   ta_folded_gh<TAG_WIDTH> fold_tag7;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram7{"t7_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram7{"t7_sec"};
   hcm::zone zone7;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram7{"t7_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram7{"t7_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram7{"t7_u"};
 
@@ -230,9 +233,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram8{"t8_tag"};
   ta_folded_gh<11> fold_idx8;
   ta_folded_gh<TAG_WIDTH> fold_tag8;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram8{"t8_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram8{"t8_sec"};
   hcm::zone zone8;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram8{"t8_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram8{"t8_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram8{"t8_u"};
 
@@ -240,9 +243,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram9{"t9_tag"};
   ta_folded_gh<11> fold_idx9;
   ta_folded_gh<TAG_WIDTH> fold_tag9;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram9{"t9_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram9{"t9_sec"};
   hcm::zone zone9;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram9{"t9_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram9{"t9_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram9{"t9_u"};
 
@@ -250,9 +253,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram10{"t10_tag"};
   ta_folded_gh<11> fold_idx10;
   ta_folded_gh<TAG_WIDTH> fold_tag10;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram10{"t10_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram10{"t10_sec"};
   hcm::zone zone10;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram10{"t10_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram10{"t10_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram10{"t10_u"};
 
@@ -260,9 +263,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram11{"t11_tag"};
   ta_folded_gh<11> fold_idx11;
   ta_folded_gh<TAG_WIDTH> fold_tag11;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram11{"t11_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram11{"t11_sec"};
   hcm::zone zone11;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram11{"t11_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram11{"t11_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram11{"t11_u"};
 
@@ -270,9 +273,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram12{"t12_tag"};
   ta_folded_gh<11> fold_idx12;
   ta_folded_gh<TAG_WIDTH> fold_tag12;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram12{"t12_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram12{"t12_sec"};
   hcm::zone zone12;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram12{"t12_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram12{"t12_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram12{"t12_u"};
 
@@ -280,9 +283,9 @@ struct TageAheadHC_IR : predictor {
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram13{"t13_tag"};
   ta_folded_gh<11> fold_idx13;
   ta_folded_gh<TAG_WIDTH> fold_tag13;
-  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram13{"t13_pred"};
   hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram13{"t13_sec"};
   hcm::zone zone13;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram13{"t13_pred"};
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram13{"t13_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram13{"t13_u"};
 
@@ -476,14 +479,14 @@ struct TageAheadHC_IR : predictor {
     // Fanout on prefetch_* regs:
     //   shift into current_* (1) + NUM_GROUPS group chains
     static_loop<NT>([&]<u64 I>() {
-      prefetch_tag_hit[I].fanout(hard<1 + NUM_GROUPS>{}); // shift + group_hits
+      prefetch_tag_hit[I].fanout(hard<2>{});  // shift + htag_sec precompute
       prefetch_pred[I].fanout(hard<1 + NUM_GROUPS>{});    // shift + table_preds
       prefetch_hyst[I].fanout(hard<2>{});    // shift + weak_mask
       prefetch_u[I].fanout(hard<2>{});       // shift + weak_mask
-      prefetch_sec[I].fanout(hard<1 + NUM_GROUPS>{});     // shift + sec_match
+      prefetch_sec[I].fanout(hard<2>{});     // shift + sec_match precompute
       prefetch_group_id[I].fanout(hard<1 + NUM_GROUPS>{}); // shift + group_id cmp
     });
-    prefetch_fb.fanout(hard<1 + NUM_GROUPS>{}); // shift + per-group fb extraction
+    prefetch_fb.fanout(hard<2>{}); // shift + fb_bits extraction
 
     // Shift prefetch → current (unconditional)
     static_loop<NT>([&]<u64 I>() {
@@ -517,8 +520,8 @@ struct TageAheadHC_IR : predictor {
 
     auto sec_tag_now = ta::Xor3SecTagHash5::apply<SEC_TAG_BITS>(
         block_end_info.next_pc);
-    // Fanout: reg write(1) + NT sec_match comparisons × NUM_GROUPS chains
-    sec_tag_now.fanout(hard<NT * NUM_GROUPS + 1>{});
+    // Fanout: reg write(1) + NT sec_match precomputes
+    sec_tag_now.fanout(hard<NT + 1>{});
     curr_sec_tag = sec_tag_now;
     // Alloc-path: NT sec_ram writes use the OLD sec_tag (saved before overwrite)
     train_sec_tag.fanout(hard<NT>{});
@@ -568,6 +571,25 @@ struct TageAheadHC_IR : predictor {
     // Save old prediction (block B) before scatter overwrites with B+1
     branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
 
+    // Precompute per-table sec_tag match (once, not per-group × per-table)
+    // Reduces sec_tag_now fanout from NT*NUM_GROUPS+1=99 to NT+1=15
+    arr<val<1>, NT> sec_matches = [&](u64 i) -> val<1> {
+      return val<SEC_TAG_BITS>{prefetch_sec[i]} ==
+             val<SEC_TAG_BITS>{sec_tag_now};
+    };
+
+    // Precompute per-table combined htag_hit & sec_match
+    // Reduces prefetch_tag_hit fanout from 8 to 2
+    arr<val<1>, NT> htag_sec = [&](u64 i) -> val<1> {
+      return val<1>{prefetch_tag_hit[i]} & sec_matches[i].fo1();
+    };
+    htag_sec.fanout(hard<NUM_GROUPS>{}); // one read per group chain
+
+    // Precompute per-group fb bits (split N-wide fb into individual bits)
+    // Reduces prefetch_fb fanout from 8 to 2
+    arr<val<1>, NUM_GROUPS> fb_bits =
+        val<FB_PRED_BITS>{prefetch_fb}.make_array(val<1>{});
+
     // Precompute per-table weakness: entry is weak when hyst==0 AND u==0.
     val<NT> weak_mask = [&]() {
       arr<val<1>, NT> w = [&](u64 i) -> val<1> {
@@ -616,17 +638,15 @@ struct TageAheadHC_IR : predictor {
       match2.fanout(hard<2>{});
       arr<val<1>, NT + 1> m2_bits = match2.make_array(val<1>{});
 
-      // 1-bit masking: replicate(1) is identity, simplifies to AND
-      arr<val<PRED_BITS>, NT + 1> pmask = [&](u64 i) {
-        return m1_bits[i].fo1().replicate(hard<PRED_BITS>{}).concat() &
-               table_preds[i];
+      // 1-bit masking: m1/m2 bit directly ANDs with 1-bit pred
+      arr<val<1>, NT + 1> pmask = [&](u64 i) {
+        return m1_bits[i].fo1() & table_preds[i];
       };
-      arr<val<PRED_BITS>, NT + 1> amask = [&](u64 i) {
-        return m2_bits[i].fo1().replicate(hard<PRED_BITS>{}).concat() &
-               table_preds[i];
+      arr<val<1>, NT + 1> amask = [&](u64 i) {
+        return m2_bits[i].fo1() & table_preds[i];
       };
-      val<PRED_BITS> pp = pmask.fo1().fold_or();
-      val<PRED_BITS> ap = amask.fo1().fold_or();
+      val<1> pp = pmask.fo1().fold_or();
+      val<1> ap = amask.fo1().fold_or();
       pp.fanout(hard<2>{});
       ap.fanout(hard<2>{});
 
@@ -635,8 +655,9 @@ struct TageAheadHC_IR : predictor {
 
       val<1> ua = pw & meta_use_alt & ha.fo1();
 
+      // 1-bit: XOR is already the disagreement bit
       auto pp_xor_ap = pp ^ ap;
-      val<1> ad = pp_xor_ap.fo1() != hard<0>{};
+      val<1> ad = pp_xor_ap.fo1();
 
       return std::tuple{val<MATCH_BITS>{match1},
                         val<MATCH_BITS>{match2},
@@ -649,19 +670,15 @@ struct TageAheadHC_IR : predictor {
 
     // ---- Per-group resolution loop ----
     static_loop<NUM_GROUPS>([&]<u64 G>() {
-      // Group hits: htag_hit & (group_id == G) & sec_tag match
+      // Group hits: precomputed (htag & sec) & group_id match
       arr<val<1>, NT> group_hits = [&](u64 i) -> val<1> {
-        val<1> htag_ok = val<1>{prefetch_tag_hit[i]};
         val<1> group_ok =
             val<GROUP_BITS>{prefetch_group_id[i]} == hard<G>{};
-        val<1> sec_match =
-            val<SEC_TAG_BITS>{prefetch_sec[i]} ==
-            val<SEC_TAG_BITS>{sec_tag_now};
-        return htag_ok & group_ok & sec_match;
+        return htag_sec[i] & group_ok;
       };
 
-      // Extract group G's fb bit from N-wide fallback
-      val<PRED_BITS> fb_g = val<1>{prefetch_fb >> G};
+      // Per-group fb bit (precomputed from make_array split)
+      val<PRED_BITS> fb_g = fb_bits[G].fo1();
 
       auto [m1, m2, pp, ap, pw, ad, ua] =
           resolve_chain(group_hits.fo1(), fb_g);

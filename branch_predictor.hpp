@@ -4,6 +4,7 @@
 #include "predictors/custom/Tage.hpp"
 #include "predictors/custom/TageAhead.hpp"
 #include "predictors/custom/TageAheadHC.hpp"
+#include "predictors/custom/TageAheadHC_IR.hpp"
 #include "predictors/custom/TageDirect.hpp"
 // #include "predictors/custom/TageDirectBim.hpp"
 #include "predictors/experiment_perceptron.hpp"
@@ -569,6 +570,82 @@ using HS_N2_L256_H400 = TageAhead<HISTSWEEP(2, 256, 16, 400)>;
 using HS_N2_L256_H600 = TageAhead<HISTSWEEP(2, 256, 24, 600)>;
 
 #endif // #if 0
+
+// ============================================================================
+// Sweep 9: S1 base + BPE=1 + graded tags
+//
+// S7_BASE is broken after BPE commit (missing BR_P_ENTRY/INTERLEAVED).
+// S1_GT_BASE / S1_BPE1_BASE are correct replacements.
+// ============================================================================
+
+#define S1_GT_BASE(TABLE_CFG)                                                  \
+  TABLE_CFG,                                                                   \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      7, false, /* BR_P_ENTRY=7, INTERLEAVED=false */                          \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
+
+#define S1_BPE1_BASE(TABLE_CFG)                                                \
+  TABLE_CFG,                                                                   \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      1, false, /* BR_P_ENTRY=1, INTERLEAVED=false */                          \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
+
+// Uniform tag widths
+using S9_TC_U8  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<8>,  ta::GradedSize<512, 2048>>;
+using S9_TC_U9  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<9>,  ta::GradedSize<512, 2048>>;
+using S9_TC_U10 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<10>, ta::GradedSize<512, 2048>>;
+using S9_TC_U11 = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                ta::UniformTag<11>, ta::GradedSize<512, 2048>>;
+
+// Graded tag configs (raw widths; eff = raw - GROUP_BITS)
+// BPE=7: GROUP_BITS=0, BPE=1: GROUP_BITS=3
+using S9_TC_GT10_6  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                    ta::GradedTag<10, 6>, ta::GradedSize<512, 2048>>;
+using S9_TC_GT11_7  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                    ta::GradedTag<11, 7>, ta::GradedSize<512, 2048>>;
+using S9_TC_GT12_8  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                    ta::GradedTag<12, 8>, ta::GradedSize<512, 2048>>;
+using S9_TC_GT13_9  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                    ta::GradedTag<13, 9>, ta::GradedSize<512, 2048>>;
+using S9_TC_GT14_8  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                    ta::GradedTag<14, 8>, ta::GradedSize<512, 2048>>;
+
+// BPE=7 baselines (GROUP_BITS=0, raw tag = effective tag)
+using S9_GT_U8      = TageAhead<S1_GT_BASE(S9_TC_U8)>;      // uniform 8
+using S9_GT_U9      = TageAhead<S1_GT_BASE(S9_TC_U9)>;      // uniform 9
+using S9_GT_U10     = TageAhead<S1_GT_BASE(S9_TC_U10)>;     // uniform 10
+using S9_GT_U11     = TageAhead<S1_GT_BASE(S9_TC_U11)>;     // uniform 11 (S1 baseline)
+using S9_GT_GT10_6  = TageAhead<S1_GT_BASE(S9_TC_GT10_6)>;  // graded 10→6
+using S9_GT_GT11_7  = TageAhead<S1_GT_BASE(S9_TC_GT11_7)>;  // graded 11→7
+using S9_GT_GT12_8  = TageAhead<S1_GT_BASE(S9_TC_GT12_8)>;  // graded 12→8
+using S9_GT_GT13_9  = TageAhead<S1_GT_BASE(S9_TC_GT13_9)>;  // graded 13→9
+using S9_GT_GT14_8  = TageAhead<S1_GT_BASE(S9_TC_GT14_8)>;  // graded 14→8
+
+// BPE=1 (NUM_GROUPS=7, GROUP_BITS=3, eff = raw - 3)
+using S9_BPE1_U8      = TageAhead<S1_BPE1_BASE(S9_TC_U8)>;      // raw 8,  eff 5
+using S9_BPE1_U9      = TageAhead<S1_BPE1_BASE(S9_TC_U9)>;      // raw 9,  eff 6
+using S9_BPE1_U10     = TageAhead<S1_BPE1_BASE(S9_TC_U10)>;     // raw 10, eff 7
+using S9_BPE1_U11     = TageAhead<S1_BPE1_BASE(S9_TC_U11)>;     // raw 11, eff 8
+using S9_BPE1_GT10_6  = TageAhead<S1_BPE1_BASE(S9_TC_GT10_6)>;  // graded 10→6, eff 7→3
+using S9_BPE1_GT11_7  = TageAhead<S1_BPE1_BASE(S9_TC_GT11_7)>;  // graded 11→7, eff 8→4
+using S9_BPE1_GT12_8  = TageAhead<S1_BPE1_BASE(S9_TC_GT12_8)>;  // graded 12→8, eff 9→5
+using S9_BPE1_GT13_9  = TageAhead<S1_BPE1_BASE(S9_TC_GT13_9)>;  // graded 13→9, eff 10→6
+using S9_BPE1_GT14_8  = TageAhead<S1_BPE1_BASE(S9_TC_GT14_8)>;  // graded 14→8, eff 11→5
 
 // ============================================================================
 // TageDirect matching TageAheadHC structural params (no ahead pipeline)
