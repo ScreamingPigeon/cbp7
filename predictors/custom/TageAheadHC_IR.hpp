@@ -232,8 +232,8 @@ struct TageAheadHC_IR : predictor {
   ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram7{"t7_hyst"};
   ta_rwram<U_WIDTH, 2048, 8, 1> u_ram7{"t7_u"};
 
-  // ---- Fallback RAM (mid-array, between T7 and T8) ----
-  hcm::ram<val<N>, FB_CAPACITY> fb_ctr{"fb"};
+  // ---- Fallback (single 8K×7 RAM) ----
+  hcm::ram<val<FB_PRED_BITS>, FB_CAPACITY> fb_ctr{"fb"};
 
   // ---- Table 8 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram8{"t8_tag"};
@@ -411,9 +411,9 @@ struct TageAheadHC_IR : predictor {
 #endif
     });
 
-    // Fallback ahead read (bimodal: index = PC)
+    // Fallback ahead read (single 8K×7 RAM, no banking)
     auto fb_idx = val<FB_IDX_BITS>{inst_pc >> 2};
-    fb_idx.fanout(hard<2>{}); // prefetch_fb_idx + fb_ctr.read
+    fb_idx.fanout(hard<2>{}); // prefetch_fb_idx + fb read
     prefetch_fb_idx = fb_idx;
     prefetch_fb = fb_ctr.read(fb_idx);
     prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
@@ -922,7 +922,7 @@ struct TageAheadHC_IR : predictor {
 
     val<1> fb_changed = actual_dir_full != val<FB_PRED_BITS>{train_fb.fo1()};
     val<1> fb_gate = do_train & t_m1[NT].fo1() & mispredict & fb_changed.fo1();
-    fb_gate.fanout(hard<5>{}); // fb_ctr: execute_if gate + idx fanout + data + extra
+    fb_gate.fanout(hard<11>{}); // ta_rwram-style gate
     execute_if(fb_gate, [&]() {
       fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir_full);
     });

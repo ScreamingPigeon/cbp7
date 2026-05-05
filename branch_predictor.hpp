@@ -706,6 +706,14 @@ using S10_TC_GBS_542 = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GE
                                      std::array<u64, 15>{5,5,5,4,4,4,4,3,3,3,2,2,2,2,2},
                                      ta::uniform_array<u64, 15>(8)>;
 using S10_GBS_542 = TageAhead<S1_BPE1_8B_BASE(S10_TC_GBS_542)>;
+// Cross: GBS_542 bank shift + PC_IDX_SHIFT=5
+using S10_GBS_542_PCS5 = TageAhead<S1_BPE1_8B_BASE(S10_TC_GBS_542), 1, 0, false, 1, 5>;
+// Cross: GBS_542 bank shift + GradedTag<11,7>
+using S10_TC_GBS_542_GT117 = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                     ta::GradedTag<11, 7>, ta::GradedSize<512, 2048>,
+                                     std::array<u64, 15>{5,5,5,4,4,4,4,3,3,3,2,2,2,2,2},
+                                     ta::uniform_array<u64, 15>(8)>;
+using S10_GBS_542_GT117 = TageAhead<S1_BPE1_8B_BASE(S10_TC_GBS_542_GT117)>;
 
 // S10d: max shift per table (aggressive — each table at its limit)
 using S10_TC_BS_MAX = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
