@@ -655,6 +655,7 @@ using S9_TC_U11_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOM
 
 using TA1C_BPE1_8B = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B)>;
 // META_BANKS variants: per-branch meta counters
+using TA1C_BPE1_8B_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 2>;
 using TA1C_BPE1_8B_MB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 4>;
 using TA1C_BPE1_8B_MB7 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 7>;
 

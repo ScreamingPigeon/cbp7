@@ -197,6 +197,8 @@ struct TageAhead : predictor {
   // ---- Meta banking (per-branch meta counters) ----
   static_assert(META_BANKS >= 1 && META_BANKS <= N,
                 "META_BANKS must be in [1, N]");
+  static_assert(META_BANKS == 1 || NUM_GROUPS > 1,
+                "META_BANKS > 1 requires NUM_GROUPS > 1 (BPE < N)");
   // Map branch position → meta bank index
   static constexpr auto BRANCH_TO_META_BANK = []() {
     std::array<u64, N> b2m{};
@@ -1682,25 +1684,34 @@ struct TageAhead : predictor {
       // Per-group: each actual_dir_g[G] read for any_provider_wrong + table_wrong selects
       actual_dir_g.fanout(hard<2 + NT>{}); // any_prov_wrong(1) + fb_changed(1) + table_wrong×NT
     }
-    val<1> any_provider_wrong = [&]() {
+    // Per-group wrong signals (kept for META_BANKS>1 per-bank training)
+    arr<val<1>, NUM_GROUPS> per_group_wrong = [&](u64 g) -> val<1> {
       if constexpr (NUM_GROUPS == 1) {
         if constexpr (FB_RECONCILE)
           return (t_pp ^ actual_dir_g[0]) != hard<0>{};
         else
           return (t_pp.fo1() ^ actual_dir_g[0]) != hard<0>{};
       } else {
-        // Per-group wrong, then fold_or (use pre-read old predictions)
-        arr<val<1>, NUM_GROUPS> gw = [&](u64 g) -> val<1> {
-          return (val<PRED_BITS>{old_provider_pred[g]} ^
-                  actual_dir_g[g]) != hard<0>{};
-        };
-        return gw.fo1().fold_or();
+        return (val<PRED_BITS>{old_provider_pred[g]} ^
+                actual_dir_g[g]) != hard<0>{};
       }
+    };
+    val<1> any_provider_wrong = [&]() {
+      if constexpr (NUM_GROUPS == 1)
+        return per_group_wrong[0];
+      else
+        return per_group_wrong.fo1().fold_or();
     }();
     // NOTE: @prakhar @claude audit: meta_update(1) [+ alloc_trigger(1) if
     // TAGE_WRONG]
-    if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG)
-      any_provider_wrong.fanout(hard<2>{}); // meta_update + alloc_trigger
+    // NOTE: @prakhar @claude audit
+    // META_BANKS==1: any_provider_wrong used by meta_update(1) + alloc_trigger(1)
+    // META_BANKS>1:  meta uses per_group_wrong; any_provider_wrong only for alloc
+    if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG) {
+      if constexpr (META_BANKS == 1)
+        any_provider_wrong.fanout(hard<2>{});
+      // META_BANKS>1: no extra fanout needed — fo1 suffices for alloc_trigger
+    }
     // NOTE: @prakhar @claude audit: meta_gate(1) + meta_update_dir(1) = 2
     t_pw.fanout(hard<2>{});
     // NOTE: @prakhar @claude audit: do_pred_update per table = NT
@@ -2096,30 +2107,93 @@ struct TageAhead : predictor {
 #endif
 
     // ---- Step 5: Meta counter update ----
-    // META_BANKS>1: each bank is an independent meta RAM. Training updates
-    // the bank corresponding to train_group's meta bank.
-    {
-      u64 tmb = (NUM_GROUPS > 1) ? GROUP_TO_META_BANK[train_group] : 0;
-      auto old_meta = val<META_WIDTH, i64>{meta_pipe[tmb][META_PIPE - 1]};
-      // NOTE: @prakhar @claude audit
-      old_meta.fanout(hard<2>{}); // ta_update_ctr(1) + (new_meta != old_meta)(1)
+    if constexpr (META_BANKS == 1) {
+      // Single meta bank: original behavior — uses any_provider_wrong
+      auto old_meta = val<META_WIDTH, i64>{meta_pipe[0][META_PIPE - 1]};
+      old_meta.fanout(hard<2>{});
       auto new_meta = [&]() {
         if constexpr (AllocCfg::ALLOC_TRIGGER == AllocTrigger::TAGE_WRONG)
           return ta_update_ctr(old_meta, any_provider_wrong);
         else
           return ta_update_ctr(old_meta, any_provider_wrong.fo1());
       }();
-      // NOTE: @prakhar @claude audit
-      new_meta.fanout(hard<2>{}); // (new_meta != old_meta)(1) + meta_ctr.write(1)
+      new_meta.fanout(hard<2>{});
       val<1> meta_gate = do_train & t_pw & t_ad & (new_meta != old_meta);
-      // NOTE: @prakhar @claude audit
-      meta_gate.fanout(hard<5>{}); // meta_ctr.write: B=2 bank writes + write_bank
-                                   // + write_localaddr + write_data
+      meta_gate.fanout(hard<5>{});
       execute_if(meta_gate, [&]() {
-        meta_ctr[tmb].write(
-            val<META_IDX_BITS>{meta_idx_pipe[tmb][META_PIPE - 1].fo1()},
+        meta_ctr[0].write(
+            val<META_IDX_BITS>{meta_idx_pipe[0][META_PIPE - 1].fo1()},
             new_meta, hard<0>{});
       });
+    } else {
+      // Per-bank meta: each bank trained with its own group's wrong signal,
+      // pw, and ad. Multiple groups may map to same bank — fold_or them.
+      // Constexpr: which groups map to each bank?
+      static constexpr auto META_BANK_GROUPS = []() {
+        // groups_for_bank[mb] = bitmask of groups mapping to bank mb
+        std::array<u64, META_BANKS> mask{};
+        for (u64 g = 0; g < NUM_GROUPS; g++)
+          mask[GROUP_TO_META_BANK[g]] |= (1ULL << g);
+        return mask;
+      }();
+
+      // Number of groups per meta bank (constexpr)
+      static constexpr auto META_BANK_GROUP_COUNT = []() {
+        std::array<u64, META_BANKS> cnt{};
+        for (u64 g = 0; g < NUM_GROUPS; g++)
+          cnt[GROUP_TO_META_BANK[g]]++;
+        return cnt;
+      }();
+      static constexpr u64 MAX_GROUPS_PER_BANK = []() {
+        u64 mx = 0;
+        for (u64 mb = 0; mb < META_BANKS; mb++)
+          if (META_BANK_GROUP_COUNT[mb] > mx) mx = META_BANK_GROUP_COUNT[mb];
+        return mx;
+      }();
+
+      for (u64 mb = 0; mb < META_BANKS; mb++) {
+        // Per-group gating: gate fires only when pw AND ad are true for the
+        // SAME group. Direction comes only from groups where gate fired.
+        // This avoids the pairing bug where OR(pw) & OR(ad) could fire from
+        // different groups, and ensures correct decrement (groups where gate
+        // fires but prediction was correct push counter back toward provider).
+        u64 gi = 0;
+        // bank_gate_arr[j] = pw_g & ad_g  (group g has weak provider with differing alt)
+        arr<val<1>, MAX_GROUPS_PER_BANK> bank_gate_arr = [&]([[maybe_unused]] u64 j) -> val<1> {
+          for (u64 g = gi; g < NUM_GROUPS; g++) {
+            if (GROUP_TO_META_BANK[g] == mb) {
+              gi = g + 1;
+              return pre_read_pw[g] & pre_read_ad[g];
+            }
+          }
+          return hard<0>{}; // padding (OR identity)
+        };
+        gi = 0;
+        // bank_dir_arr[j] = pw_g & ad_g & wrong_g  (direction: wrong only from gated groups)
+        arr<val<1>, MAX_GROUPS_PER_BANK> bank_dir_arr = [&]([[maybe_unused]] u64 j) -> val<1> {
+          for (u64 g = gi; g < NUM_GROUPS; g++) {
+            if (GROUP_TO_META_BANK[g] == mb) {
+              gi = g + 1;
+              return pre_read_pw[g] & pre_read_ad[g] & per_group_wrong[g];
+            }
+          }
+          return hard<0>{};
+        };
+        val<1> bank_gate = bank_gate_arr.fo1().fold_or();
+        val<1> bank_wrong_dir = bank_dir_arr.fo1().fold_or();
+
+        auto old_meta = val<META_WIDTH, i64>{meta_pipe[mb][META_PIPE - 1]};
+        old_meta.fanout(hard<2>{});
+        auto new_meta = ta_update_ctr(old_meta, bank_wrong_dir);
+        new_meta.fanout(hard<2>{});
+        val<1> meta_gate = do_train & bank_gate & (new_meta != old_meta);
+        meta_gate.fanout(hard<5>{});
+        execute_if(meta_gate, [&]() {
+          meta_ctr[mb].write(
+              val<META_IDX_BITS>{meta_idx_pipe[mb][META_PIPE - 1].fo1()},
+              new_meta, hard<0>{});
+        });
+      }
     }
 
     // ---- Merged per-table writes (one write per RAM per table) ----
