@@ -445,16 +445,308 @@ Accuracy neutral (+0.18%). EPI +5% from arr::select MUX overhead (FREE_FANOUT).
 | HC_IR MB2 (no FB banking) | 0.860 | 3056 | 2198 |
 | HC_IR MB2 + FB4 (arr::select MUX) | 1.040 | 3655 | 2198 |
 | HC_IR MB2 + FB4 (OR-fold execute_if) | 1.037 | 3132 | 2198 |
+| HC_IR MB2 + 7×8K×1 (width-split only) | 1.087 | 3290 | 2198 |
 
-MUX approach regressed P2 by +0.18ns (+21%). OR-fold (execute_if masking +
-fold_or) replaced 2-stage MUX<4> with AND+OR<4>. Result: timing barely
-changed (-0.003ns) but energy dropped -14% (3655→3132 fJ). The timing
-bottleneck is the 28 RAM reads' wiring, not the selection logic. All 4 banks
-still read every cycle (HARCOM cannot gate RAM reads).
+All splitting approaches regressed timing. Summary:
 
-**Verdict**: FAILED. FB banking in HC_IR adds +0.18ns P2 regression (+21%)
-regardless of MUX approach (arr::select vs OR-fold). The 28 small RAM reads
-(4 banks × 7 groups, all read every cycle — HARCOM cannot gate reads)
-dominate the critical path vs the single 8K×7 RAM. Reverted to single RAM.
-FB banking remains viable in template TageAhead (FREE_FANOUT mode) where
-timing is unconstrained.
+| Approach | Extra RAMs | P2 delta | EPI delta |
+|----------|-----------|----------|-----------|
+| 28 RAMs (4 banks × 7 groups, 2K×1) MUX | +27 | +21% | +27% |
+| 28 RAMs OR-fold | +27 | +21% | +9% |
+| 7 RAMs (7 groups, 8K×1) | +6 | +26% | +15% |
+
+**Verdict**: FAILED. Any user-level RAM splitting hurts HC_IR timing.
+HARCOM's internal SRAM banking (automatic, per harcom.pdf §5.5.2) handles
+a single wide RAM more efficiently than multiple narrow user-level RAMs.
+The single 8K×7 RAM benefits from internal H-tree routing and shared
+decode; splitting into separate objects forces independent address
+distribution and read ports. Reverted to single RAM. FB banking remains
+viable in template TageAhead (FREE_FANOUT mode) where timing is
+unconstrained.
+
+## Sweep 12: GradedTag<11,7> with BPE1 (2026-05-05)
+
+Motivation: with BPE1 GROUP_BITS=3, effective tag bits = raw − 3. Uniform
+11-bit tag gives 8 effective bits everywhere. GradedTag<11,7> gives long-
+history tables 8 eff bits (same) and short-history tables 4 eff bits (less
+disambiguation but smaller tag storage). Prior sweep 9 showed GT11_7 had
+best MPKI among graded configs on 14-table non-8B setup.
+
+Config: TA1C_BPE1_8B_GT117 (15 tables, 8 banks, BPE1, GradedTag<11,7>).
+
+### Results (eval-monitor, 20 traces)
+
+| Trace | Base (U11) | GT11_7 | Delta |
+|-------|-----------|--------|-------|
+| 502-gcc | 17.566 | 18.151 | +0.59 |
+| 505-mcf | 17.651 | 15.530 | **−2.12** |
+| 508-namd | 5.013 | 4.710 | −0.30 |
+| 531-deepsjeng | 14.804 | 15.215 | +0.41 |
+| 548-exchange2 | 5.980 | 6.490 | +0.51 |
+| 554-roms | 0.065 | 0.057 | −0.01 |
+| dcapo-kafka | 6.382 | 6.329 | −0.05 |
+| gap-sssp | 37.253 | 37.009 | −0.24 |
+| gcc-1 | 14.021 | 14.479 | +0.46 |
+| java16 | 6.716 | 6.957 | +0.24 |
+| llvm-2 | 11.522 | 11.867 | +0.35 |
+| lua-3 | 2.632 | 2.629 | −0.00 |
+| nodejs-http2 | 9.738 | 10.036 | +0.30 |
+| nodejs-octane | 7.361 | 7.662 | +0.30 |
+| python3-dulwich | 5.420 | 5.648 | +0.23 |
+| rsbench | 42.737 | 41.434 | **−1.30** |
+| sampleflow | 2.097 | 1.968 | −0.13 |
+| web_130 | 6.821 | 7.131 | +0.31 |
+| web_74 | 6.475 | 6.619 | +0.14 |
+| zstd | 8.390 | 8.836 | +0.45 |
+| **Mean** | **11.432** | **11.438** | **+0.05%** |
+
+7 wins / 13 losses. Net effect negligible (+0.05%).
+
+### Per-table analysis (why regressions happen)
+
+**mcf (GT117 wins −2.12)**: Baseline had excessive false tag matches on
+mid-history tables T5-T9 (TagMatch 27-33%, accuracy only 37-40%). GT117's
+shorter tags on these tables changed allocation dynamics, collapsing their
+provider counts (T5: 75K→4.7K, T6: 84K→3K). Branches fell back to bimodal
+which was more accurate (64.6%→66.3%). Shorter tags acted as a beneficial
+filter — fewer false matches = less pollution from bad providers.
+
+**gcc-1 (GT117 loses +0.46)**: TagMatch% rose across tables (T14: 5.2%→11.2%
+with only 7-bit raw / 4-bit eff tag). T0 provided more predictions
+(5365→7213) but with worse accuracy (10.6%→8.4%). The shorter tags on
+short-history tables increased aliasing without benefit — these tables had
+well-calibrated tag matching at 11 bits.
+
+**Pattern**: GT117 helps traces where baseline has excessive false tag matches
+on mid-tables (aliasing pollution), but hurts traces where the 11-bit uniform
+tag was already well-calibrated. The effect is trace-dependent with no net
+gain.
+
+**Verdict**: GradedTag<11,7> is accuracy-neutral at aggregate. The prior
+sweep 9 MPKI advantage (12.357 vs 12.556) was measured on a different config
+(14 tables, no 8-bank). With 15 tables + 8 banks, the advantage disappears.
+
+## Sweep 12: Per-Bit Flip Rate Instrumentation (Bank Conflict Root Cause)
+
+**Goal**: Identify exactly which index bit positions are "sticky" (low flip rate
+between consecutive read accesses) for short-history tables, causing bank conflicts.
+
+**Setup**: Added `bit_flip_count[A]` instrumentation to ta_rwram. Tracks which
+specific bit positions of the full index flip between consecutive `read()` calls,
+per table. Run on llvm-2 trace (1000 warmup, 40000 measure).
+
+**Config**: TageAhead1C (15 tables, 8 banks, BANK_SHIFT=1, BANK_BITS=3, so bank
+select = index bits [1:3]). Note: default config already uses BANK_SHIFT=1.
+
+### Results: Per-table bit flip rates (bank-select bits highlighted)
+
+| Table | HistLen | same_prev% | lost% | **b0 flip** | **b1 flip** | **b2 flip** | b3 | b4 | b5 | idx_xor_0% |
+|-------|---------|-----------|-------|------------|------------|------------|-----|-----|-----|------------|
+| T0  | 199 | 50.3% | 50.5% | 50.9% | 49.8% | 49.7% | 50.3% | 49.6% | 47.4% | 0.1% |
+| T1  | 158 | 49.0% | 50.6% | 49.4% | 51.0% | 50.6% | 50.1% | 49.8% | 48.8% | 0.1% |
+| T2  | 126 | 50.7% | 51.3% | 48.6% | 49.3% | 49.4% | 49.7% | 49.0% | 48.8% | 0.1% |
+| T3  | 100 | 50.2% | 50.9% | 49.4% | 49.8% | 50.0% | 49.6% | 49.6% | 49.1% | 0.1% |
+| T4  |  79 | 50.0% | 50.0% | 50.3% | 50.0% | 50.2% | 50.4% | 49.8% | 49.3% | 0.1% |
+| T5  |  63 | 51.0% | 50.1% | 49.2% | 49.0% | 51.1% | 49.1% | 49.2% | 49.8% | 0.1% |
+| T6  |  50 | 50.3% | 49.4% | 50.7% | 49.7% | 49.3% | 49.0% | 49.7% | 47.7% | 1.1% |
+| T7  |  39 | 52.1% | 52.6% | 48.7% | 47.9% | 50.1% | 49.1% | 49.0% | 48.4% | 2.0% |
+| T8  |  31 | 53.0% | 52.2% | 46.0% | 47.0% | 50.5% | 48.9% | 49.9% | 46.3% | 2.6% |
+| T9  |  25 | 53.0% | 52.2% | 46.0% | 47.0% | 50.5% | 48.9% | 49.9% | 46.3% | 3.2% |
+| T10 |  20 | 51.6% | 53.7% | 48.8% | 48.4% | 49.0% | 48.9% | 49.9% | 46.3% | 3.6% |
+| T11 |  15 | 51.6% | 53.7% | 48.8% | 48.4% | 49.0% | 48.9% | 44.1% | 41.8% | 4.0% |
+| T12 |  12 | 56.7% | 57.3% | 48.8% | 43.3% | 48.9% | 47.2% | 44.1% | 41.8% | 4.2% |
+| T13 |  10 | 56.7% | 57.3% | **3.7%** | 43.3% | 48.9% | 47.2% | 44.1% | 41.8% | 4.4% |
+| T14 |   8 | 56.7% | 57.3% | **3.7%** | 43.3% | 48.9% | 47.2% | 44.1% | 41.8% | 4.7% |
+
+### Key Findings
+
+1. **Bit 0 is nearly frozen for T13-T14**: Only 3.7% flip rate (vs ~50% ideal).
+   With BANK_SHIFT=0, this is the LSB of bank select — consecutive accesses
+   almost always land in the same b0-parity half of the banks.
+
+2. **Bit 1 degraded for T12-T14**: 43.3% flip rate (vs ~50% ideal). Combined
+   with frozen b0, the 3-bit bank select is heavily biased toward repeating.
+
+3. **Higher bits also degrade for short tables**: b4/b5 drop to 41-44% for
+   T11-T14, and b8/b9 drop to 25-35% for T14. The short fold registers have
+   low entropy overall.
+
+4. **Long-history tables are fine**: T0-T5 show ~50% flip rates on all bits,
+   confirming bank conflicts are concentrated in short-history tables.
+
+5. **Root cause**: For 8-10 bit history lengths, the fold register is tiny and
+   only shifts by 1 bit per cycle. Combined with `pc >> 2` (which is constant
+   within a basic block loop), the low index bits barely change. The same index
+   → same bank → same-bank conflict → lost writes (57% loss rate for T13-T14).
+
+### Corrected Understanding
+
+The actual config uses **BANK_SHIFT=1** (confirmed in both S9_TC_U11_8B and
+TageAheadHC_IR), so bank select = bits [1,2,3]. The frozen b0 (3.7%) is already
+excluded from bank selection. The bit flip rates for the actual bank-select bits are:
+
+- b1: 43-50% (slightly degraded for T12-T14)
+- b2: 48-51% (near-ideal)
+- b3: 47-50% (decent)
+
+However, `bank_xor_popcount` shows only values 0 and 1 (never 2 or 3), meaning
+**at most 1 of the 3 bank bits changes per cycle**. This is the fundamental issue:
+the fold register shifts by 1 bit/cycle, so the full index changes by only 1-2 bits
+total between consecutive accesses. Even though individual bits have ~50% long-run
+flip rates, they don't flip independently — only one flips at a time.
+
+This produces ~50% same-bank rate across ALL tables (not just short ones). Short
+tables (T12-T14) are slightly worse (56-57%) due to additional low-entropy effects.
+
+### Architecture Summary
+
+- 1 read per table per cycle (single index from `fold XOR pc>>2`)
+- Each entry has a 3-bit `group_id` in the tag identifying which of 7 branches it serves
+- 7 independent resolution chains share the physical tables
+- Conflict: predict-read on cycle N and train-write on cycle N+K hit same bank
+  because consecutive indices differ by only 1-2 bits → same bank bits
+
+### Literature Fix (Seznec, "A New Case for TAGE", JILP 2011)
+
+Published TAGE implementations **decouple bank selection from the index entirely**.
+Bank is derived from PC rotation:
+
+```
+bank = pc & (NUM_BANKS-1);
+if (bank == prev_bank) bank = (bank+1) & (NUM_BANKS-1);
+```
+
+Consecutive branch PCs are different addresses → naturally spread across banks.
+The folded history is only used for row index + tag, never for bank selection.
+Updates use small write buffers (1-2 cycle tolerance) since silent-update
+elimination means only ~9% of branches actually need writes.
+
+### Implications
+
+- BANK_SHIFT adjustments are ineffective — the problem is that the fold register
+  produces low-hamming-distance consecutive indices regardless of which bits are used.
+- The correct fix: derive bank from PC bits (or a rotation of PC), independent of
+  the folded history index. This guarantees consecutive predictions hit different
+  banks, leaving previous banks free for buffered write flushes.
+
+### Experiment: Block PC XOR into bank select (FAILED)
+
+**Approach**: XOR `val<BANK_BITS>{inst_pc >> 5}` into the bank_id after split_addr
+in ta_rwram. Both read and write use the same XOR so they target the same physical
+bank. Added `bank_xor` parameter to `ta_rwram::read()` and `ta_rwram::write()`.
+
+**Result on llvm-2**: No improvement. Same ~50% same-bank rate, ~50-57% lost writes
+across all tables. Identical to baseline.
+
+**Why it failed**: In a loop, the block PC is **constant** across iterations. XOR-ing
+a constant into bank select just permutes which bank is used — it doesn't change that
+consecutive accesses from the same block hit the **same** permuted bank. The conflict
+comes from same-block re-accesses, not from inter-block transitions.
+
+**Conclusion**: Static PC-based bank derivation cannot help when the dominant conflict
+pattern is loops hitting the same PC repeatedly. Need **stateful rotation** (Seznec
+approach) where a running counter or prev_bank tracker guarantees different banks on
+consecutive cycles regardless of PC repetition.
+
+## Sweep 13: SEC_TAG Width (2026-05-05)
+
+Motivation: sec_tag RAMs are per-table (15 tables). Reducing width saves
+area/power. Baseline uses 5-bit sec_tag (Xor3SecTagHash5) which rejects
+~24% of tag matches as false positives.
+
+Config: BPE1, 8 banks, 15 tables, UniformTag<11>. Swept SEC_TAG_BITS=3,4
+vs baseline 5.
+
+### Results (eval-monitor, 20 traces)
+
+| Trace | SEC5 (base) | SEC4 | SEC3 |
+|-------|------------|------|------|
+| 502-gcc | 17.566 | 18.082 | 18.247 |
+| 505-mcf | 17.651 | 18.017 | 17.852 |
+| 508-namd | 5.013 | 4.957 | 5.039 |
+| 531-deepsjeng | 14.804 | 15.310 | 15.394 |
+| 548-exchange2 | 5.980 | 7.170 | 7.155 |
+| 554-roms | 0.065 | 0.092 | 0.088 |
+| dcapo-kafka | 6.382 | 7.316 | 7.616 |
+| gap-sssp | 37.253 | 37.569 | 38.192 |
+| gcc-1 | 14.021 | 14.528 | 14.477 |
+| java16 | 6.716 | 7.139 | 7.162 |
+| llvm-2 | 11.522 | 11.906 | 12.319 |
+| lua-3 | 2.632 | 2.422 | 2.659 |
+| nodejs-http2 | 9.738 | 10.001 | 10.112 |
+| nodejs-octane | 7.361 | 7.563 | 7.855 |
+| python3-dulwich | 5.420 | 5.726 | 5.750 |
+| rsbench | 42.737 | 42.438 | 42.499 |
+| sampleflow | 2.097 | 2.179 | 1.956 |
+| web_130 | 6.821 | 7.166 | 7.347 |
+| web_74 | 6.475 | 6.636 | 6.688 |
+| zstd | 8.390 | 7.967 | 8.332 |
+| **Mean** | **11.432** | **11.709 (+2.4%)** | **11.837 (+3.5%)** |
+
+| Config | Mean MPKI | sec_rej% | Wins/Losses |
+|--------|-----------|----------|-------------|
+| SEC5 (baseline) | 11.432 | 24.0% | — |
+| SEC4 | 11.709 | 23.4% | 3/17 |
+| SEC3 | 11.837 | 22.9% | 2/18 |
+
+**Verdict**: FAILED. Shorter sec_tag consistently degrades accuracy. The
+5-bit sec_tag rejects 24% of tag matches — real filtering work that prevents
+false-positive providers. Reducing to 4 bits loses 0.6% of that filtering
+(23.4% sec_rej) and costs +2.4% MPKI. Worst regressions: exchange2 (+1.2),
+kafka (+0.9-1.2), deepsjeng (+0.5). 5-bit sec_tag is optimal.
+
+---
+
+## Experiment: Seznec-Style Bank Rotation (FAILED)
+
+**Goal**: Reduce rwram read-write bank conflicts. Baseline: 2-bank single-ported
+tables, ~50% same-bank rate between consecutive reads, ~57% lost writes.
+
+**Approach**: Per-table stateful rotation — track previous read's bank, if
+natural bank == prev_bank then increment. XOR the natural vs rotated bank to
+produce `bank_xor` passed into `ta_rwram::read()` and `ta_rwram::write()`.
+Pipeline the rotated bank through prefetch→current→train for write path.
+
+**Result on llvm-2** (40M branches):
+- `read_same_prev`: 56.68% → **0.00%** (rotation works perfectly for read-read)
+- `lost writes`: 57% → **78%** (WORSE)
+- MPKI: 11.52 → **22.71** (+97% regression)
+
+**Root Cause**: In a banked RAM, `bank + localaddr` together identify a unique
+entry. XOR-ing the bank bit routes the read to a **different physical entry**
+(same localaddr, wrong bank). Tag check fails → massive miss rate increase.
+The rotation doesn't just change routing — it changes which data you read.
+
+**Why lookahead scheduling (EV8/Seznec papers) also doesn't apply**: Those
+techniques spread *independent* accesses to different banks. In hot loops,
+both prediction reads and training writes target the **same entry** (same
+block PC → same index → same bank). No scheduling can avoid the conflict
+when the read and write are to the same address.
+
+**Conclusion**: For 2-bank single-ported RAMs with hot-loop workloads, ~50%
+read-write bank conflict rate is the architectural floor. The lost-write rate
+is already priced into baseline MPKI. Possible mitigations (not pursued):
+deeper write buffer, write-only-on-mispredict, or accepting the loss.
+
+**Reverted**: All rotation code removed from TageAhead.hpp and custom_common.hpp.
+
+## Sweep 14: GradedTag<11,7> on TageAheadHC_IR (2026-05-05)
+
+Motivation: GradedTag<11,7> was accuracy-neutral (+0.05%) on template TageAhead
+BPE1 (Sweep 12), but tag RAM area savings could improve VFS on the hand-coded
+HC_IR. Short-history tables (T0-T3) use 7-bit tags, long-history tables (T13)
+use 11-bit. With GROUP_BITS=3, effective htag ranges from 4 to 8 bits.
+
+Config: TageAheadHC_IR with per-table tag widths:
+  {7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11}
+
+### Quick-eval results (20 traces)
+
+| Metric | Baseline (U11) | GT<11,7> | Delta |
+|--------|----------------|----------|-------|
+| MPI | 0.01081 | 0.01078 | -0.3% |
+| VFS | 0.878 | 0.8777 | -0.03% |
+
+MPKI slightly better but VFS marginally worse — tag RAM savings don't
+compensate. Full eval (168 traces) launched to `out/full_hcir_gt117/` for
+definitive comparison, since the quick-eval delta is within noise.

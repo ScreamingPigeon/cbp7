@@ -805,6 +805,15 @@ struct DefaultSecTagHash {
   }
 };
 
+// 3-way XOR sec_tag hash for 3-bit sec_tag: PC[4:2] ^ PC[9:7] ^ PC[14:12]
+struct Xor3SecTagHash3 {
+  template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {
+    static_assert(SEC_TAG_BITS == 3, "Xor3SecTagHash3 is tuned for 3-bit sec_tag");
+    pc.fanout(hard<3>{});
+    return val<3>{pc >> 2} ^ val<3>{pc >> 7} ^ val<3>{pc >> 12};
+  }
+};
+
 // PC[5:2] ^ PC[11:8] ^ PC[16:13]  — best 4-bit hash from block analyzer
 struct Xor3SecTagHash {
   template <u64 SEC_TAG_BITS> static val<SEC_TAG_BITS> apply(val<64> pc) {
@@ -886,6 +895,8 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
   u64 idx_xor_hist[XOR_HIST_SIZE] = {};
   // Bank-bits XOR histogram: how many of the BANK_BITS change
   u64 bank_xor_hist[BANK_BITS + 1] = {};
+  // Per-bit flip rate: which bit positions flip between consecutive reads
+  u64 bit_flip_count[A] = {};
 
   ta_rwram(const char *label = "") : bank{label}, name_{label} {}
 
@@ -926,6 +937,8 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
           stat_read_same_prev++;
         u64 xor_val = av ^ prev_read_addr_;
         idx_xor_hist[std::popcount(xor_val)]++;
+        for (u64 bit = 0; bit < A; bit++)
+          if ((xor_val >> bit) & 1) bit_flip_count[bit]++;
         u64 bank_bits_now = (av >> BANK_SHIFT) & ((1u << BANK_BITS) - 1);
         u64 bank_bits_prev = (prev_read_addr_ >> BANK_SHIFT) & ((1u << BANK_BITS) - 1);
         bank_xor_hist[std::popcount(bank_bits_now ^ bank_bits_prev)]++;
@@ -958,9 +971,9 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
         u64 addr_val = static_cast<u64>(addr);
         u64 new_bank;
         if constexpr (BANK_SHIFT == 0) {
-          new_bank = 1u << (addr_val & ((1u << BANK_BITS) - 1));
+          new_bank = 1u << ((addr_val & ((1u << BANK_BITS) - 1)));
         } else {
-          new_bank = 1u << ((addr_val >> BANK_SHIFT) & ((1u << BANK_BITS) - 1));
+          new_bank = 1u << (((addr_val >> BANK_SHIFT) & ((1u << BANK_BITS) - 1)));
         }
         pending_bank_ = new_bank;
       } else {
@@ -1050,6 +1063,10 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
       os << "  bank_xor_popcount[" << name_ << "]:";
       for (u64 i = 0; i <= BANK_BITS; i++)
         os << " " << i << ":" << (100.0 * bank_xor_hist[i] / total) << "%";
+      os << "\n";
+      os << "  bit_flip_rate[" << name_ << "]:";
+      for (u64 i = 0; i < A; i++)
+        os << " b" << i << ":" << (100.0 * bit_flip_count[i] / total) << "%";
       os << "\n";
     }
   }

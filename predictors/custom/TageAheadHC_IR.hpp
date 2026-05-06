@@ -56,7 +56,16 @@ struct TageAheadHC_IR : predictor {
   };
   static constexpr u64 PRED_BITS = 1;     // 1-bit prediction per entry
   static constexpr u64 FB_PRED_BITS = N * CTR_WIDTH; // = 7, fallback stays N-wide
-  static constexpr u64 HTAG_WIDTH = TAG_WIDTH - GROUP_BITS; // = 8
+  static constexpr u64 HTAG_WIDTH = TAG_WIDTH - GROUP_BITS; // = 8 (max, for pipeline regs)
+
+  // GradedTag<11,7>: T0 (short hist) → 7, T13 (long hist) → 11
+  // Formula: 7 + 4*i/13
+  static constexpr std::array<u64, NT> PER_TABLE_TAG = {
+    7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11
+  };
+  static constexpr std::array<u64, NT> PER_TABLE_HTAG = {
+    4, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8
+  };
 
   // Per-table sizes: T0 bumped to 1024 (was GradedSize<512, 2048>)
   static constexpr std::array<u64, NT> TABLE_SIZE = {
@@ -386,9 +395,9 @@ struct TageAheadHC_IR : predictor {
       prefetch_tag[I] = stored_tag;
       // Split tag: lower HTAG_WIDTH bits = htag, upper GROUP_BITS = group_id
       prefetch_tag_hit[I] =
-          val<HTAG_WIDTH>{stored_tag} == val<HTAG_WIDTH>{computed_tag};
+          val<PER_TABLE_HTAG[I]>{stored_tag} == val<PER_TABLE_HTAG[I]>{computed_tag};
       prefetch_group_id[I] =
-          val<GROUP_BITS>{stored_tag >> HTAG_WIDTH};
+          val<GROUP_BITS>{stored_tag >> PER_TABLE_HTAG[I]};
       prefetch_ctag[I] = computed_tag;
       prefetch_pred[I] = pred_ram_at<I>().read(idx);
       prefetch_sec[I] = sec_ram_at<I>().read(idx);
@@ -1047,7 +1056,7 @@ struct TageAheadHC_IR : predictor {
       gate_alloc.fanout(hard<2>{}); // tag_ram + sec_ram
       execute_if(gate_alloc, [&]() {
         val<GROUP_BITS> alloc_gid = val<GROUP_BITS>{u64(train_group)};
-        auto full_tag = concat(alloc_gid, val<HTAG_WIDTH>{train_ctag[I].fo1()});
+        auto full_tag = concat(alloc_gid, val<PER_TABLE_HTAG[I]>{train_ctag[I].fo1()});
         tag_ram_at<I>().write(val<IDX_BITS[I]>{train_idx[I]},
                               val<TAG_WIDTH>{full_tag});
         sec_ram_at<I>().write(val<IDX_BITS[I]>{train_idx[I]},

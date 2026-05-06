@@ -588,7 +588,7 @@ using HS_N2_L256_H600 = TageAhead<HISTSWEEP(2, 256, 24, 600)>;
       SiblingPolicy::ALL, 0, 10, 10,                                           \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
       ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
-      ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
+      ta::DefaultEpochTrigger, false, true, false, false, 0, false, ta::SecTagAll
 
 #define S1_BPE1_BASE(TABLE_CFG)                                                \
   TABLE_CFG,                                                                   \
@@ -600,7 +600,7 @@ using HS_N2_L256_H600 = TageAhead<HISTSWEEP(2, 256, 24, 600)>;
       SiblingPolicy::ALL, 0, 10, 10,                                           \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
       ta::uniform_array<u64, 14>(8), ta::FixedDecayThresh<8>, false,           \
-      ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
+      ta::DefaultEpochTrigger, false, true, false, false, 0, false, ta::SecTagAll
 
 // Uniform tag widths
 using S9_TC_U8  = TATableConfig<14, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
@@ -651,9 +651,22 @@ using S9_TC_U11_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOM
       SiblingPolicy::ALL, 0, 10, 10,                                           \
       true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
       ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
-      ta::DefaultEpochTrigger, false, true, false, 0, false, ta::SecTagAll
+      ta::DefaultEpochTrigger, false, true, false, false, 0, false, ta::SecTagAll
 
 using TA1C_BPE1_8B = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B)>;
+// FB bimodal hysteresis variant
+#define S1_BPE1_8B_FBH_BASE(TABLE_CFG)                                        \
+  TABLE_CFG,                                                                   \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      1, false,                                                                \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, true, 0, false, ta::SecTagAll
+using TA1C_BPE1_8B_FBH = TageAhead<S1_BPE1_8B_FBH_BASE(S9_TC_U11_8B)>;
 // META_BANKS variants: per-branch meta counters (FB defaults: 1 bank, no split)
 using TA1C_BPE1_8B_MB2 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 2>;
 using TA1C_BPE1_8B_MB4 = TageAhead<S1_BPE1_8B_BASE(S9_TC_U11_8B), 1, 0, false, 4>;
@@ -670,6 +683,31 @@ using S9_TC_GT11_7_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::G
                                       ta::uniform_array<u64, 15>(1),
                                       ta::uniform_array<u64, 15>(8)>;
 using TA1C_BPE1_8B_GT117 = TageAhead<S1_BPE1_8B_BASE(S9_TC_GT11_7_8B)>;
+// SEC_TAG sweep: 3-bit and 4-bit (baseline is 5-bit)
+#define S1_BPE1_8B_SEC3(TABLE_CFG)                                             \
+  TABLE_CFG,                                                                   \
+      7, 6, 3, true, 1, ta::Xor3SecTagHash3, 1,                               \
+      1, false,                                                                \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, false, 0, false, ta::SecTagAll
+#define S1_BPE1_8B_SEC4(TABLE_CFG)                                             \
+  TABLE_CFG,                                                                   \
+      7, 6, 4, true, 1, ta::Xor3SecTagHash, 1,                                \
+      1, false,                                                                \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, false, 0, false, ta::SecTagAll
+using TA1C_BPE1_8B_SEC3 = TageAhead<S1_BPE1_8B_SEC3(S9_TC_U11_8B)>;
+using TA1C_BPE1_8B_SEC4 = TageAhead<S1_BPE1_8B_SEC4(S9_TC_U11_8B)>;
 
 // ============================================================================
 // Sweep 10: Bank shift decorrelation

@@ -101,6 +101,10 @@ template <
     // Overwrites fb pred when they persistently disagree (hyst weak).
     // Mirrors Tage.hpp's P1/P2 reconciliation — keeps fb aligned with TAGE.
     bool FB_RECONCILE = false,
+    // ---- Fallback bimodal hysteresis ----
+    // Traditional 2-bit saturating counter for fb: pred only flips when hyst
+    // is weak (wrong twice). Mirrors Tage.hpp's bhyst. Half-sized RAM (shared).
+    bool FB_BIM_HYST = false,
     // ---- Far-allocation pressure ----
     // When > 0, allocation distance >= FARALLOC_DIST from provider biases
     // alloc_ctr harder toward epoch/decay (extra decrement).
@@ -263,6 +267,10 @@ struct TageAhead : predictor {
   // Width per fb RAM: 1-bit per group when FB_SPLIT_WIDTH, else N-wide
   static constexpr u64 FB_RAM_WIDTH = FB_SPLIT_WIDTH ? CTR_WIDTH : FB_PRED_BITS;
   static constexpr u64 FB_NUM_WIDTH_RAMS = FB_SPLIT_WIDTH ? NUM_GROUPS : 1;
+
+  // ---- Fallback bimodal hysteresis ----
+  static constexpr u64 FB_BH_CAPACITY = FB_CAPACITY / 2; // half-sized (shared hyst)
+  static constexpr u64 FB_BH_IDX_BITS = ta::clog2(FB_BH_CAPACITY);
   static_assert(!FB_SPLIT_WIDTH || NUM_GROUPS > 1,
                 "FB_SPLIT_WIDTH requires NUM_GROUPS > 1 (BPE < N)");
 
@@ -283,6 +291,9 @@ struct TageAhead : predictor {
   // Piped fb hyst for reconciliation (only accessed when FB_RECONCILE=true)
   reg<1> prefetch_fb_hyst;
   reg<1> current_fb_hyst;
+  // fb bimodal hyst read value (read in update_cycle before extra_cycle,
+  // written after extra_cycle — no predict1 pipeline needed)
+  reg<FB_PRED_BITS> fb_bh_read;
 
   // Gshare fold register — folds GS_HIST bits of global history into
   // FB_IDX_BITS for the fallback index. Zero cost when USE_GSHARE=false
@@ -372,6 +383,9 @@ struct TageAhead : predictor {
   // hyst=1 → agree, hyst=0 → disagree (weak → eligible for reconciliation).
   // Only accessed when FB_RECONCILE=true; zero cost otherwise.
   hcm::ram<val<1>, FB_CAPACITY> fb_hyst{"fb_hyst"};
+  // Fallback bimodal hyst: per-branch confidence (1=strong, 0=weak).
+  // Only flip fb pred when hyst is weak. Half-sized (shared).
+  hcm::ram<val<FB_PRED_BITS>, FB_BH_CAPACITY> fb_bim_hyst{"fb_bim_hyst"};
   ta_rwram<META_WIDTH, META_CAPACITY, 2> meta_ctr[META_BANKS];
 
   // train_*: saved from current_* before pipeline shift, used for training
@@ -1614,8 +1628,8 @@ struct TageAhead : predictor {
     static_loop<NT>([&]<u64 I>() {
       t_m1[I].fanout(hard<4>{}); // NOTE: @prakhar @claude audit
     });
-    if constexpr (FB_RECONCILE)
-      t_m1[NT].fanout(hard<2>{}); // NOTE: @prakhar @claude audit
+    if constexpr (FB_RECONCILE || FB_BIM_HYST)
+      t_m1[NT].fanout(hard<1 + (FB_RECONCILE ? 1 : 0) + (FB_BIM_HYST ? 1 : 0)>{}); // NOTE: @prakhar @claude audit
     val<PRED_BITS> t_pp = [&]() -> val<PRED_BITS> {
       if constexpr (NUM_GROUPS > 1)
         return val<PRED_BITS>{old_provider_pred[train_group]};
@@ -1693,6 +1707,15 @@ struct TageAhead : predictor {
         3 + ((DECAY_ENABLE || EPOCH_ENABLE) ? 1 : 0) +
         (AllocCfg::ALLOC_TRIGGER == AllocTrigger::MISPREDICT ? 1 : 0);
     mispredict.fanout(hard<MISP_READS>{});
+    // Read fb bimodal hyst BEFORE extra_cycle (cycle 1); write happens AFTER (cycle 2)
+    // Declare train_fb_idx fanout early since bh read precedes other uses.
+    // Reads: bh_read(1) + fb_write(1) + bh_write(1) [+ reconcile(2) if FB_RECONCILE]
+    if constexpr (FB_BIM_HYST) {
+      train_fb_idx.fanout(hard<3 + (FB_RECONCILE ? 2 : 0)>{});
+      fb_bh_read = execute_if(mispredict, [&]() {
+        return fb_bim_hyst.read(val<FB_BH_IDX_BITS>{train_fb_idx});
+      });
+    }
     need_extra_cycle(mispredict);
 #ifdef DEBUG_PRINT
     std::cerr << "--- update_cycle ---\n";
@@ -1700,8 +1723,8 @@ struct TageAhead : predictor {
 #endif
     // NOTE: @prakhar @claude audit
     do_train.fanout(
-        hard<4 * NT + 2 + (FB_RECONCILE ? 2 : 0)>{}); // fb + meta + 4 per table
-                                                      // [+ reconcile + fb_hyst]
+        hard<4 * NT + 2 + (FB_RECONCILE ? 2 : 0) + (FB_BIM_HYST ? 1 : 0)>{}); // fb + meta + 4 per table
+                                                      // [+ reconcile] [+ bim_hyst]
 
 #ifdef TAGE_MONITOR
     mon.record_block(static_cast<u64>(val<LOGLINEINST>{block_entry}),
@@ -1795,8 +1818,8 @@ struct TageAhead : predictor {
     t_pw.fanout(hard<2>{});
     // NOTE: @prakhar @claude audit: do_pred_update per table = NT
     t_phw.fanout(hard<NT>{});
-    // t_m1[NT] fanout declared below at use site (fo1 or fanout<2> per
-    // FB_RECONCILE)
+    // t_m1[NT] fanout declared above (fo1 or fanout per
+    // FB_RECONCILE/FB_BIM_HYST)
     // NOTE: @prakhar @claude audit: u_correct×NT(NT) + meta_gate(1)
     //   [+ u_wrong×NT(NT) if U_MISP != UNTOUCHED]
     t_ad.fanout(hard<NT + (U_MISP != UMispPolicy::UNTOUCHED ? NT : 0) + 1>{});
@@ -2112,15 +2135,19 @@ struct TageAhead : predictor {
 
     // ---- Step 4: Fallback update ----
     // 4a. Direct update: mispredict + fallback is provider → write actual_dir.
-    // train_fb:      1 read (FB_RECONCILE=false), 2 reads (FB_RECONCILE=true)
-    // train_fb_idx:  1 read (FB_RECONCILE=false), 3 reads (FB_RECONCILE=true)
-    // train_fb_hyst: 0 reads (FB_RECONCILE=false), 2 reads (FB_RECONCILE=true)
+    // NOTE: @prakhar @claude audit — fanout counts vary by FB_RECONCILE/FB_BIM_HYST
+    static constexpr u64 FB_EXTRA = (FB_RECONCILE ? 1 : 0) + (FB_BIM_HYST ? 1 : 0);
     if constexpr (FB_RECONCILE) {
       // NOTE: @prakhar @claude audit
       train_fb_hyst.fanout(hard<2>{}); // fb_hyst_weak + silent update check
-      train_fb.fanout(hard<2>{});      // NOTE: @prakhar @claude audit
-      train_fb_idx.fanout(hard<3>{});  // NOTE: @prakhar @claude audit
     }
+    if constexpr (FB_EXTRA > 0) {
+      train_fb.fanout(hard<1 + FB_EXTRA>{});   // NOTE: @prakhar @claude audit
+      if constexpr (!FB_BIM_HYST) // BIM_HYST declares train_fb_idx fanout early (before need_extra_cycle)
+        train_fb_idx.fanout(hard<1 + 2 * FB_EXTRA>{}); // NOTE: @prakhar @claude audit
+    }
+    if constexpr (FB_BIM_HYST)
+      fb_bh_read.fanout(hard<2>{}); // fb_bh_weak + bh_changed
     // Full N-wide actual direction for fb path (fb_ctr stores FB_PRED_BITS = N*CTR_WIDTH)
     val<FB_PRED_BITS> actual_dir_full = [&]() -> val<FB_PRED_BITS> {
       if constexpr (NUM_GROUPS == 1) {
@@ -2131,17 +2158,28 @@ struct TageAhead : predictor {
         }}.concat();
       }
     }();
-    if constexpr (NUM_GROUPS > 1)
-      actual_dir_full.fanout(hard<2>{}); // fb_changed + fb_ctr.write
+    if constexpr (NUM_GROUPS > 1 || FB_BIM_HYST)
+      actual_dir_full.fanout(hard<1 + (NUM_GROUPS > 1 ? 1 : 0) + (FB_BIM_HYST ? 1 : 0)>{});
     val<1> fb_changed = [&]() -> val<1> {
-      if constexpr (FB_RECONCILE)
+      if constexpr (FB_EXTRA > 0)
         return actual_dir_full != val<FB_PRED_BITS>{train_fb};
       else
         return actual_dir_full != val<FB_PRED_BITS>{train_fb.fo1()};
     }();
-    // t_m1[NT]: fanout<2> declared above if FB_RECONCILE, else use fo1() here
+    // fb_gate + fb write data depend on FB_BIM_HYST
+    val<FB_PRED_BITS> fb_write_data = [&]() -> val<FB_PRED_BITS> {
+      if constexpr (FB_BIM_HYST) {
+        // Per-branch: only flip prediction where hyst is weak AND wrong
+        val<FB_PRED_BITS> fb_wrong = actual_dir_full ^ val<FB_PRED_BITS>{train_fb};
+        val<FB_PRED_BITS> fb_bh_weak = ~val<FB_PRED_BITS>{fb_bh_read};
+        val<FB_PRED_BITS> fb_flip = fb_wrong & fb_bh_weak;
+        return val<FB_PRED_BITS>{train_fb} ^ fb_flip;
+      } else {
+        return actual_dir_full;
+      }
+    }();
     val<1> fb_gate = [&]() -> val<1> {
-      if constexpr (FB_RECONCILE)
+      if constexpr (FB_EXTRA > 0)
         return do_train & t_m1[NT] & mispredict & fb_changed.fo1();
       else
         return do_train & t_m1[NT].fo1() & mispredict & fb_changed.fo1();
@@ -2198,12 +2236,23 @@ struct TageAhead : predictor {
     // NOTE: @prakhar @claude audit
     fb_gate.fanout(hard<5>{}); // fb_ctr.write: B=2 bank writes + write_bank +
                                // write_localaddr + write_data
-    if constexpr (FB_RECONCILE)
-      fb_write(val<FB_IDX_BITS>{train_fb_idx}, actual_dir_full, fb_gate);
+    if constexpr (FB_EXTRA > 0)
+      fb_write(val<FB_IDX_BITS>{train_fb_idx}, fb_write_data, fb_gate);
     else
-      fb_write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir_full, fb_gate);
+      fb_write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, fb_write_data, fb_gate);
 
-    // 4b. Reconciliation (Tage.hpp P1/P2 pattern): when TAGE and fb disagree
+    // 4b. Bimodal hysteresis update: correct→strong(1), wrong→weak(0)
+    if constexpr (FB_BIM_HYST) {
+      val<FB_PRED_BITS> fb_wrong = actual_dir_full ^ val<FB_PRED_BITS>{train_fb};
+      val<FB_PRED_BITS> new_bh = ~fb_wrong; // 1=correct, 0=wrong
+      val<1> bh_changed = new_bh != val<FB_PRED_BITS>{fb_bh_read};
+      val<1> bh_gate = do_train & t_m1[NT] & mispredict & bh_changed;
+      execute_if(bh_gate, [&]() {
+        fb_bim_hyst.write(val<FB_BH_IDX_BITS>{train_fb_idx}, new_bh);
+      });
+    }
+
+    // 4c. Reconciliation (Tage.hpp P1/P2 pattern): when TAGE and fb disagree
     // persistently (fb_hyst weak), overwrite fb with TAGE's prediction.
     // Also update fb_hyst every cycle to track agreement.
     if constexpr (FB_RECONCILE) {
