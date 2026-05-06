@@ -96,13 +96,10 @@ struct TageAheadHC_IR : predictor {
 
   // ======== Fallback (bimodal, ahead-pipelined) ========
   reg<FB_PRED_BITS> prefetch_fb;
-  reg<FB_PRED_BITS> current_fb;
   reg<FB_IDX_BITS> prefetch_fb_idx;
-  reg<FB_IDX_BITS> current_fb_idx;
 
   // Piped PC for allocation tag recomputation
   reg<ALLOC_PC_BITS> prefetch_pc;
-  reg<ALLOC_PC_BITS> current_pc;
 
   // ======== Block tracking ========
   reg<1> true_block = 1;
@@ -114,11 +111,10 @@ struct TageAheadHC_IR : predictor {
   u64 block_size = 0;
   arr<reg<1>, N> branch_dir;
 
-  // Secondary tag (precomputed in update_cycle from next_pc)
+  // Secondary tag (computed in predict1 from inst_pc)
   reg<SEC_TAG_BITS> curr_sec_tag;
 
   // ======== Pipeline regs [NT] ========
-  reg<TAG_WIDTH> prefetch_tag[NT];
   reg<1> prefetch_tag_hit[NT];       // htag-only match (lower HTAG_WIDTH bits)
   reg<PRED_BITS> prefetch_pred[NT];  // 1-bit prediction per entry
   reg<SEC_TAG_BITS> prefetch_sec[NT];
@@ -127,16 +123,6 @@ struct TageAheadHC_IR : predictor {
   reg<U_WIDTH> prefetch_u[NT];
   reg<TAG_WIDTH> prefetch_ctag[NT];
   reg<GROUP_BITS> prefetch_group_id[NT]; // extracted from upper tag bits
-
-  reg<TAG_WIDTH> current_tag[NT];
-  reg<1> current_tag_hit[NT];
-  reg<PRED_BITS> current_pred[NT];
-  reg<SEC_TAG_BITS> current_sec[NT];
-  reg<MAX_IDX_BITS> current_idx[NT];
-  reg<HYST_WIDTH> current_hyst[NT];
-  reg<U_WIDTH> current_u[NT];
-  reg<TAG_WIDTH> current_ctag[NT];
-  reg<GROUP_BITS> current_group_id[NT];
 
   // Prediction regs (shared by predict1/2/reuse)
   arr<reg<1>, N> pred;
@@ -380,187 +366,19 @@ struct TageAheadHC_IR : predictor {
 
   // ======== predict1 ========
   val<1> predict1([[maybe_unused]] val<64> inst_pc) {
-    // 2 reads per table (>>2, >>4) + fb (>>2) + prefetch_pc (>>2)
-    inst_pc.fanout(hard<2 * NT + 2>{});
-
-    // Ahead reads for next block (no true_block gate — see TageAhead comment)
-    static_loop<NT>([&]<u64 I>() {
-      auto &fi = fold_idx_at<I>();
-      auto &ft = fold_tag_at<I>();
-      fi.fanout(hard<2>{}); // get() + compute_update
-      ft.fanout(hard<2>{}); // get() + compute_update
-      auto fold_idx_val = fi.get();
-      auto idx = fold_idx_val.fo1() ^ val<IDX_BITS[I]>{inst_pc >> 2};
-      idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
-      auto fold_tag_val = ft.get();
-      auto computed_tag = fold_tag_val.fo1() ^ val<TAG_WIDTH>{inst_pc >> 4};
-      computed_tag.fanout(hard<2>{}); // tag comparison + prefetch_ctag write
-
-      auto stored_tag = tag_ram_at<I>().read(idx);
-      stored_tag.fanout(hard<3>{}); // htag compare + group_id extract + prefetch_tag
-      prefetch_tag[I] = stored_tag;
-      // Split tag: lower HTAG_WIDTH bits = htag, upper GROUP_BITS = group_id
-      prefetch_tag_hit[I] =
-          val<PER_TABLE_HTAG[I]>{stored_tag} == val<PER_TABLE_HTAG[I]>{computed_tag};
-      prefetch_group_id[I] =
-          val<GROUP_BITS>{stored_tag >> PER_TABLE_HTAG[I]};
-      prefetch_ctag[I] = computed_tag;
-      prefetch_pred[I] = pred_ram_at<I>().read(idx);
-      prefetch_sec[I] = sec_ram_at<I>().read(idx);
-      prefetch_idx[I] = idx;
-      prefetch_hyst[I] = hyst_ram_at<I>().read(val<HYST_IDX_BITS[I]>{idx});
-      prefetch_u[I] = u_ram_at<I>().read(idx);
-#ifdef DEBUG_PRINT
-      if constexpr (I == 0) {
-        std::cerr << "\n=== predict1 table[0] ===\n";
-        fold_idx_val.print("  fold_idx=", "\n", true, std::cerr);
-        idx.print("  idx=", "\n", true, std::cerr);
-        fold_tag_val.print("  fold_tag=", "\n", true, std::cerr);
-        computed_tag.print("  ctag=", "\n", true, std::cerr);
-        stored_tag.print("  stored_tag=", "\n", true, std::cerr);
-        prefetch_tag_hit[I].print("  tag_hit=", "\n", true, std::cerr);
-        prefetch_pred[I].print("  pred=", "\n", true, std::cerr);
-        prefetch_sec[I].print("  sec=", "\n", true, std::cerr);
-        prefetch_hyst[I].print("  hyst=", "\n", true, std::cerr);
-      }
-#endif
-    });
-
-    // Fallback ahead read (single 8K×7 RAM)
-    auto fb_idx = val<FB_IDX_BITS>{inst_pc >> 2};
-    fb_idx.fanout(hard<2>{}); // prefetch_fb_idx + fb read
-    prefetch_fb_idx = fb_idx;
-    prefetch_fb = fb_ctr.read(fb_idx);
-    prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
-
-    // Return precomputed prediction from reg
-    block_entry.fanout(hard<2 * LINEINST>{});
-    pred.fanout(hard<2 * LINEINST>{});
-    block_size = 1;
-    num_branch = 0;
-    reuse_prediction(~line_end());
-    return pred[num_branch];
-  }
-
-  // ======== reuse_predict1 ========
-  val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) {
-    block_size++;
-    reuse_prediction(~line_end());
-    return pred[num_branch];
-  }
-
-  // ======== predict2 / reuse_predict2 ========
-  val<1> predict2([[maybe_unused]] val<64> inst_pc) { return pred[num_branch]; }
-  val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) { return pred[num_branch]; }
-
-  // ======== update_condbr ========
-  void update_condbr([[maybe_unused]] val<64> branch_pc, val<1> taken,
-                     [[maybe_unused]] val<64> next_pc) {
-    assert(num_branch < N);
-    branch_dir[num_branch] = taken.fo1();
-    num_branch++;
-    reuse_prediction(~line_end() & val<1>{num_branch < N});
-  }
-
-  // ======== update_cycle ========
-  void update_cycle([[maybe_unused]] instruction_info &block_end_info) {
+    // inst_pc fanout: 2 per table (>>2, >>5) + fb(>>2) + prefetch_pc(>>2)
+    //               + sec_tag(>>2,>>9,>>16) + meta_idx(>>2)
+    inst_pc.fanout(hard<2 * NT + 6>{});
 
     // ================================================================
-    // Stage 1: Pipeline shift
-    //
-    // Save current_* → train_* (block A's data for training next cycle),
-    // then shift prefetch_* → current_* (block B's ahead reads become
-    // active for resolution this cycle).
-    //
-    // train_sec_hit is computed here by comparing current_sec against
-    // curr_sec_tag (the sec-tag hash from the PREVIOUS cycle's next_pc).
-    // This is correct: current_sec was prefetched using the predicted PC,
-    // and curr_sec_tag was hashed from the actual next_pc of that block.
-    // ================================================================
-
-    // curr_sec_tag: NT reads for train_sec_hit comparisons + 1 for saving
-    curr_sec_tag.fanout(hard<NT + 1>{});
-
-    static_loop<NT>([&]<u64 I>() {
-      train_idx[I] = current_idx[I].fo1();
-      train_pred[I] = current_pred[I].fo1();
-      train_hyst[I] = current_hyst[I].fo1();
-      train_u[I] = current_u[I].fo1();
-      train_ctag[I] = current_ctag[I].fo1();
-      train_tag_hit[I] = current_tag_hit[I].fo1();
-      train_group_id[I] = current_group_id[I].fo1();
-      // Sec-tag match: does stored sec_tag equal the hash from last cycle?
-      train_sec_hit[I] = (val<SEC_TAG_BITS>{current_sec[I].fo1()} ==
-                          val<SEC_TAG_BITS>{curr_sec_tag});
-    });
-    train_fb = current_fb.fo1();
-    train_fb_idx = current_fb_idx.fo1();
-    train_pc = current_pc.fo1();
-    train_sec_tag = curr_sec_tag; // save for allocation writes
-
-    // Fanout on prefetch_* regs:
-    //   shift into current_* (1) + NUM_GROUPS group chains
-    static_loop<NT>([&]<u64 I>() {
-      prefetch_tag_hit[I].fanout(hard<2>{});  // shift + htag_sec precompute
-      prefetch_pred[I].fanout(hard<1 + NUM_GROUPS>{});    // shift + table_preds
-      prefetch_hyst[I].fanout(hard<2>{});    // shift + weak_mask
-      prefetch_u[I].fanout(hard<2>{});       // shift + weak_mask
-      prefetch_sec[I].fanout(hard<2>{});     // shift + sec_match precompute
-      prefetch_group_id[I].fanout(hard<1 + NUM_GROUPS>{}); // shift + group_id cmp
-    });
-    prefetch_fb.fanout(hard<2>{}); // shift + fb_bits extraction
-
-    // Shift prefetch → current (unconditional)
-    static_loop<NT>([&]<u64 I>() {
-      current_tag[I] = prefetch_tag[I].fo1();
-      current_tag_hit[I] = prefetch_tag_hit[I];
-      current_pred[I] = prefetch_pred[I];
-      current_sec[I] = prefetch_sec[I];
-      current_idx[I] = prefetch_idx[I].fo1();
-      current_hyst[I] = prefetch_hyst[I];
-      current_u[I] = prefetch_u[I];
-      current_ctag[I] = prefetch_ctag[I].fo1();
-      current_group_id[I] = prefetch_group_id[I];
-    });
-    current_fb = prefetch_fb;
-    current_fb_idx = prefetch_fb_idx.fo1();
-    current_pc = prefetch_pc.fo1();
-
-    // ================================================================
-    // Stage 2: Sec-tag hash from next_pc
-    //
-    // Xor3SecTagHash5: val<5>{pc>>2} ^ val<5>{pc>>9} ^ val<5>{pc>>16}
-    // This is the BOTTLENECK on the predict path (942ps in debug_print)
-    // because next_pc arrives late from the pipeline.
-    //
-    // sec_tag_now is used for resolution (full_hits comparison) AND
-    // stored into curr_sec_tag for next cycle's train_sec_hit.
-    // ================================================================
-
-    // next_pc fanout: sec_tag_now(1) + meta_idx(1) + hist path_bits(1)
-    block_end_info.next_pc.fanout(hard<3>{});
-
-    auto sec_tag_now = ta::Xor3SecTagHash5::apply<SEC_TAG_BITS>(
-        block_end_info.next_pc);
-    // Fanout: reg write(1) + NT sec_match precomputes
-    sec_tag_now.fanout(hard<NT + 1>{});
-    curr_sec_tag = sec_tag_now;
-    // Alloc-path: NT sec_ram writes use the OLD sec_tag (saved before overwrite)
-    train_sec_tag.fanout(hard<NT>{});
-#ifdef DEBUG_PRINT
-    std::cerr << "--- sec-tag path ---\n";
-    sec_tag_now.print("  sec_tag_now=", "\n", true, std::cerr);
-#endif
-
-    // ================================================================
-    // Stage 3: Meta pipeline
+    // Stage 1: Meta pipeline shift (moved from update_cycle)
     //
     // Shift meta_pipe[] down, then read new meta counter value into [0].
     // meta_pipe[META_PIPE-1] (= [1]) holds the delayed meta value used
     // for provider-vs-alt selection in the resolution chain.
     //
-    // Shift FIRST, then write [0] — prevents stale-value bug where [1]
-    // would read the new RAM value instead of the properly delayed one.
+    // Uses inst_pc for meta index (inst_pc(B) == next_pc(A)).
+    // Shift FIRST, then write [0] — prevents stale-value bug.
     // ================================================================
 
     for (u64 mb = 0; mb < META_BANKS; mb++) {
@@ -570,7 +388,7 @@ struct TageAheadHC_IR : predictor {
       }
     }
     {
-      auto meta_idx = val<META_IDX_BITS>{block_end_info.next_pc >> 2};
+      auto meta_idx = val<META_IDX_BITS>{inst_pc >> 2};
       meta_idx.fanout(hard<1 + META_BANKS>{}); // meta_idx_pipe[0] + K reads
       meta_pipe[0][0] = meta_ctr0.read(meta_idx);
       meta_pipe[1][0] = meta_ctr1.read(meta_idx);
@@ -586,35 +404,33 @@ struct TageAheadHC_IR : predictor {
     };
 
     // ================================================================
-    // Stage 4: Per-group resolution chains (Independent Resolution)
+    // Stage 2: Sec-tag + resolution (on OLD prefetch_* from previous predict1)
     //
-    // 7 independent resolve_chains, one per branch (NUM_GROUPS=7).
-    // Each entry's tag is split into htag (8-bit) + group_id (3-bit).
-    // A table entry is a hit for group G when:
-    //   htag matches AND group_id == G AND sec_tag matches.
+    // inst_pc(B) == next_pc(A): the sec_tag hash is the same as what
+    // update_cycle would have computed from block_end_info.next_pc.
+    // Resolution reads prefetch_* (block A's entries) before they are
+    // overwritten by this cycle's RAM reads.
     //
-    // Each chain finds its own provider/alt and produces a 1-bit pred.
+    // sec_tag_now also serves as train_sec_hit (same comparison).
     // ================================================================
 
-    // Save old prediction (block B) before scatter overwrites with B+1
-    branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
+    auto sec_tag_now = ta::Xor3SecTagHash5::apply<SEC_TAG_BITS>(inst_pc);
+    // Fanout: NT sec_match + NT train_sec_hit + train_sec_tag write
+    sec_tag_now.fanout(hard<2 * NT + 1>{});
+    curr_sec_tag = sec_tag_now;
 
-    // Precompute per-table sec_tag match (once, not per-group × per-table)
-    // Reduces sec_tag_now fanout from NT*NUM_GROUPS+1=99 to NT+1=15
+    // Precompute per-table sec_tag match
     arr<val<1>, NT> sec_matches = [&](u64 i) -> val<1> {
-      return val<SEC_TAG_BITS>{prefetch_sec[i]} ==
-             val<SEC_TAG_BITS>{sec_tag_now};
+      return val<SEC_TAG_BITS>{prefetch_sec[i]} == val<SEC_TAG_BITS>{sec_tag_now};
     };
 
     // Precompute per-table combined htag_hit & sec_match
-    // Reduces prefetch_tag_hit fanout from 8 to 2
     arr<val<1>, NT> htag_sec = [&](u64 i) -> val<1> {
       return val<1>{prefetch_tag_hit[i]} & sec_matches[i].fo1();
     };
     htag_sec.fanout(hard<NUM_GROUPS>{}); // one read per group chain
 
     // Precompute per-group fb bits (split N-wide fb into individual bits)
-    // Reduces prefetch_fb fanout from 8 to 2
     arr<val<1>, NUM_GROUPS> fb_bits =
         val<FB_PRED_BITS>{prefetch_fb}.make_array(val<1>{});
 
@@ -631,21 +447,6 @@ struct TageAheadHC_IR : predictor {
     // meta_use_alt: each bank serves its groups
     // Bank 0: groups 0-3 (4 reads), Bank 1: groups 4-6 (3 reads)
     meta_use_alt.fanout(hard<4>{});
-
-    // Pre-read ALL old train reg values BEFORE per-group resolution
-    // overwrites them. Training uses these pre-read values.
-    u64 train_group = num_branch > 0 ? num_branch - 1 : 0;
-    arr<val<PRED_BITS>, NUM_GROUPS> old_provider_pred = [&](u64 g) -> val<PRED_BITS> {
-      return val<PRED_BITS>{train_provider_pred[g].fo1()};
-    };
-    val<MATCH_BITS> pre_read_match1 = train_match1[train_group].fo1();
-    // Per-group pw/ad needed for per-bank meta training
-    arr<val<1>, NUM_GROUPS> pre_read_pw = [&](u64 g) -> val<1> {
-      return train_provider_weak[g].fo1();
-    };
-    arr<val<1>, NUM_GROUPS> pre_read_ad = [&](u64 g) -> val<1> {
-      return train_altdiff[g].fo1();
-    };
 
     // ---- resolve_chain lambda (1-bit version) ----
     auto resolve_chain = [&](arr<val<1>, NT> fh, val<PRED_BITS> fb_g,
@@ -738,11 +539,124 @@ struct TageAheadHC_IR : predictor {
 #endif
 
     // ================================================================
-    // Stage 5: Training setup
+    // Stage 3: Pipeline shift (prefetch → train)
     //
-    // Read OLD piped resolution values (block A) BEFORE overwriting
-    // with current resolution (block B). Training uses block A's
-    // data while resolution just computed block B's.
+    // Save OLD prefetch_* into train_* BEFORE RAM reads overwrite them.
+    // train_sec_hit uses sec_tag_now (same as resolution sec_matches).
+    // ================================================================
+
+    train_sec_tag = sec_tag_now;
+    static_loop<NT>([&]<u64 I>() {
+      train_sec_hit[I] = (val<SEC_TAG_BITS>{prefetch_sec[I].fo1()} ==
+                          val<SEC_TAG_BITS>{sec_tag_now});
+      train_idx[I] = prefetch_idx[I].fo1();
+      train_pred[I] = prefetch_pred[I].fo1();
+      train_hyst[I] = prefetch_hyst[I].fo1();
+      train_u[I] = prefetch_u[I].fo1();
+      train_ctag[I] = prefetch_ctag[I].fo1();
+      train_tag_hit[I] = prefetch_tag_hit[I].fo1();
+      train_group_id[I] = prefetch_group_id[I].fo1();
+    });
+    train_fb = prefetch_fb.fo1();
+    train_fb_idx = prefetch_fb_idx.fo1();
+    train_pc = prefetch_pc.fo1();
+
+    // ================================================================
+    // Stage 4: Ahead RAM reads for next block
+    // ================================================================
+
+    static_loop<NT>([&]<u64 I>() {
+      auto &fi = fold_idx_at<I>();
+      auto &ft = fold_tag_at<I>();
+      fi.fanout(hard<2>{}); // get() + compute_update
+      ft.fanout(hard<2>{}); // get() + compute_update
+      auto fold_idx_val = fi.get();
+      auto idx = fold_idx_val.fo1() ^ val<IDX_BITS[I]>{inst_pc >> 2};
+      idx.fanout(hard<6>{}); // 5 RAM reads + prefetch_idx write
+      auto fold_tag_val = ft.get();
+      auto computed_tag = fold_tag_val.fo1() ^ val<TAG_WIDTH>{inst_pc >> 5};
+      computed_tag.fanout(hard<2>{}); // tag comparison + prefetch_ctag write
+
+      auto stored_tag = tag_ram_at<I>().read(idx);
+      stored_tag.fanout(hard<2>{}); // htag compare + group_id extract
+      // Split tag: lower HTAG_WIDTH bits = htag, upper GROUP_BITS = group_id
+      prefetch_tag_hit[I] =
+          val<PER_TABLE_HTAG[I]>{stored_tag} == val<PER_TABLE_HTAG[I]>{computed_tag};
+      prefetch_group_id[I] =
+          val<GROUP_BITS>{stored_tag >> PER_TABLE_HTAG[I]};
+      prefetch_ctag[I] = computed_tag;
+      prefetch_pred[I] = pred_ram_at<I>().read(idx);
+      prefetch_sec[I] = sec_ram_at<I>().read(idx);
+      prefetch_idx[I] = idx;
+      prefetch_hyst[I] = hyst_ram_at<I>().read(val<HYST_IDX_BITS[I]>{idx});
+      prefetch_u[I] = u_ram_at<I>().read(idx);
+#ifdef DEBUG_PRINT
+      if constexpr (I == 0) {
+        std::cerr << "\n=== predict1 table[0] ===\n";
+        fold_idx_val.print("  fold_idx=", "\n", true, std::cerr);
+        idx.print("  idx=", "\n", true, std::cerr);
+        fold_tag_val.print("  fold_tag=", "\n", true, std::cerr);
+        computed_tag.print("  ctag=", "\n", true, std::cerr);
+        stored_tag.print("  stored_tag=", "\n", true, std::cerr);
+        prefetch_tag_hit[I].print("  tag_hit=", "\n", true, std::cerr);
+        prefetch_pred[I].print("  pred=", "\n", true, std::cerr);
+        prefetch_sec[I].print("  sec=", "\n", true, std::cerr);
+        prefetch_hyst[I].print("  hyst=", "\n", true, std::cerr);
+      }
+#endif
+    });
+
+    // Fallback ahead read (single 8K×7 RAM)
+    auto fb_idx = val<FB_IDX_BITS>{inst_pc >> 2};
+    fb_idx.fanout(hard<2>{}); // prefetch_fb_idx + fb read
+    prefetch_fb_idx = fb_idx;
+    prefetch_fb = fb_ctr.read(fb_idx);
+    prefetch_pc = val<ALLOC_PC_BITS>{inst_pc >> 2};
+
+    // Return prediction from resolution (just computed above)
+    block_entry.fanout(hard<2 * LINEINST>{});
+    pred.fanout(hard<2 * LINEINST>{});
+    block_size = 1;
+    num_branch = 0;
+    reuse_prediction(~line_end());
+    return pred[num_branch];
+  }
+
+  // ======== reuse_predict1 ========
+  val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc) {
+    block_size++;
+    reuse_prediction(~line_end());
+    return pred[num_branch];
+  }
+
+  // ======== predict2 / reuse_predict2 ========
+  val<1> predict2([[maybe_unused]] val<64> inst_pc) { return pred[num_branch]; }
+  val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc) { return pred[num_branch]; }
+
+  // ======== update_condbr ========
+  void update_condbr([[maybe_unused]] val<64> branch_pc, val<1> taken,
+                     [[maybe_unused]] val<64> next_pc) {
+    assert(num_branch < N);
+    branch_dir[num_branch] = taken.fo1();
+    num_branch++;
+    reuse_prediction(~line_end() & val<1>{num_branch < N});
+  }
+
+  // ======== update_cycle ========
+  void update_cycle([[maybe_unused]] instruction_info &block_end_info) {
+
+    // ================================================================
+    // Resolution + meta pipeline + shift all moved to predict1.
+    // update_cycle only does: training + history updates.
+    // ================================================================
+
+    // Alloc-path: NT sec_ram writes use the sec_tag saved by predict1
+    train_sec_tag.fanout(hard<NT>{});
+
+    // ================================================================
+    // Training setup
+    //
+    // Pre-read values saved by predict1's resolution loop.
     //
     // Fanout declarations for training regs:
     //   train_hyst[I]:    2 reads (t_hyst_weak + old_hyst in update)
@@ -752,6 +666,21 @@ struct TageAheadHC_IR : predictor {
     //   train_idx[I]:     5 reads (pred/hyst/tag/sec/u RAM writes)
     // ================================================================
 
+    // Pre-read values saved by predict1's per-group resolution loop.
+    u64 train_group = num_branch > 0 ? num_branch - 1 : 0;
+    arr<val<PRED_BITS>, NUM_GROUPS> old_provider_pred = [&](u64 g) -> val<PRED_BITS> {
+      return val<PRED_BITS>{train_provider_pred[g].fo1()};
+    };
+    val<MATCH_BITS> pre_read_match1 = train_match1[train_group].fo1();
+    arr<val<1>, NUM_GROUPS> pre_read_pw = [&](u64 g) -> val<1> {
+      return train_provider_weak[g].fo1();
+    };
+    arr<val<1>, NUM_GROUPS> pre_read_ad = [&](u64 g) -> val<1> {
+      return train_altdiff[g].fo1();
+    };
+
+    branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
+
     static_loop<NT>([&]<u64 I>() {
       train_hyst[I].fanout(hard<2>{});
       train_u[I].fanout(hard<3>{});       // u_zero + base old_u + decay old_u
@@ -760,7 +689,7 @@ struct TageAheadHC_IR : predictor {
       train_idx[I].fanout(hard<5>{});     // 5 RAM writes
     });
 
-    // Use pre-read values from before per-group loop overwrote train regs
+    // Use pre-read values from predict1's per-group resolution
     val<MATCH_BITS> t_match1 = pre_read_match1;
     t_match1.fanout(hard<2>{}); // make_array + alloc_base
     arr<val<1>, NT + 1> t_m1 = t_match1.make_array(val<1>{});
