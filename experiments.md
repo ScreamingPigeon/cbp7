@@ -750,3 +750,36 @@ Config: TageAheadHC_IR with per-table tag widths:
 MPKI slightly better but VFS marginally worse — tag RAM savings don't
 compensate. Full eval (168 traces) launched to `out/full_hcir_gt117/` for
 definitive comparison, since the quick-eval delta is within noise.
+
+### Full-eval results (55 traces completed)
+
+GT<11,7> weighted MPKI: 9.783 vs HC_IR baseline: 9.658 → **+1.29% worse**.
+Several large regressions (compress_7 +21%, fp_11 +25%, roms +45%) outweigh
+wins (exchange2 -12%, gmsh -13.5%). **Verdict: FAILED.**
+
+---
+
+## Experiment: FB Bimodal Hysteresis on TageAheadHC_IR (2026-05-05)
+
+**Goal**: Add traditional 2-bit saturating counter hysteresis to the fallback
+bimodal predictor. Instead of overwriting fb prediction on every mispredict,
+only flip when hysteresis is weak (wrong twice). Half-sized RAM (4096×7).
+
+**Key constraint**: HARCOM single-RAM-access-per-cycle. Read fb_bim_hyst gated
+by mispredict before `need_extra_cycle` (cycle 1), write after (cycle 2).
+Only updates on mispredict cycles.
+
+Config: TageAheadHC_IR, 14 tables, BPE1, 8 banks, SEC_TAG=5.
+FB_BH_CAPACITY=4096 (half of FB_CAPACITY=8192).
+
+### Quick-eval results (20 traces)
+
+| Metric | HC_IR baseline | HC_IR + FBH | Delta |
+|--------|----------------|-------------|-------|
+| MPI | 0.01078 | 0.009804 | -9.1% |
+| VFS | 0.878 | 0.8946 | +1.9% |
+
+VFS stays under 1 cycle (0.913 with FLOORPLAN). fb_bim_hyst RAM placed after
+meta to avoid displacing critical-path structures.
+
+Full eval (168 traces, 4 cores) launched to `full_out/hc_ir_fbh/`.
