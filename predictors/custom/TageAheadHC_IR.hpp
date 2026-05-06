@@ -35,6 +35,8 @@ struct TageAheadHC_IR : predictor {
   static constexpr u64 LOGLINEINST = 8;   // clog2(256)
   static constexpr u64 FB_CAPACITY = 8192;
   static constexpr u64 FB_IDX_BITS = 13;  // clog2(8192)
+  static constexpr u64 FB_BH_CAPACITY = FB_CAPACITY / 2;
+  static constexpr u64 FB_BH_IDX_BITS = 12; // clog2(4096)
   static constexpr u64 META_WIDTH = 4;
   static constexpr u64 META_CAPACITY = 2048;
   static constexpr u64 META_IDX_BITS = 11; // clog2(2048)
@@ -309,6 +311,9 @@ struct TageAheadHC_IR : predictor {
   ta_rwram<META_WIDTH, META_CAPACITY, 8, 1> meta_ctr0{"meta0"};
   ta_rwram<META_WIDTH, META_CAPACITY, 8, 1> meta_ctr1{"meta1"};
 
+  // ---- FB bimodal hysteresis (update-only, non-critical path) ----
+  hcm::ram<val<FB_PRED_BITS>, FB_BH_CAPACITY> fb_bim_hyst{"fb_bim_hyst"};
+
   // ======== Training regs ========
   reg<MAX_IDX_BITS> train_idx[NT];
   reg<PRED_BITS> train_pred[NT];   // 1-bit per entry
@@ -316,6 +321,7 @@ struct TageAheadHC_IR : predictor {
   reg<U_WIDTH> train_u[NT];
   reg<FB_PRED_BITS> train_fb;
   reg<FB_IDX_BITS> train_fb_idx;
+  reg<FB_PRED_BITS> fb_bh_read;
   reg<ALLOC_PC_BITS> train_pc;
   reg<TAG_WIDTH> train_ctag[NT];
   reg<SEC_TAG_BITS> train_sec_tag;
@@ -761,7 +767,8 @@ struct TageAheadHC_IR : predictor {
     static_loop<NT>([&]<u64 I>() {
       t_m1[I].fanout(hard<4>{});
     });
-    // t_m1[NT]: 1 read (fb_gate). FB_RECONCILE=false, no extra fanout needed.
+    // t_m1[NT]: fb_gate(1) + bh_gate(1)
+    t_m1[NT].fanout(hard<2>{});
 
     // t_pw not needed — per-bank meta uses pre_read_pw[g] directly
     val<1> t_ad = pre_read_ad[train_group];
@@ -815,20 +822,27 @@ struct TageAheadHC_IR : predictor {
     // ================================================================
 
     val<1> &mispredict = block_end_info.is_mispredict;
-    // extra_cycle(1) + alloc_trigger(1) + fb_gate(1) + acc_ctr(1) + true_block(1)
-    mispredict.fanout(hard<5>{});
+    // extra_cycle(1) + alloc_trigger(1) + fb_gate(1) + acc_ctr(1) + true_block(1) + bh_read(1) + bh_gate(1)
+    mispredict.fanout(hard<7>{});
+
+    // Read fb bimodal hyst BEFORE extra_cycle (cycle 1); write happens AFTER (cycle 2)
+    train_fb_idx.fanout(hard<3>{});  // bh_read(1) + fb_write(1) + bh_write(1)
+    fb_bh_read = execute_if(mispredict, [&]() {
+      return fb_bim_hyst.read(val<FB_BH_IDX_BITS>{train_fb_idx});
+    });
+
     need_extra_cycle(mispredict);
 
-    // do_train gates all RAM writes: 4 per table + fb + meta
-    // fb(1) + meta_banks(2) + 4 per table
-    do_train.fanout(hard<4 * NT + 1 + META_BANKS>{});
+    // do_train gates all RAM writes: 4 per table + fb + bh + meta
+    // fb(1) + bh(1) + meta_banks(2) + 4 per table
+    do_train.fanout(hard<4 * NT + 2 + META_BANKS>{});
 
     // Full N-wide actual direction for fb path
     val<FB_PRED_BITS> actual_dir_full = arr<val<1>, N>{[&](u64 i) -> val<1> {
                                           return val<1>{branch_dir[i]};
                                         }}.concat();
-    // fb_changed(1) + fb_ctr.write(1)
-    actual_dir_full.fanout(hard<2>{});
+    // fb_wrong(1) + fb_changed(1) + bh_write(1)
+    actual_dir_full.fanout(hard<3>{});
 
     // Per-group provider wrong (used by per-bank meta training)
     arr<val<1>, NUM_GROUPS> per_group_wrong = [&](u64 g) -> val<1> {
@@ -929,11 +943,28 @@ struct TageAheadHC_IR : predictor {
     // agreement tracking or silent overwrites.
     // ================================================================
 
-    val<1> fb_changed = actual_dir_full != val<FB_PRED_BITS>{train_fb.fo1()};
-    val<1> fb_gate = do_train & t_m1[NT].fo1() & mispredict & fb_changed.fo1();
+    // fb_write_data: only flip prediction where hyst is weak AND wrong
+    train_fb.fanout(hard<3>{}); // fb_wrong(1) + fb_write_data(1) + fb_changed(1)
+    fb_bh_read.fanout(hard<2>{}); // fb_bh_weak(1) + bh_changed(1)
+    val<FB_PRED_BITS> fb_wrong = actual_dir_full ^ val<FB_PRED_BITS>{train_fb};
+    fb_wrong.fanout(hard<2>{}); // fb_flip(1) + new_bh(1)
+    val<FB_PRED_BITS> fb_bh_weak = ~val<FB_PRED_BITS>{fb_bh_read};
+    val<FB_PRED_BITS> fb_flip = fb_wrong & fb_bh_weak;
+    val<FB_PRED_BITS> fb_write_data = val<FB_PRED_BITS>{train_fb} ^ fb_flip;
+
+    val<1> fb_changed = fb_write_data != val<FB_PRED_BITS>{train_fb};
+    val<1> fb_gate = do_train & t_m1[NT] & mispredict & fb_changed.fo1();
     fb_gate.fanout(hard<11>{}); // ta_rwram-style gate
     execute_if(fb_gate, [&]() {
-      fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx.fo1()}, actual_dir_full);
+      fb_ctr.write(val<FB_IDX_BITS>{train_fb_idx}, fb_write_data);
+    });
+
+    // Bimodal hysteresis update: correct→strong(1), wrong→weak(0)
+    val<FB_PRED_BITS> new_bh = ~fb_wrong;
+    val<1> bh_changed = new_bh != val<FB_PRED_BITS>{fb_bh_read};
+    val<1> bh_gate = do_train & t_m1[NT] & mispredict & bh_changed;
+    execute_if(bh_gate, [&]() {
+      fb_bim_hyst.write(val<FB_BH_IDX_BITS>{train_fb_idx}, new_bh);
     });
 
     // ================================================================
