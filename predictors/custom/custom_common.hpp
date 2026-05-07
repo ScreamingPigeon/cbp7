@@ -1215,10 +1215,10 @@ template <u64 SKIP, u64 NT> val<NT> skip_n(val<NT> x) {
   if constexpr (SKIP == 0)
     return x;
   else if constexpr (SKIP == 1)
-    return clear_lsb(x);
+    return clear_lsb(x.fo1());
   else {
-    val<NT> s = skip_n<SKIP - 1, NT>(x);
-    return clear_lsb(s);
+    val<NT> s = skip_n<SKIP - 1, NT>(x.fo1());
+    return clear_lsb(s.fo1());
   }
 }
 } // namespace target_detail
@@ -1229,7 +1229,7 @@ template <u64 SKIP = 1> struct DeterministicSkipTarget {
   static constexpr const char *name() { return "DetSkip"; }
   template <u64 NT>
   static val<NT> apply(val<NT> collamask, valtype auto, valtype auto, val<8>) {
-    return target_detail::skip_n<SKIP, NT>(collamask);
+    return target_detail::skip_n<SKIP, NT>(collamask.fo1());
   }
 };
 
@@ -1242,7 +1242,7 @@ template <u64 SKIP = 1, u64 PROB_256 = 64> struct StaticSkipTarget {
                        val<8> rng) {
     collamask.fanout(hard<2>{});
     val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
-    return select(rng < hard<PROB_256>{}, skipped, collamask);
+    return select(rng.fo1() < hard<PROB_256>{}, skipped.fo1(), collamask);
   }
 };
 
@@ -1255,7 +1255,7 @@ template <u64 SKIP = 1> struct AllocPressureSkipTarget {
                        val<8> rng) {
     collamask.fanout(hard<2>{});
     val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
-    return select(val<8>{ap} > rng, skipped, collamask);
+    return select(val<8>{ap.fo1()} > rng.fo1(), skipped.fo1(), collamask);
   }
 };
 
@@ -1269,7 +1269,7 @@ template <u64 SKIP = 1> struct AccuracyPressureSkipTarget {
                        val<8> rng) {
     collamask.fanout(hard<2>{});
     val<NT> skipped = target_detail::skip_n<SKIP, NT>(collamask);
-    return select(val<8>{acp} > rng, skipped, collamask);
+    return select(val<8>{acp.fo1()} > rng.fo1(), skipped.fo1(), collamask);
   }
 };
 

@@ -438,7 +438,7 @@ struct TageAheadHC_IR : predictor {
 
     auto sec_tag_now = ta::Xor3SecTagHash5::apply<SEC_TAG_BITS>(inst_pc);
     // Fanout: NT sec_match + NT train_sec_hit + train_sec_tag write
-    sec_tag_now.fanout(hard<2 * NT + 1>{});
+    sec_tag_now.fanout(hard<2 * NT + 2>{});
     curr_sec_tag = sec_tag_now;
 
     // Precompute per-table sec_tag match
@@ -546,7 +546,7 @@ struct TageAheadHC_IR : predictor {
       pp.fanout(hard<2>{});
 
       // Scatter: pred[G] = select(ua, ap, pp) — each group has 1 branch
-      pred[G] = select(ua, ap.fo1(), pp);
+      pred[G] = select(ua.fo1(), ap.fo1(), pp);
 
       // Save per-group resolution → train regs
       train_match1[G] = m1.fo1();
@@ -698,11 +698,15 @@ struct TageAheadHC_IR : predictor {
     arr<val<1>, NUM_GROUPS> pre_read_pw = [&](u64 g) -> val<1> {
       return train_provider_weak[g].fo1();
     };
+    for (u64 g = 0; g < NUM_GROUPS; g++)
+      pre_read_pw[g].fanout(hard<2>{}); // gate + dir
     arr<val<1>, NUM_GROUPS> pre_read_ad = [&](u64 g) -> val<1> {
       return train_altdiff[g].fo1();
     };
+    for (u64 g = 0; g < NUM_GROUPS; g++)
+      pre_read_ad[g].fanout(hard<3>{}); // t_ad + gate + dir
 
-    branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
+    branch_dir.fanout(hard<5>{}); // actual_dir_concat + per_group_wrong + entry_actual + true_block + last_condbr
 
     static_loop<NT>([&]<u64 I>() {
       train_hyst[I].fanout(hard<2>{});
@@ -713,7 +717,7 @@ struct TageAheadHC_IR : predictor {
     });
 
     // Use pre-read values from predict1's per-group resolution
-    val<MATCH_BITS> t_match1 = pre_read_match1;
+    val<MATCH_BITS> t_match1 = pre_read_match1.fo1();
     t_match1.fanout(hard<2>{}); // make_array + alloc_base
     arr<val<1>, NT + 1> t_m1 = t_match1.make_array(val<1>{});
     static_loop<NT>([&]<u64 I>() {
@@ -798,7 +802,7 @@ struct TageAheadHC_IR : predictor {
 
     // Per-group provider wrong (used by per-bank meta training)
     arr<val<1>, NUM_GROUPS> per_group_wrong = [&](u64 g) -> val<1> {
-      return (val<PRED_BITS>{old_provider_pred[g]} ^
+      return (val<PRED_BITS>{old_provider_pred[g].fo1()} ^
               val<1>{branch_dir[g]}) != hard<0>{};
     };
 
@@ -901,8 +905,8 @@ struct TageAheadHC_IR : predictor {
     val<FB_PRED_BITS> fb_wrong = actual_dir_full ^ val<FB_PRED_BITS>{train_fb};
     fb_wrong.fanout(hard<2>{}); // fb_flip(1) + new_bh(1)
     val<FB_PRED_BITS> fb_bh_weak = ~val<FB_PRED_BITS>{fb_bh_read};
-    val<FB_PRED_BITS> fb_flip = fb_wrong & fb_bh_weak;
-    val<FB_PRED_BITS> fb_write_data = val<FB_PRED_BITS>{train_fb} ^ fb_flip;
+    val<FB_PRED_BITS> fb_flip = fb_wrong & fb_bh_weak.fo1();
+    val<FB_PRED_BITS> fb_write_data = val<FB_PRED_BITS>{train_fb} ^ fb_flip.fo1();
     fb_write_data.fanout(hard<2>{}); // fb_changed compare + fb_ctr write
 
     val<1> fb_changed = fb_write_data != val<FB_PRED_BITS>{train_fb};
@@ -916,7 +920,8 @@ struct TageAheadHC_IR : predictor {
     val<FB_PRED_BITS> new_bh = ~fb_wrong;
     new_bh.fanout(hard<2>{}); // bh_changed compare + fb_bim_hyst write
     val<1> bh_changed = new_bh != val<FB_PRED_BITS>{fb_bh_read};
-    val<1> bh_gate = do_train & t_m1[NT] & mispredict & bh_changed;
+    val<1> bh_gate = do_train & t_m1[NT] & mispredict & bh_changed.fo1();
+    bh_gate.fanout(hard<11>{}); // ta_rwram-style gate
     execute_if(bh_gate, [&]() {
       fb_bim_hyst.write(val<FB_BH_IDX_BITS>{train_fb_idx}, new_bh);
     });
@@ -939,16 +944,16 @@ struct TageAheadHC_IR : predictor {
         return pre_read_pw[j] & pre_read_ad[j];
       };
       arr<val<1>, 4> dir0_arr = [&](u64 j) -> val<1> {
-        return pre_read_pw[j] & pre_read_ad[j] & per_group_wrong[j];
+        return pre_read_pw[j] & pre_read_ad[j] & per_group_wrong[j].fo1();
       };
       val<1> bank0_gate = gate0_arr.fo1().fold_or();
       val<1> bank0_dir = dir0_arr.fo1().fold_or();
 
       auto old_meta0 = val<META_WIDTH, i64>{meta_pipe[0][META_PIPE - 1]};
       old_meta0.fanout(hard<2>{});
-      auto new_meta0 = ta_update_ctr(old_meta0, bank0_dir);
+      auto new_meta0 = ta_update_ctr(old_meta0, bank0_dir.fo1());
       new_meta0.fanout(hard<2>{});
-      val<1> meta_gate0 = do_train & bank0_gate & (new_meta0 != old_meta0);
+      val<1> meta_gate0 = do_train & bank0_gate.fo1() & (new_meta0 != old_meta0);
       meta_gate0.fanout(hard<11>{});
       execute_if(meta_gate0, [&]() {
         meta_ctr0.write(val<META_IDX_BITS>{meta_idx_pipe[0][META_PIPE - 1].fo1()},
@@ -961,16 +966,16 @@ struct TageAheadHC_IR : predictor {
         return pre_read_pw[j + 4] & pre_read_ad[j + 4];
       };
       arr<val<1>, 3> dir1_arr = [&](u64 j) -> val<1> {
-        return pre_read_pw[j + 4] & pre_read_ad[j + 4] & per_group_wrong[j + 4];
+        return pre_read_pw[j + 4] & pre_read_ad[j + 4] & per_group_wrong[j + 4].fo1();
       };
       val<1> bank1_gate = gate1_arr.fo1().fold_or();
       val<1> bank1_dir = dir1_arr.fo1().fold_or();
 
       auto old_meta1 = val<META_WIDTH, i64>{meta_pipe[1][META_PIPE - 1]};
       old_meta1.fanout(hard<2>{});
-      auto new_meta1 = ta_update_ctr(old_meta1, bank1_dir);
+      auto new_meta1 = ta_update_ctr(old_meta1, bank1_dir.fo1());
       new_meta1.fanout(hard<2>{});
-      val<1> meta_gate1 = do_train & bank1_gate & (new_meta1 != old_meta1);
+      val<1> meta_gate1 = do_train & bank1_gate.fo1() & (new_meta1 != old_meta1);
       meta_gate1.fanout(hard<11>{});
       execute_if(meta_gate1, [&]() {
         meta_ctr1.write(val<META_IDX_BITS>{meta_idx_pipe[1][META_PIPE - 1].fo1()},
@@ -1041,9 +1046,9 @@ struct TageAheadHC_IR : predictor {
       gate_alloc.fanout(hard<2>{}); // tag_ram + sec_ram
       execute_if(gate_alloc, [&]() {
         val<GROUP_BITS> alloc_gid = val<GROUP_BITS>{u64(train_group)};
-        auto full_tag = concat(alloc_gid, val<PER_TABLE_HTAG[I]>{train_ctag[I].fo1()});
+        auto full_tag = concat(alloc_gid.fo1(), val<PER_TABLE_HTAG[I]>{train_ctag[I].fo1()});
         tag_ram_at<I>().write(val<IDX_BITS[I]>{train_idx[I]},
-                              val<TAG_WIDTH>{full_tag});
+                              val<TAG_WIDTH>{full_tag.fo1()});
         sec_ram_at<I>().write(val<IDX_BITS[I]>{train_idx[I]},
                               val<SEC_TAG_BITS>{train_sec_tag});
       });
@@ -1134,7 +1139,7 @@ struct TageAheadHC_IR : predictor {
 
     val<1> any_alloc = alloc_target != hard<0>{};
     auto new_acc = ta_update_ctr(val<ACC_WIDTH>{acc_ctr}, ~mispredict);
-    auto new_alloc = ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc);
+    auto new_alloc = ta_update_ctr(val<ALLOC_WIDTH>{alloc_ctr}, ~any_alloc.fo1());
     acc_ctr = new_acc.fo1();
     alloc_ctr = new_alloc.fo1();
 
@@ -1158,7 +1163,7 @@ struct TageAheadHC_IR : predictor {
     true_block.fanout(hard<NT * 2 + 2>{});
 
     // PATH mode: 6-bit path from next_pc[7:2]
-    auto hist_input = val<PATHBITS>{block_end_info.next_pc >> 2};
+    auto hist_input = val<PATHBITS>{block_end_info.next_pc.fo1() >> 2};
     // NT fold_idx + NT fold_tag compute_update + gh.update
     hist_input.fanout(hard<NT * 2 + 1>{});
     gh.template fanout_per_bit<GH_FANOUT>();
