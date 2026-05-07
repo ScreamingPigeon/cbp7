@@ -22,7 +22,7 @@ using namespace hcm;
 struct TageAheadHC_IR : predictor {
 
   // ======== Constants (hardcoded from S3_MW4_MC2048 + BPE1) ========
-  static constexpr u64 NT = 14;           // number of tables
+  static constexpr u64 NT = 15;           // number of tables
   static constexpr u64 N = 7;             // max conditional branches per block
   static constexpr u64 PATHBITS = 6;
   static constexpr u64 SEC_TAG_BITS = 5;
@@ -42,7 +42,7 @@ struct TageAheadHC_IR : predictor {
   static constexpr u64 META_IDX_BITS = 11; // clog2(2048)
   static constexpr u64 META_PIPE = 2;
   static constexpr u64 META_BANKS = 2;
-  static constexpr u64 MATCH_BITS = NT + 1; // = 15
+  static constexpr u64 MATCH_BITS = NT + 1; // = 16
   static constexpr u64 ALLOC_PC_BITS = TAG_WIDTH + 2; // = 13
   static constexpr u64 ACC_WIDTH = 10;
   static constexpr u64 ALLOC_WIDTH = 10;
@@ -63,28 +63,28 @@ struct TageAheadHC_IR : predictor {
   // GradedTag<11,7>: T0 (short hist) → 7, T13 (long hist) → 11
   // Formula: 7 + 4*i/13
   static constexpr std::array<u64, NT> PER_TABLE_TAG = {
-    7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11
+    7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11
   };
   static constexpr std::array<u64, NT> PER_TABLE_HTAG = {
-    4, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8
+    4, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8
   };
 
   // Per-table sizes: T0 bumped to 1024 (was GradedSize<512, 2048>)
   static constexpr std::array<u64, NT> TABLE_SIZE = {
     1024, 1024, 1024, 1024, 1024,
-    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048
+    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048
   };
   // Per-table history lengths: geometric_hist<14>(8, 200)
   static constexpr std::array<u64, NT> HIST_LEN =
       ta::geometric_hist<NT>(8, 200);
   // Per-table IDX bits
   static constexpr std::array<u64, NT> IDX_BITS = {
-    10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11
+    10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11
   };
   // Per-table hyst sizes (shared hyst: TABLE_SIZE/2)
   static constexpr std::array<u64, NT> HYST_SIZE = {
     512, 512, 512, 512, 512,
-    1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024
+    1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024
   };
 
   // Per-bit GH fanout (USE_GSHARE=false, so no fb_fold contribution)
@@ -198,6 +198,16 @@ struct TageAheadHC_IR : predictor {
   ta_rwram<PRED_BITS, 1024, 8, 1> pred_ram4{"t4_pred"};
   ta_rwram<HYST_WIDTH, 512, 8, 1> hyst_ram4{"t4_hyst"};
   ta_rwram<U_WIDTH, 1024, 8, 1> u_ram4{"t4_u"};
+
+  // ---- Table 14 (2048 entries, IDX=11) — placed here to fill gap ----
+  hcm::ram<val<TAG_WIDTH>, 2048> tag_ram14{"t14_tag"};
+  ta_folded_gh<11> fold_idx14;
+  ta_folded_gh<TAG_WIDTH> fold_tag14;
+  hcm::ram<val<SEC_TAG_BITS>, 2048> sec_ram14{"t14_sec"};
+  hcm::zone zone14;
+  ta_rwram<PRED_BITS, 2048, 8, 1> pred_ram14{"t14_pred"};
+  ta_rwram<HYST_WIDTH, 1024, 8, 1> hyst_ram14{"t14_hyst"};
+  ta_rwram<U_WIDTH, 2048, 8, 1> u_ram14{"t14_u"};
 
   // ---- Table 5 (2048 entries, IDX=11) ----
   hcm::ram<val<TAG_WIDTH>, 2048> tag_ram5{"t5_tag"};
@@ -345,7 +355,8 @@ struct TageAheadHC_IR : predictor {
     else if constexpr (I == 10) return name##10;                               \
     else if constexpr (I == 11) return name##11;                               \
     else if constexpr (I == 12) return name##12;                               \
-    else return name##13;                                                      \
+    else if constexpr (I == 13) return name##13;                               \
+    else return name##14;                                                      \
   }
   HC_DISPATCH(tag_ram)
   HC_DISPATCH(pred_ram)
@@ -358,7 +369,7 @@ struct TageAheadHC_IR : predictor {
 
   // Per-table HYST_IDX_BITS
   static constexpr std::array<u64, NT> HYST_IDX_BITS = {
-    9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10
+    9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
   };
 
   // ======== Helpers ========
@@ -389,7 +400,7 @@ struct TageAheadHC_IR : predictor {
     }
     {
       auto meta_idx = val<META_IDX_BITS>{inst_pc >> 2};
-      meta_idx.fanout(hard<1 + META_BANKS>{}); // meta_idx_pipe[0] + K reads
+      meta_idx.fanout(hard<2 + META_BANKS>{}); // 2 RAM reads + 2 idx_pipe writes
       meta_pipe[0][0] = meta_ctr0.read(meta_idx);
       meta_pipe[1][0] = meta_ctr1.read(meta_idx);
       meta_idx_pipe[0][0] = meta_idx;
@@ -413,6 +424,17 @@ struct TageAheadHC_IR : predictor {
     //
     // sec_tag_now also serves as train_sec_hit (same comparison).
     // ================================================================
+
+    // Fanout for prefetch_* registers: resolution reads + shift fo1()
+    for (u64 i = 0; i < NT; i++) {
+      prefetch_sec[i].fanout(hard<2>{});       // sec_matches + shift
+      prefetch_tag_hit[i].fanout(hard<2>{});   // htag_sec + shift
+      prefetch_hyst[i].fanout(hard<2>{});      // weak_mask + shift
+      prefetch_u[i].fanout(hard<2>{});         // weak_mask + shift
+      prefetch_group_id[i].fanout(hard<1 + NUM_GROUPS>{}); // shift + 7 group== checks
+      prefetch_pred[i].fanout(hard<1 + NUM_GROUPS>{});     // shift + 7 resolve chains
+    }
+    prefetch_fb.fanout(hard<2>{});  // fb_bits make_array + shift
 
     auto sec_tag_now = ta::Xor3SecTagHash5::apply<SEC_TAG_BITS>(inst_pc);
     // Fanout: NT sec_match + NT train_sec_hit + train_sec_tag write
@@ -446,7 +468,7 @@ struct TageAheadHC_IR : predictor {
 
     // meta_use_alt: each bank serves its groups
     // Bank 0: groups 0-3 (4 reads), Bank 1: groups 4-6 (3 reads)
-    meta_use_alt.fanout(hard<4>{});
+    meta_use_alt.fanout(hard<4>{}); // max 4 reads per bank (groups 0-3 for bank 0)
 
     // ---- resolve_chain lambda (1-bit version) ----
     auto resolve_chain = [&](arr<val<1>, NT> fh, val<PRED_BITS> fb_g,
@@ -463,12 +485,13 @@ struct TageAheadHC_IR : predictor {
       val<MATCH_BITS> match2 = remainder.fo1().one_hot();
 
       // 1-bit table predictions + 1-bit fb
+      fb_g.fanout(hard<2>{}); // min fanout; read once (when i==NT)
       arr<val<PRED_BITS>, NT + 1> table_preds = [&](u64 i) -> val<PRED_BITS> {
         if (i < NT)
           return val<PRED_BITS>{prefetch_pred[i]};
-        return fb_g;
+        return val<PRED_BITS>{fb_g};
       };
-      table_preds.fanout(hard<2>{});
+      for (u64 i = 0; i < NT + 1; i++) table_preds[i].fanout(hard<2>{});
 
       arr<val<1>, NT + 1> m1_bits = match1.make_array(val<1>{});
       match2.fanout(hard<2>{});
@@ -510,14 +533,14 @@ struct TageAheadHC_IR : predictor {
       arr<val<1>, NT> group_hits = [&](u64 i) -> val<1> {
         val<1> group_ok =
             val<GROUP_BITS>{prefetch_group_id[i]} == hard<G>{};
-        return htag_sec[i] & group_ok;
+        return htag_sec[i] & group_ok.fo1();
       };
 
       // Per-group fb bit (precomputed from make_array split)
       val<PRED_BITS> fb_g = fb_bits[G].fo1();
 
       auto [m1, m2, pp, ap, pw, ad, ua] =
-          resolve_chain(group_hits.fo1(), fb_g, GROUP_TO_META_BANK[G]);
+          resolve_chain(group_hits.fo1(), fb_g.fo1(), GROUP_TO_META_BANK[G]);
 
       // pp is read twice: select + train save
       pp.fanout(hard<2>{});
@@ -880,6 +903,7 @@ struct TageAheadHC_IR : predictor {
     val<FB_PRED_BITS> fb_bh_weak = ~val<FB_PRED_BITS>{fb_bh_read};
     val<FB_PRED_BITS> fb_flip = fb_wrong & fb_bh_weak;
     val<FB_PRED_BITS> fb_write_data = val<FB_PRED_BITS>{train_fb} ^ fb_flip;
+    fb_write_data.fanout(hard<2>{}); // fb_changed compare + fb_ctr write
 
     val<1> fb_changed = fb_write_data != val<FB_PRED_BITS>{train_fb};
     val<1> fb_gate = do_train & t_m1[NT] & mispredict & fb_changed.fo1();
@@ -890,6 +914,7 @@ struct TageAheadHC_IR : predictor {
 
     // Bimodal hysteresis update: correct→strong(1), wrong→weak(0)
     val<FB_PRED_BITS> new_bh = ~fb_wrong;
+    new_bh.fanout(hard<2>{}); // bh_changed compare + fb_bim_hyst write
     val<1> bh_changed = new_bh != val<FB_PRED_BITS>{fb_bh_read};
     val<1> bh_gate = do_train & t_m1[NT] & mispredict & bh_changed;
     execute_if(bh_gate, [&]() {
@@ -1031,7 +1056,7 @@ struct TageAheadHC_IR : predictor {
 
       val<U_WIDTH> old_u = val<U_WIDTH>{train_u[I]};
       // u_inc(2) + u_dec(2) + decay_select(2) + merged_select(1) + merged_changed(1)
-      old_u.fanout(hard<8>{});
+      old_u.fanout(hard<10>{});
       // Saturating increment: clamp at maxval
       auto u_inc =
           val<U_WIDTH>{old_u + val<U_WIDTH>{old_u != hard<old_u.maxval>{}}};
@@ -1081,7 +1106,7 @@ struct TageAheadHC_IR : predictor {
           select(base_u_write, base_newu,
                  select(decay_fire, decayed_u.fo1(), old_u));
       val<1> merged_write = base_u_write | decay_fire;
-      merged.fanout(hard<3>{}); // merged_changed + gate check + write
+      merged.fanout(hard<2>{}); // merged_changed + write
       val<1> merged_changed = merged != old_u;
 
       // Silent update elimination: only write when value actually changes

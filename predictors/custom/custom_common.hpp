@@ -912,8 +912,8 @@ template <u64 N, u64 M, u64 B, u64 BANK_SHIFT = 0> struct ta_rwram {
       val<BANK_SHIFT> lo = addr;
       val<BANK_BITS> bankid = addr >> BANK_SHIFT;
       val<A - BANK_SHIFT - BANK_BITS> hi = addr >> (BANK_SHIFT + BANK_BITS);
-      val<L> localaddr = concat(lo, hi);
-      return std::pair{localaddr, bankid};
+      val<L> localaddr = concat(lo.fo1(), hi.fo1());
+      return std::pair{localaddr.fo1(), bankid.fo1()};
     }
   }
 
