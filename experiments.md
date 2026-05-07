@@ -783,3 +783,272 @@ VFS stays under 1 cycle (0.913 with FLOORPLAN). fb_bim_hyst RAM placed after
 meta to avoid displacing critical-path structures.
 
 Full eval (168 traces, 4 cores) launched to `full_out/hc_ir_fbh/`.
+
+## Experiment: Fanout Optimization on TageAheadHC_IR (2026-05-06)
+
+Applied fanout fixes (fo1/fanout(hard<N>) on critical path). Full 168-trace eval.
+
+### Full-eval results
+
+| Config | VFS | MPKI | EPI (fJ) | IPC_cbp | Max P2 (ns) |
+|--------|-----|------|----------|---------|-------------|
+| HC_IR FBH | 0.897064 | 8.964 | 2837 | 9.009 | 0.913 |
+| HC_IR fo_fix | 0.897028 | 8.964 | 2837 | 9.009 | 0.993 |
+| Delta | -0.004% | 0.0% | 0.0% | 0.0% | +8.8% |
+
+Fanout fixes increased P2 from 0.913→0.993ns (still under 1 cycle). VFS unchanged
+because P2 is capped at ceil(1) = 1 cycle in both cases. MPKI and EPI identical.
+
+### VFS analysis: high-IPC traces penalized
+
+VFS formula has `(IPC/IPC*)^3.2` energy term. With reference IPC*=8, traces with
+IPC >> 8 get exponentially penalized. 7 traces with IPC > 20 score VFS < 0.65:
+
+| Trace | IPC | MPKI | VFS |
+|-------|-----|------|-----|
+| roms | 58.0 | 0.191 | 0.009 |
+| fp_28 | 60.8 | 1.467 | 0.028 |
+| fp_21 | 23.0 | 0.677 | 0.178 |
+| roms-1 | 25.5 | 1.506 | 0.195 |
+| int_197 | 22.7 | 1.261 | 0.232 |
+| diamond | 21.0 | 2.067 | 0.355 |
+| namd | 20.1 | 4.905 | 0.634 |
+
+These traces have excellent accuracy but terrible VFS because the predictor is "too fast."
+
+## Experiment: IPC Capping via need_extra_cycle (2026-05-07)
+
+### Why IPC throttling matters (from vfs.pdf, Michaud 2025)
+
+The VFS formula models a **fixed core power budget** (Section 5.3). The core C
+being evaluated has power `P = EPI × IPC × f₀` at reference voltage. If P > P*
+(reference power), voltage and frequency are **scaled down** to meet the budget.
+If P < P*, they are **scaled up**. The VFS captures this frequency adjustment:
+
+```
+VFS = (IPC/IPC*) × α × (1 - 2/(1 + sqrt(1 + β × (EPI*/EPI) × (IPC*/IPC))))
+```
+
+The key insight is **how core energy scales with IPC** (Eq. 12, Section 5.4):
+
+```
+EPI/EPI* = (IPC/IPC*)^γ     where γ = 3.2
+```
+
+This models that higher IPC requires a more complex core consuming more energy
+(qualitatively similar to Pollack's rule but with a larger exponent). The
+normalized EPI (Eq. 16) combines CBP energy and core energy:
+
+```
+EPI/EPI* = [λ × (IPC/IPC*)^γ + μ × EPIcbp/EPIcbp*] × (1 + WPI/2)
+```
+
+where `λ ≈ 0.826` (core fraction) and `μ = 0.05` (CBP fraction). The core
+energy term `λ × (IPC/IPC*)^γ` dominates. For IPC=65 (roms): `(65/8)^3.2 ≈ 23000`,
+making EPI/EPI* ≈ 19000. This enormous normalized energy forces the VFS
+voltage-frequency scaling to **massively reduce frequency**, collapsing VFS
+despite the raw IPC speedup.
+
+The VFS-optimal curve (Section 5.4) shows that `P/P* = (IPC/IPC*)^(γ+1)`.
+Cores above this curve consume too much power for their IPC — the frequency
+reduction eats the speedup. **A predictor with IPC >> IPC* lands far above
+the VFS-optimal curve.** Throttling IPC back toward IPC*=8 moves the
+operating point onto the curve where VFS is maximized.
+
+From Section 4: "Do not apply the VFS formula on a single trace." The FoM
+are averaged (IPC_cbp harmonic, CPI_cbp/EPI_cbp arithmetic) then VFS computed
+once. But `need_extra_cycle()` operates per-trace during simulation, so the
+throttling must be conservative — false positives on moderate-IPC traces
+hurt the aggregate.
+
+**Goal**: Artificially cap IPC to 8 (= reference predictor) on high-IPC, low-MPKI
+windows by injecting extra cycles via `need_extra_cycle()`. This moves
+high-IPC traces toward the VFS-optimal operating point.
+
+### Mechanism (HARCOM implementation)
+
+- Track per-window (2^WIN_BITS blocks): instruction count, block count, mispredictions
+- At window boundary: if `MPKI < 1000/2^MPKI_SHIFT` AND `IPC > 2^IPC_CAP_SHIFT`,
+  compute debt = `instr >> IPC_CAP_SHIFT - window_blocks`
+- Each block: drain up to MAX_INJECT extra cycles from debt via `need_extra_cycle()`
+- Only inject on non-mispredicting blocks (`& ~mispredict`)
+- `need_extra_cycle()` timing is IGNORED — no P1/P2 impact
+
+Parameters (sweepable via -DCAP_WIN_BITS, -DCAP_MPKI_SHIFT, -DCAP_MAX_INJ):
+- IPC_CAP_SHIFT: IPC cap = 2^N (default 3 → cap=8)
+- WIN_BITS: window = 2^N blocks
+- MPKI_SHIFT: MPKI threshold = 1000/2^N
+- MAX_INJECT: max extra cycles per block (should be ≥ 31 for full drain)
+
+### Theoretical analysis (full 168-trace simulation)
+
+| Cap strategy | Arith VFS | Geo VFS | Harm VFS | Worst Δ |
+|---|---|---|---|---|
+| No cap | 0.790 | 0.738 | 0.448 | — |
+| MPKI<4, cap=8 | 0.831 | 0.813 | 0.792 | +0.000 |
+| IPC>14, cap=8 | 0.829 | 0.812 | 0.791 | +0.000 |
+| IPC>10, cap=8 | 0.831 | 0.814 | 0.793 | -0.057 |
+
+MPKI gating critical: without it, traces with high IPC + high MPKI (nest-1, gmsh-5)
+regress because reducing IPC hurts when CPI is already high.
+
+### Quick-eval sweep: WIN=128, varying MPKI threshold (MAX_INJ=32)
+
+CSV column format (from predictor_metrics.py):
+`name,instr,branch,condbr,pred_cycles,extra_cycles,diverge,diverge_at_end,misp,p1,p2,epi`
+
+VFS computed using exact vfs.py formula (speedup includes WPI correction,
+normalizedEPI uses `LAMBDA * speedup^GAMMA`, not `(IPC/IPC*)^3.2` directly).
+
+16/20 quick-eval traces overlap with full_out baseline. Per-trace vs fo_fix baseline:
+
+| Trace | B_IPC | MPKI | B_VFS | w128_m4 VFS | w128_m2 VFS | w128_m1 VFS |
+|-------|-------|------|-------|-------------|-------------|-------------|
+| 502-gcc-all | 6.6 | 14.6 | 0.704 | 0.697 (-0.007) | 0.700 (-0.005) | 0.701 (-0.003) |
+| 505-mcf | 12.8 | 17.2 | 0.793 | 0.791 (-0.002) | 0.791 (-0.002) | 0.791 (-0.002) |
+| **508-namd** | 23.0 | 4.9 | 0.545 | **0.968 (+0.423)** | **0.931 (+0.386)** | **0.870 (+0.324)** |
+| 531-deepsjeng | 12.3 | 11.8 | 0.881 | 0.880 (-0.001) | 0.881 (-0.001) | 0.881 (-0.000) |
+| **548-exchange2** | 13.6 | 4.9 | 0.860 | **0.963 (+0.103)** | **0.935 (+0.075)** | **0.907 (+0.047)** |
+| **554-roms** | 65.2 | 0.2 | 0.006 | **0.999 (+0.993)** | **0.999 (+0.992)** | **0.975 (+0.969)** |
+| **dcapo-kafka** | 11.2 | 4.3 | 0.927 | **0.968 (+0.042)** | **0.970 (+0.043)** | **0.972 (+0.045)** |
+| gap-sssp | 10.0 | 31.6 | 0.548 | 0.548 (-0.001) | 0.548 (-0.001) | 0.544 (-0.004) |
+| gcc-1 | 6.9 | 10.9 | 0.787 | 0.779 (-0.009) | 0.781 (-0.006) | 0.783 (-0.005) |
+| **java16** | 11.5 | 4.0 | 0.910 | **0.977 (+0.067)** | **0.968 (+0.058)** | **0.956 (+0.046)** |
+| llvm-2 | 7.5 | 8.7 | 0.858 | 0.851 (-0.008) | 0.854 (-0.005) | 0.855 (-0.004) |
+| nodejs-http2 | 7.8 | 7.2 | 0.904 | 0.881 (-0.023) | 0.883 (-0.021) | 0.886 (-0.019) |
+| nodejs-octane | 7.7 | 6.0 | 0.921 | 0.884 (-0.037) | 0.886 (-0.034) | 0.888 (-0.033) |
+| rsbench | 6.2 | 40.7 | 0.407 | 0.407 (-0.000) | 0.407 (-0.000) | 0.406 (-0.001) |
+| **sampleflow** | 10.5 | 3.3 | 0.932 | **0.980 (+0.048)** | **0.980 (+0.048)** | **0.980 (+0.048)** |
+| **zstd** | 18.2 | 7.5 | 0.814 | **0.942 (+0.128)** | **0.940 (+0.126)** | **0.938 (+0.124)** |
+
+| Aggregate (16 traces) | Baseline | w128_m4 | w128_m2 | w128_m1 |
+|---|---|---|---|---|
+| Arith VFS | 0.737 | 0.845 (+0.107) | 0.841 (+0.103) | 0.833 (+0.096) |
+| Geo VFS | 0.568 | 0.824 (+0.256) | 0.821 (+0.253) | 0.814 (+0.246) |
+| Improved (>0.001) | — | 7 | 7 | 7 |
+| Regressed (>0.001) | — | 7 | 6 | 7 |
+
+**IMPORTANT: Per-trace VFS is WRONG.** vfs.pdf Section 4: "Do not apply the VFS
+formula on a single trace." The correct procedure: average IPC_cbp (harmonic),
+CPI_cbp (arithmetic), EPI_cbp (arithmetic) across all traces, then compute VFS
+once on the aggregate FoM. The per-trace VFS numbers above are illustrative only.
+
+### Aggregate VFS (official predictor_metrics.py + vfs.py, same 20 traces)
+
+| Config | IPC_cbp | CPI_cbp | EPI_cbp | VFS | dVFS |
+|--------|---------|---------|---------|-----|------|
+| Baseline (20 traces) | 9.738 | 0.0872 | 2600 | **0.896** | — |
+| w128_m4 (MPKI<3.9) | 8.021 | 0.0872 | 2629 | 0.866 | **-0.030** |
+| w128_m2 (MPKI<1.95) | 8.190 | 0.0872 | 2629 | 0.870 | **-0.026** |
+| w128_m1 (MPKI<0.98) | 8.336 | 0.0872 | 2629 | 0.873 | **-0.022** |
+| w256_m4 (MPKI<3.9) | 8.086 | 0.0872 | 2632 | 0.867 | **-0.028** |
+
+**IPC capping HURTS aggregate VFS.** All configs are worse than baseline.
+
+Root causes:
+1. **Harmonic mean IPC**: roms dropping from IPC=65→8 barely moves the harmonic
+   mean (1/65=0.015 → 1/8=0.125 is small vs 20 traces). But false-positive
+   capping on IPC<8 traces (lua 7.4→6.8, nodejs-octane 7.7→6.6) significantly
+   increases their 1/IPC contribution, dragging the harmonic mean down.
+2. **False positives on low-IPC traces**: traces with IPC 5-8 have per-window
+   MPKI dipping below threshold on some windows, triggering capping that
+   shouldn't fire. These traces dominate the harmonic mean.
+3. **CPI unchanged**: capping doesn't reduce mispredictions, so CPI stays at
+   0.0872. The IPC drop is pure loss — no compensating CPI benefit.
+4. **VFS formula's WPI correction**: speedup = (IPC_cbp/IPC*) × (1+WPI*)/(1+WPI).
+   Since CPI is unchanged, WPI = IPC_cbp × CPI_cbp drops with IPC_cbp, which
+   helps the (1+WPI*)/(1+WPI) factor. But not enough to offset the IPC loss.
+
+**Verdict**: IPC capping via `need_extra_cycle()` is **counterproductive** for VFS.
+The aggregate harmonic mean IPC is dominated by low-IPC traces, not the few
+high-IPC outliers. Capping high-IPC traces provides negligible harmonic mean
+benefit while false positives on moderate traces cause real harm. The energy
+model's `(IPC/IPC*)^γ` penalty is already handled by the VFS formula's
+voltage-frequency scaling — manually throttling IPC double-counts the adjustment.
+
+### Full sweep results (2026-05-07, all 8 configs complete)
+
+All configs evaluated on 20 quick-eval traces. VFS computed using official
+`predictor_metrics.py` + `vfs.py` on matching 20-trace baseline subset.
+
+| Config | Window | MPKI < | IPC_cbp | VFS | dVFS |
+|--------|--------|--------|---------|-----|------|
+| **Baseline** | — | — | 9.738 | **0.896** | — |
+| w512_m1 | 512 | 0.98 | 8.457 | 0.877 | -0.019 |
+| w512_m2 | 512 | 1.95 | 8.336 | 0.874 | -0.022 |
+| w128_m1 | 128 | 0.98 | 8.336 | 0.873 | -0.022 |
+| w256_m2 | 256 | 1.95 | 8.275 | 0.872 | -0.024 |
+| w256_m1 | 256 | 0.98 | — | 0.870 | -0.025 |
+| w128_m2 | 128 | 1.95 | 8.190 | 0.870 | -0.026 |
+| w256_m4 | 256 | 3.9 | 8.086 | 0.867 | -0.028 |
+| w128_m4 | 128 | 3.9 | 8.021 | 0.866 | -0.030 |
+
+**Every config hurts VFS.** Best (w512_m1) still -0.019 below baseline.
+
+### Why IPC capping can never help (harmonic mean analysis)
+
+Full 168-trace IPC distribution from `full_out/hc_ir_fo_fix`:
+
+| IPC range | Traces | sum(1/IPC) | % of harmonic sum |
+|-----------|--------|------------|-------------------|
+| 50+ | 2 | 0.031 | 0.2% |
+| 20-50 | 6 | 0.238 | 1.3% |
+| 12-20 | 28 | 2.021 | 10.8% |
+| 10-12 | 22 | 1.996 | 10.7% |
+| 8-10 | 52 | 5.876 | 31.5% |
+| <8 | 58 | 8.488 | **45.5%** |
+
+VFS uses **harmonic mean IPC** (vfs.pdf §4, predictor_metrics.py). The harmonic
+mean = N / sum(1/IPC_i). High-IPC outliers (roms IPC=65, fp_28 IPC=66)
+contribute 1/65 ≈ 0.015 each — **invisible** to the harmonic sum (0.2% combined).
+
+Even with **perfect capping** (zero false positives, cap all IPC>8 to exactly 8):
+- Harmonic mean IPC: 9.009 → **7.555** (−16%)
+- The 52 traces with IPC 8-12 each go from 1/10≈0.10 to 1/8=0.125
+- This adds far more to the harmonic denominator than the high-IPC traces save
+
+110 traces have IPC > 8 but only contribute 54.5% of the harmonic sum. Capping
+them all to 8 increases their contribution, dragging the harmonic mean **below** 8.
+Meanwhile the 58 traces with IPC < 8 (45.5% of the sum) are untouched.
+
+**Conclusion**: IPC throttling is fundamentally incompatible with harmonic-mean-
+based VFS scoring. The approach is a dead end — no parameter tuning can fix it.
+The correct path to VFS improvement is reducing MPKI/CPI and EPI, not throttling IPC.
+
+### Per-trace FoM changes (20 quick-eval traces)
+
+CPI is unchanged across all configs (same mispredictions, same P2 latency).
+Showing best config (w512_m1) and most aggressive (w128_m4) vs baseline.
+
+| Trace | B_IPC | B_CPI | B_EPI | m1_IPC | dIPC% | m1_EPI | dEPI | m4_IPC | dIPC% | m4_EPI | dEPI |
+|-------|-------|-------|-------|--------|-------|--------|------|--------|-------|--------|------|
+| 502-gcc-all | 6.6 | 0.132 | 3829 | 6.6 | -0.3% | 3881 | +52 | 6.5 | -2.7% | 3874 | +45 |
+| 505-mcf | 12.8 | 0.154 | 1783 | 12.6 | -1.4% | 1811 | +28 | 12.6 | -1.8% | 1807 | +24 |
+| 508-namd | 23.0 | 0.044 | 1099 | 18.5 | -19.8% | 1115 | +16 | 10.3 | -55.4% | 1113 | +14 |
+| 531-deepsjeng | 12.3 | 0.107 | 1960 | 12.3 | -0.0% | 1986 | +26 | 11.9 | -3.2% | 1982 | +22 |
+| 548-exchange2 | 13.6 | 0.044 | 1976 | 13.1 | -3.7% | 2007 | +31 | 10.0 | -26.9% | 2003 | +27 |
+| **554-roms** | **65.2** | 0.002 | 433 | **8.4** | **-87.1%** | 439 | +6 | **8.1** | **-87.6%** | 438 | +5 |
+| dcapo-kafka | 11.2 | 0.039 | 2337 | 8.2 | -26.1% | 2364 | +27 | 7.7 | -31.3% | 2361 | +24 |
+| gap-sssp | 10.0 | 0.285 | 2024 | 9.7 | -2.4% | 2054 | +30 | 9.9 | -0.1% | 2050 | +26 |
+| gcc-1 | 6.9 | 0.099 | 3713 | 6.9 | -0.7% | 3760 | +47 | 6.7 | -3.0% | 3753 | +40 |
+| java16 | 11.5 | 0.036 | 2311 | 10.5 | -9.2% | 2342 | +31 | 8.7 | -24.5% | 2338 | +27 |
+| llvm-2 | 7.5 | 0.078 | 3475 | 7.4 | -0.5% | 3519 | +44 | 7.2 | -2.9% | 3513 | +38 |
+| lua-3 | 7.4 | 0.019 | 3586 | 6.9 | -7.0% | 3624 | +38 | 6.8 | -7.4% | 3618 | +32 |
+| nodejs-http2 | 7.8 | 0.064 | 3292 | 7.3 | -7.2% | 3329 | +37 | 7.1 | -9.5% | 3324 | +32 |
+| nodejs-octane | 7.7 | 0.054 | 3426 | 6.7 | -12.0% | 3468 | +42 | 6.6 | -14.0% | 3462 | +36 |
+| python3-dulwich | 8.4 | 0.033 | 3146 | 7.6 | -9.9% | 3182 | +36 | 7.3 | -13.4% | 3177 | +31 |
+| rsbench | 6.2 | 0.366 | 3497 | 6.2 | -0.2% | 3549 | +52 | 6.2 | +0.0% | 3541 | +44 |
+| sampleflow | 10.5 | 0.030 | 2639 | 8.2 | -22.0% | 2681 | +42 | 7.8 | -25.0% | 2676 | +37 |
+| web_130 | 8.7 | 0.044 | 3045 | 8.0 | -8.1% | 3083 | +38 | 7.5 | -13.0% | 3078 | +33 |
+| web_74 | 8.6 | 0.046 | 3057 | 7.4 | -14.3% | 3095 | +38 | 7.3 | -14.9% | 3089 | +32 |
+| zstd | 18.2 | 0.068 | 1369 | 12.4 | -31.8% | 1390 | +21 | 11.5 | -36.5% | 1387 | +18 |
+
+Key observations:
+- CPI identical across all configs (capping doesn't affect mispredictions)
+- EPI increases slightly (+5 to +52 fJ) due to `need_extra_cycle()` calling
+  `panel.next_cycle()` which adds dynamic energy
+- False positives: lua (IPC 7.4, already <8) gets capped to 6.9/6.8;
+  nodejs-octane (IPC 7.7) capped to 6.7/6.6 — these should never be touched
+- Even traces with IPC ~8-10 (web_74, web_130, python3) get 7-14% IPC cuts
+
+Results in `out/ipc_cap_sweep/{config}/`. Baseline in `full_out/hc_ir_fo_fix/`.
