@@ -1,0 +1,14 @@
+g++ -std=c++20 -O3  -Wall -Wextra -pedantic -Wno-deprecated-declarations -Wno-mismatched-tags -DTAGE_MONITOR -DCHEATING_MODE -DFREE_FANOUT -Itrace_files -o build/cbp-monitor-eval cbp.cpp -lz -DPREDICTOR='S9_GT_U8 S9_GT_U9 S9_GT_U10 S9_GT_U11 S9_GT_GT10_6 S9_GT_GT11_7 S9_GT_GT12_8 S9_GT_GT13_9 S9_GT_GT14_8 S9_BPE1_U8 S9_BPE1_U9 S9_BPE1_U10 S9_BPE1_U11 S9_BPE1_GT10_6 S9_BPE1_GT11_7 S9_BPE1_GT12_8 S9_BPE1_GT13_9 S9_BPE1_GT14_8'
+<command-line>: error: two or more data types in declaration of ‘type name’
+branch_predictor.hpp:676:26: note: in expansion of macro ‘PREDICTOR’
+  676 | using branch_predictor = PREDICTOR;
+      |                          ^~~~~~~~~
+cbp.cpp:6:1: error: ‘branch_predictor’ does not name a type
+    6 | branch_predictor pred;
+      | ^~~~~~~~~~~~~~~~
+cbp.cpp: In function ‘int main(int, char**)’:
+cbp.cpp:57:13: error: ‘pred’ was not declared in this scope; did you mean ‘pread’?
+   57 |     sim.run(pred, warmup_instructions, measurement_instructions);
+      |             ^~~~
+      |             pread
+make: *** [Makefile:197: build/cbp-monitor-eval] Error 1

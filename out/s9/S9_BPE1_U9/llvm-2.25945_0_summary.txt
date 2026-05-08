@@ -1,0 +1,658 @@
+=== TageAhead Monitor Summary ===
+Instructions: 11002890  Branches: 1931812  Mispredictions: 150153 (7.77%)  MPKI: 13.647
+Blocks: 1236154  Extra cycles: 150153 (12.15%)
+True blocks: 1161571 (93.97%)
+Train skips (first cycle): 0
+
+Pipeline Calls:
+  predict1: 1663538  reuse: 11360834  (reuse: 87.23%)
+  predict2: 1663538  reuse: 11360834
+  Avg instr/block (from P1): 7.83
+
+Block Structure:
+  Avg instr/block: 8.9
+  Avg branches/block: 1.6
+  Instr/block histogram: 1:58540 2:104297 3:175807 4:101551 5:83345 6:62458 7:46999 8:109668 9:46006 10:41756 11:59987 12:49624 13:50645 14:42044 15:30201 16:21027 
+  Branches/block histogram: 1:819231 2:259842 3:86331 4:42277 5:13866 6:6783 7:7824 
+  Entry point top-5: 0:1236154 
+  Exit point top-5: 3:175807 8:109668 2:104297 4:101551 5:83345 
+
+Provider Distribution:
+  Table     | Provided  |  Correct  | Accuracy | TagMatch% | SecMatch% | FullMatch%
+  ----------+-----------+-----------+----------+-----------+-----------+-----------
+  Bimodal   |         0 |         0 |    0.0% |      -- |      -- |      --
+  T0       |   1931812 |   1141633 |   59.1% |     0.5% |     3.2% |     0.1%
+  T1       |         0 |         0 |    0.0% |     0.6% |     3.4% |     0.3%
+  T2       |         0 |         0 |    0.0% |     0.9% |     3.7% |     0.5%
+  T3       |         0 |         0 |    0.0% |     1.2% |     4.3% |     0.8%
+  T4       |         0 |         0 |    0.0% |     1.7% |     4.5% |     1.1%
+  T5       |         0 |         0 |    0.0% |     3.2% |     5.6% |     2.4%
+  T6       |         0 |         0 |    0.0% |     4.3% |     6.1% |     3.2%
+  T7       |         0 |         0 |    0.0% |     5.9% |     7.5% |     4.5%
+  T8       |         0 |         0 |    0.0% |     8.6% |     9.2% |     6.4%
+  T9       |         0 |         0 |    0.0% |    10.4% |    10.3% |     7.4%
+  T10      |         0 |         0 |    0.0% |    14.7% |    13.3% |    10.1%
+  T11      |         0 |         0 |    0.0% |    17.1% |    13.8% |    11.0%
+  T12      |         0 |         0 |    0.0% |    15.2% |    13.7% |    10.8%
+  T13      |         0 |         0 |    0.0% |    12.8% |    11.1% |     8.7%
+
+TAGE-only (1931812 branches, 100.0% of all):
+  Table  | Prov%  | Alt%   | ProvAcc
+  -------+--------+--------+--------
+  T0     | 100.0% | 100.0% |  59.1%
+  T1     |   0.0% |   0.0% |   0.0%
+  T2     |   0.0% |   0.0% |   0.0%
+  T3     |   0.0% |   0.0% |   0.0%
+  T4     |   0.0% |   0.0% |   0.0%
+  T5     |   0.0% |   0.0% |   0.0%
+  T6     |   0.0% |   0.0% |   0.0%
+  T7     |   0.0% |   0.0% |   0.0%
+  T8     |   0.0% |   0.0% |   0.0%
+  T9     |   0.0% |   0.0% |   0.0%
+  T10    |   0.0% |   0.0% |   0.0%
+  T11    |   0.0% |   0.0% |   0.0%
+  T12    |   0.0% |   0.0% |   0.0%
+  T13    |   0.0% |   0.0% |   0.0%
+  Overall TAGE accuracy: 59.1%
+
+Meta Override:
+  Total: 0  Correct: 0 (0.0%)
+  Chose alt:     0  Correct: 0 (0.0%)
+  Chose primary: 0  Correct: 0 (0.0%)
+
+Provider Source Breakdown:
+  No tag match (FB only):    1931812 (100.0%)  acc=59.1%
+  Sec-tag rejected (FB):     0 (0.0%)  acc=0.0%
+  TAGE provider, meta→alt:   0 (0.0%)  acc=0.0%
+  TAGE provider, meta→pri:   0 (0.0%)  acc=0.0%
+  TAGE provider, no meta:    0 (0.0%)  acc=0.0%
+
+Allocation:
+  Attempts: 1236154  Success: 148601 (12.0%)  Fail: 1087553  Blocked: 436  Sibling skips: 87740
+  Per table: T0=1265 T1=2320 T2=3203 T3=5585 T4=6751 T5=8291 T6=10401 T7=11468 T8=13094 T9=14451 T10=16638 T11=20485 T12=33567 T13=1082
+  Sibling per table: T0=672 T1=820 T2=1065 T3=1496 T4=1835 T5=3349 T6=4467 T7=6127 T8=8186 T9=10369 T10=13274 T11=15706 T12=12410 T13=7964
+  Unique branch PCs: 5342
+
+Allocation Cascade (provider -> target):
+  Provider  | Allocs  |     T0     T1     T2     T3     T4     T5     T6     T7     T8     T9    T10    T11    T12    T13
+  ----------+---------+--------------------------------------------------------------------------------------------------
+  T1       |       4 |      4      0      0      0      0      0      0      0      0      0      0      0      0      0
+  T2       |    1043 |   1037      6      0      0      0      0      0      0      0      0      0      0      0      0
+  T3       |    2077 |    164   1895     18      0      0      0      0      0      0      0      0      0      0      0
+  T4       |    2697 |     34    306   2346     11      0      0      0      0      0      0      0      0      0      0
+  T5       |    4823 |      4     57    581   4152     29      0      0      0      0      0      0      0      0      0
+  T6       |    5325 |      4     26    128    827   4314     26      0      0      0      0      0      0      0      0
+  T7       |    6258 |      4     10     44    287   1304   4575     34      0      0      0      0      0      0      0
+  T8       |    7697 |      5      2     29    117    435   1852   5216     41      0      0      0      0      0      0
+  T9       |    7827 |      1      2     14     68    254    737   2142   4568     41      0      0      0      0      0
+  T10      |    9077 |      2      1      9     26    132    374   1072   2635   4794     32      0      0      0      0
+  T11      |    9175 |      1      2     10     28     79    232    712   1518   2769   3766     58      0      0      0
+  T12      |   10887 |      0      1      4     11     33    106    347    872   1817   3309   4321     66      0      0
+  T13      |    2307 |      0      1      0      2      4     14     36    134    202    399    698    762     55      0
+  Bimodal   |   79404 |      5     11     20     56    167    375    842   1700   3471   6945  11561  19657  33512   1082
+
+TAGE Table Occupancy:
+  Table  | Size  | Occupied |  Occ% | EverHit | Used% | Accuracy | Allocs
+  -------+-------+----------+-------+---------+-------+----------+-------
+  T0     |   512 |      453 | 88.5% |     512 |100.0% |   59.1% |   1265
+  T1     |  1024 |      905 | 88.4% |    1013 | 98.9% |    0.0% |   2320
+  T2     |  1024 |      973 | 95.0% |    1016 | 99.2% |    0.0% |   3203
+  T3     |  1024 |     1017 | 99.3% |    1017 | 99.3% |    0.0% |   5585
+  T4     |  1024 |     1022 | 99.8% |    1021 | 99.7% |    0.0% |   6751
+  T5     |  2048 |     2022 | 98.7% |    1995 | 97.4% |    0.0% |   8291
+  T6     |  2048 |     2034 | 99.3% |    2004 | 97.9% |    0.0% |  10401
+  T7     |  2048 |     2037 | 99.5% |    2021 | 98.7% |    0.0% |  11468
+  T8     |  2048 |     2039 | 99.6% |    2031 | 99.2% |    0.0% |  13094
+  T9     |  2048 |     2045 | 99.9% |    2032 | 99.2% |    0.0% |  14451
+  T10    |  2048 |     2046 | 99.9% |    2042 | 99.7% |    0.0% |  16638
+  T11    |  2048 |     2047 |100.0% |    2029 | 99.1% |    0.0% |  20485
+  T12    |  2048 |     1973 | 96.3% |    1846 | 90.1% |    0.0% |  33567
+  T13    |  2048 |      730 | 35.6% |     729 | 35.6% |    0.0% |   1082
+
+Bimodal Fallback (8192 entries):
+  Writes: 79406  Occupied: 3456 (42.2%)
+  Accuracy: 0/0 (0.0%)
+
+U-bit:
+  Table  | U set    | U clear  | Turnover
+  -------+----------+----------+----------
+  T0     |      415 |      257 |   38.2%
+  T1     |     1025 |      612 |   37.4%
+  T2     |      989 |      623 |   38.6%
+  T3     |     2085 |     1108 |   34.7%
+  T4     |     2532 |     1482 |   36.9%
+  T5     |     3906 |     1975 |   33.6%
+  T6     |     5134 |     2231 |   30.3%
+  T7     |     6471 |     2711 |   29.5%
+  T8     |     8945 |     3334 |   27.2%
+  T9     |    10643 |     3572 |   25.1%
+  T10    |    13567 |     3954 |   22.6%
+  T11    |    16039 |     4245 |   20.9%
+  T12    |    16996 |     4672 |   21.6%
+  T13    |     8163 |     1357 |   14.3%
+  Decay fires: 56025  Epoch resets: 0
+
+  U-clear Source Breakdown:
+  Table  | AllocFail | Sibling   | Epoch
+  -------+-----------+-----------+-----------
+  T0     |         9 |        14 |         0
+  T1     |         0 |         2 |         0
+  T2     |         0 |         1 |         0
+  T3     |         0 |         1 |         0
+  T4     |         0 |         1 |         0
+  T5     |         0 |         1 |         0
+  Total  |         9 |        20 |         0
+
+Pressure Counters:
+  Avg acc_ctr: 1021.3
+  Avg alloc_ctr: 1021.3
+
+Sec-Tag Consistency (tag-hit entries only):
+  Checks: 1616834
+  Match curr (predict-time): 1119127 (69.2%)
+  Match now  (update-time):  243576 (15.1%)
+  Match both:  201479 (12.5%)
+  Match neither: 455610 (28.2%)
+
+--- Feature 1: Top Mispredicted PCs ---
+  PC               | Total   | Misp    | Misp%  | TAGE%  | TageAcc | FB Acc  | Bias%  | Allocs
+  -----------------+---------+---------+--------+--------+---------+---------+--------+-------
+  0xe31614        |   10725 |    4732 |  44.1% | 100.0% |   49.9% |    0.0% |  50.1% |   4034  [cumul 3.2%]
+  0xcae2bc        |   52498 |    1850 |   3.5% | 100.0% |    5.4% |    0.0% |  94.6% |   2169  [cumul 4.4%]
+  0x81723c        |   13222 |    1750 |  13.2% | 100.0% |   30.9% |    0.0% |  69.1% |    513  [cumul 5.5%]
+  0xe31628        |    5350 |    1736 |  32.4% | 100.0% |   23.3% |    0.0% |  76.7% |   3107  [cumul 6.7%]
+  0x817218        |   11054 |    1685 |  15.2% | 100.0% |   68.1% |    0.0% |  31.9% |    337  [cumul 7.8%]
+  0xf51290        |   10048 |    1670 |  16.6% | 100.0% |   57.1% |    0.0% |  42.9% |   1663  [cumul 8.9%]
+  0x88482c        |    6498 |    1448 |  22.3% | 100.0% |   50.0% |    0.0% |  50.0% |   2878  [cumul 9.9%]
+  0xe34484        |    3633 |    1368 |  37.7% | 100.0% |   63.6% |    0.0% |  36.4% |    815  [cumul 10.8%]
+  0xc69884        |   10800 |    1361 |  12.6% | 100.0% |   89.5% |    0.0% |  10.5% |   1384  [cumul 11.7%]
+  0x884984        |    8924 |    1333 |  14.9% | 100.0% |   75.6% |    0.0% |  24.4% |    839  [cumul 12.6%]
+  0xd92cec        |    3473 |    1320 |  38.0% | 100.0% |   45.3% |    0.0% |  54.7% |    804  [cumul 13.5%]
+  0x817368        |    6466 |    1280 |  19.8% | 100.0% |   45.4% |    0.0% |  54.6% |     57  [cumul 14.3%]
+  0xe316a8        |    5375 |    1279 |  23.8% | 100.0% |   84.4% |    0.0% |  15.6% |   2594  [cumul 15.2%]
+  0x140a440       |    3094 |    1160 |  37.5% | 100.0% |   39.2% |    0.0% |  60.8% |    890  [cumul 16.0%]
+  0x817248        |   15140 |    1151 |   7.6% | 100.0% |   12.7% |    0.0% |  87.3% |   2093  [cumul 16.7%]
+  0xe2eb14        |    2581 |    1043 |  40.4% | 100.0% |   30.2% |    0.0% |  69.8% |   1088  [cumul 17.4%]
+  0xe342f0        |    2403 |     994 |  41.4% | 100.0% |   52.0% |    0.0% |  48.0% |    423  [cumul 18.1%]
+  0xe2f4ac        |    5168 |     949 |  18.4% | 100.0% |   15.1% |    0.0% |  84.9% |    383  [cumul 18.7%]
+  0xe2f4d8        |    5250 |     940 |  17.9% | 100.0% |   12.8% |    0.0% |  87.2% |    490  [cumul 19.3%]
+  0xe31648        |    2483 |     931 |  37.5% | 100.0% |   74.6% |    0.0% |  25.4% |    391  [cumul 20.0%]
+  Top-20 account for 29980/150153 (20.0%) of all mispredictions
+
+--- Feature 2: Branch Bias Distribution ---
+  Bias (max(T%,NT%)) | PCs
+  -------------------+------
+    0- 10%            |     0
+   10- 20%            |     0
+   20- 30%            |     0
+   30- 40%            |     0
+   40- 50%            |     0
+   50- 60%            |   206
+   60- 70%            |   190
+   70- 80%            |   194
+   80- 90%            |   227
+   90-100%            |  3474
+  Easy (>=90% biased): 3474  Hard (<60% biased): 206
+
+--- Feature 3: TAGE vs Fallback Per-PC ---
+  Category           | PCs    | Mispredictions
+  -------------------+--------+---------------
+  TAGE dominant >50% |   4291 |        149350
+  Fallback dom <=10% |      0 |             0
+  Mixed 10-50%       |      0 |             0
+
+--- Feature 5: Entry Lifetime ---
+  Table  | Evictions | AvgPreds | AvgAcc%  | ZeroUse | ZeroUse%
+  -------+-----------+----------+----------+---------+---------
+  T0     |       812 |     0.0 |    0.0% |     812 |  100.0%
+  T1     |      1415 |     0.0 |    0.0% |    1415 |  100.0%
+  T2     |      2230 |     0.0 |    0.0% |    2230 |  100.0%
+  T3     |      4568 |     0.0 |    0.0% |    4568 |  100.0%
+  T4     |      5729 |     0.0 |    0.0% |    5729 |  100.0%
+  T5     |      6269 |     0.0 |    0.0% |    6269 |  100.0%
+  T6     |      8367 |     0.0 |    0.0% |    8367 |  100.0%
+  T7     |      9431 |     0.0 |    0.0% |    9431 |  100.0%
+  T8     |     11055 |     0.0 |    0.0% |   11055 |  100.0%
+  T9     |     12406 |     0.0 |    0.0% |   12406 |  100.0%
+  T10    |     14592 |     0.0 |    0.0% |   14592 |  100.0%
+  T11    |     18438 |     0.0 |    0.0% |   18438 |  100.0%
+  T12    |     31594 |     0.0 |    0.0% |   31594 |  100.0%
+  T13    |       352 |     0.0 |    0.0% |     352 |  100.0%
+
+--- Feature 7: Tag Collision Rate ---
+  Total checks: 1616834  Collisions: 65864 (4.1%)
+  Table  | Checks   | Collisions | Rate
+  -------+----------+------------+------
+  T0     |     8249 |       3654 | 44.3%
+  T1     |    10731 |       3393 | 31.6%
+  T2     |    14850 |       4237 | 28.5%
+  T3     |    20533 |       4938 | 24.0%
+  T4     |    27763 |       5138 | 18.5%
+  T5     |    53011 |       5499 | 10.4%
+  T6     |    72204 |       5926 |  8.2%
+  T7     |    98695 |       4836 |  4.9%
+  T8     |   143445 |       5482 |  3.8%
+  T9     |   173564 |       5063 |  2.9%
+  T10    |   244400 |       4704 |  1.9%
+  T11    |   283808 |       4990 |  1.8%
+  T12    |   252568 |       4954 |  2.0%
+  T13    |   213013 |       3050 |  1.4%
+
+--- Feature 8: Fallback-Stuck Branches ---
+  Category                     | PCs    | Mispred  | AvgAlloc
+  -----------------------------+--------+----------+---------
+  Never allocated to TAGE      |   1129 |    13585 |      --
+  Allocated but FB dominates   |      0 |        0 |     0.0
+  Allocated and TAGE provides  |   3162 |   135765 |    61.9
+
+--- Per-Rank Branch Accuracy ---
+  Rank | Branches  | Correct   | Accuracy
+  -----+-----------+-----------+---------
+     0 |   1236154 |    743581 |   60.2%
+     1 |    416923 |    221420 |   53.1%
+     2 |    157081 |     99712 |   63.5%
+     3 |     70750 |     41982 |   59.3%
+     4 |     28473 |     18732 |   65.8%
+     5 |     14607 |     10345 |   70.8%
+     6 |      7824 |      5861 |   74.9%
+
+--- Feature 10: Misprediction Type Breakdown ---
+  Classifies each misprediction into two categories:
+    Direction:  the predicted taken/not-taken was wrong for the providing branch
+    Boundary:   the last branch in the block was predicted correctly, but an
+                earlier branch in the same fetch block was mispredicted, causing
+                the block to end at the wrong point
+
+  Total mispredictions: 150153
+  Direction (pred!=actual): 75570 (50.3%)
+  Boundary  (block-end wrong): 74583 (49.7%)
+
+--- Feature 11: Per-PC Ahead-Context Fanout ---
+  PC               | Misp    | Contexts | Misp/Ctx | Diagnosis
+  -----------------+---------+----------+----------+----------
+  0xe31614        |    4732 |        4 |  1183.0 | hard-branch
+  0xcae2bc        |    1850 |        8 |   231.2 | hard-branch
+  0x81723c        |    1750 |        1 |  1750.0 | single-context
+  0xe31628        |    1736 |        4 |   434.0 | hard-branch
+  0x817218        |    1685 |        2 |   842.5 | hard-branch
+  0xf51290        |    1670 |        3 |   556.7 | hard-branch
+  0x88482c        |    1448 |        3 |   482.7 | hard-branch
+  0xe34484        |    1368 |        2 |   684.0 | hard-branch
+  0xc69884        |    1361 |        1 |  1361.0 | single-context
+  0x884984        |    1333 |        1 |  1333.0 | single-context
+  0xd92cec        |    1320 |        6 |   220.0 | hard-branch
+  0x817368        |    1280 |        1 |  1280.0 | single-context
+  0xe316a8        |    1279 |        1 |  1279.0 | single-context
+  0x140a440       |    1160 |        2 |   580.0 | hard-branch
+  0x817248        |    1151 |        2 |   575.5 | hard-branch
+  0xe2eb14        |    1043 |        5 |   208.6 | hard-branch
+  0xe342f0        |     994 |        2 |   497.0 | hard-branch
+  0xe2f4ac        |     949 |        3 |   316.3 | hard-branch
+  0xe2f4d8        |     940 |        1 |   940.0 | single-context
+  0xe31648        |     931 |        7 |   133.0 | hard-branch
+  0x140a2a0       |     927 |        2 |   463.5 | hard-branch
+  0xf512c8        |     890 |        7 |   127.1 | hard-branch
+  0x884964        |     872 |        3 |   290.7 | hard-branch
+  0xf51288        |     869 |        2 |   434.5 | hard-branch
+  0xf512a8        |     800 |        5 |   160.0 | hard-branch
+  0x884990        |     776 |        2 |   388.0 | hard-branch
+  0xcae09c        |     741 |        8 |    92.6 | hard-branch
+  0xc41ed0        |     731 |        4 |   182.8 | hard-branch
+  0xe34244        |     717 |        1 |   717.0 | single-context
+  0xf512b8        |     712 |        6 |   118.7 | hard-branch
+  Summary:
+    Single-context:     2741 PCs, 52541 mispredictions
+    Hard-branch (>5/ctx): 779 PCs, 93134 mispredictions
+    Context-fragmented: 598 PCs, 4478 mispredictions
+
+--- Feature 12: Per-PC x Block-Position Misprediction ---
+  Cross-tabulates mispredictions by PC and rank (position within fetch block).
+  Columns:
+    PC:      branch program counter
+    Total:   total observations of this PC across all positions
+    Misp:    total mispredictions of this PC across all positions
+    R0..Rn:  per-position breakdown shown as misp/total; R0 is the first
+             branch in the fetch block, R1 the second, etc.
+    Conc?:   YES if >2/3 of this PC's mispredictions concentrate at a single
+             position (suggests the block boundary, not the branch itself,
+             is the root cause)
+
+  PC               | Total   | Misp    |  R0     |  R1     |  R2     |  R3     |  R4     |  R5     |  R6     | Conc?
+  -----------------+---------+---------+---------+---------+---------+---------+---------+---------+---------+------
+  0xe31614        |   10725 |    4732 |4024/8802| 708/1923|    --   |    --   |    --   |    --   |    --   | YES
+  0xcae2bc        |   52498 |    1850 | 200/2278|1562/49233|  21/  31|   5/  16|  60/ 938|   1/   1|   1/   1| YES
+  0x81723c        |   13222 |    1750 |1750/13222|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0xe31628        |    5350 |    1736 | 866/2562| 809/2251|  61/ 537|    --   |    --   |    --   |    --   |  no
+  0x817218        |   11054 |    1685 |   1/   1|1684/11053|    --   |    --   |    --   |    --   |    --   | YES
+  0xf51290        |   10048 |    1670 | 218/ 525|1452/9523|    --   |    --   |    --   |    --   |    --   | YES
+  0x88482c        |    6498 |    1448 | 147/ 271|1301/6227|    --   |    --   |    --   |    --   |    --   | YES
+  0xe34484        |    3633 |    1368 |1368/3633|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0xc69884        |   10800 |    1361 |1361/10800|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0x884984        |    8924 |    1333 |1333/8924|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0xd92cec        |    3473 |    1320 | 752/1929| 546/1472|  16/  36|   6/  36|    --   |    --   |    --   |  no
+  0x817368        |    6466 |    1280 |1280/6466|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0xe316a8        |    5375 |    1279 |1279/5375|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0x140a440       |    3094 |    1160 |1160/3094|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0x817248        |   15140 |    1151 | 911/12054| 240/3086|    --   |    --   |    --   |    --   |    --   | YES
+  0xe2eb14        |    2581 |    1043 | 849/2036| 191/ 538|   3/   7|    --   |    --   |    --   |    --   | YES
+  0xe342f0        |    2403 |     994 |  15/  24| 979/2379|    --   |    --   |    --   |    --   |    --   | YES
+  0xe2f4ac        |    5168 |     949 | 947/5144|   2/  24|    --   |    --   |    --   |    --   |    --   | YES
+  0xe2f4d8        |    5250 |     940 | 940/5250|    --   |    --   |    --   |    --   |    --   |    --   |  no
+  0xe31648        |    2483 |     931 | 353/1183| 406/ 870|  98/ 171|  58/ 181|  16/  78|    --   |    --   |  no
+  Position-concentrated: 9/20 of top mispredicted PCs
+
+  Aggregate per-position stats:
+  (Summed across all PCs — shows overall accuracy at each block rank)
+  Rank | Branches  | Misp      | MispRate
+  -----+-----------+-----------+---------
+  R0   |   1236154 |     93546 |    7.6%
+  R1   |    416923 |     36824 |    8.8%
+  R2   |    157081 |     11588 |    7.4%
+  R3   |     70750 |      4674 |    6.6%
+  R4   |     28473 |      2191 |    7.7%
+  R5   |     14607 |       910 |    6.2%
+  R6   |      7824 |       420 |    5.4%
+
+--- Feature 13: Per-PC Allocation Outcome Histogram ---
+  AllocCount | PCs     | Cumul Mispred
+  -----------+---------+--------------
+        1-10 |    1969 |        13190
+       10-50 |    1032 |        23521
+      50-100 |     288 |        15545
+     100-300 |     287 |        29697
+        300+ |     115 |        54203
+
+--- Feature 14: TAGE Accuracy Trajectory by Alloc Count ---
+  AllocCount | TageProvided | TageAcc%
+  -----------+--------------+---------
+        1-10 |       677611 |   52.1%
+       10-50 |       364729 |   65.1%
+      50-100 |       205863 |   67.1%
+     100-300 |       305732 |   67.0%
+        300+ |       377877 |   55.1%
+
+--- Feature 15: Per-PC Oscillation Detector ---
+  PC               | Total   | Misp    | AvgStreak | MaxStreak | Streaks | Diagnosis
+  -----------------+---------+---------+-----------+-----------+---------+----------
+  0xe31614        |   10725 |    4732 |       2.1 |        98 |    2554 | oscillating
+  0xcae2bc        |   52498 |    1850 |       1.0 |         1 |    2845 | oscillating
+  0x81723c        |   13222 |    1750 |       1.5 |         5 |    2798 | oscillating
+  0xe31628        |    5350 |    1736 |       1.2 |        70 |    1069 | oscillating
+  0x817218        |   11054 |    1685 |      17.0 |       224 |     442 | stable-then-fail
+  0xf51290        |   10048 |    1670 |       1.9 |        14 |    3050 | oscillating
+  0x88482c        |    6498 |    1448 |       1.9 |        20 |    1682 | oscillating
+  0xe34484        |    3633 |    1368 |       3.6 |        82 |     645 | moderate
+  0xc69884        |   10800 |    1361 |       9.4 |        53 |    1034 | moderate
+  0x884984        |    8924 |    1333 |       3.3 |        53 |    2066 | moderate
+  0xd92cec        |    3473 |    1320 |       1.6 |        17 |     997 | oscillating
+  0x817368        |    6466 |    1280 |       1.5 |         4 |    1898 | oscillating
+  0xe316a8        |    5375 |    1279 |       5.7 |        93 |     796 | moderate
+  0x140a440       |    3094 |    1160 |       2.2 |        88 |     560 | oscillating
+  0x817248        |   15140 |    1151 |       1.1 |         2 |    1690 | oscillating
+  0xe2eb14        |    2581 |    1043 |       1.8 |        15 |     444 | oscillating
+  0xe342f0        |    2403 |     994 |       1.9 |        20 |     642 | oscillating
+  0xe2f4ac        |    5168 |     949 |       1.1 |         4 |     680 | oscillating
+  0xe2f4d8        |    5250 |     940 |       1.0 |         2 |     652 | oscillating
+  0xe31648        |    2483 |     931 |      21.6 |       273 |      50 | stable-then-fail
+
+--- Feature 16: Fallback vs TAGE Per-PC (TAGE-provided branches) ---
+  PCs where FB would be better: 0 (mispredictions: 0)
+  PCs where TAGE is better:     0 (mispredictions: 0)
+  PCs tied (±1%):               3871
+
+--- Feature 17: Micro-Window MPKI Distribution (1K-branch windows) ---
+  MPKI Range | Samples   | Fraction
+  -----------+-----------+---------
+    0-  5    |     82148 |    4.3%
+    5- 10    |     33290 |    1.7%
+   10- 15    |     30643 |    1.6%
+   15- 20    |     36489 |    1.9%
+   20- 25    |     43105 |    2.2%
+   25- 30    |     58781 |    3.0%
+   30- 35    |     70158 |    3.6%
+   35- 40    |     79452 |    4.1%
+   40- 45    |     99669 |    5.2%
+   45- 50    |     87868 |    4.6%
+    50+      |   1309186 |   67.8%
+
+--- Feature 18: Phase Detection (misp rate delta, 256-branch windows) ---
+  Compares misprediction rates between consecutive 256-branch windows.
+  A large delta signals a phase change in program behavior.
+
+  |Delta Rate| | Samples   | Fraction
+  ------------+-----------+---------
+          <1% |      1738 |   23.0%
+         1-2% |      1469 |   19.5%
+         2-5% |      2367 |   31.4%
+        5-10% |      1534 |   20.3%
+       10-20% |       406 |    5.4%
+         20%+ |        31 |    0.4%
+  Mean |delta|: 3.62%  Max |delta|: 35.55%
+
+--- Feature 20: Entry Age at Provider ---
+  Age Range   | Providers | Accuracy
+  ------------+-----------+---------
+         0-1K |         0 |   0.00%
+       1K-10K |         0 |   0.00%
+     10K-100K |         0 |   0.00%
+      100K-1M |         0 |   0.00%
+          1M+ |         0 |   0.00%
+
+--- Feature 21: Misprediction Recurrence Distance ---
+  Distance    | Count
+  ------------+------
+         1-10 |     19794
+       10-100 |     24156
+       100-1K |     30303
+       1K-10K |     36551
+         10K+ |     35231
+
+--- Feature 22: Allocation Ping-Pong ---
+  Ping-pong evictions: 19624
+
+--- Feature 24: Counterfactual Fallback Analysis ---
+  Total branches: 1931812
+  FB would be correct:   1141633 (59.10%)
+  TAGE was correct:      1141633 (59.10%)
+  FB only (FB right, TAGE wrong): 0 (0.00%)
+  TAGE only (TAGE right, FB wrong): 0 (0.00%)
+  Hypothetical FB-only MPKI: 71.816
+
+--- Per-Group Resolution Stats ---
+  Group | Branches  | Misp     | Misp%  | MPKI
+  ------+-----------+----------+--------+------
+  G0    |   1236154 |    93546 | 7.568% | 8.502
+  G1    |    416923 |    36824 | 8.832% | 3.347
+  G2    |    157081 |    11588 | 7.377% | 1.053
+  G3    |     70750 |     4674 | 6.606% | 0.425
+  G4    |     28473 |     2191 | 7.695% | 0.199
+  G5    |     14607 |      910 | 6.230% | 0.083
+  G6    |      7824 |      420 | 5.368% | 0.038
+
+  Per-Group Provider Distribution:
+  G0: Bimodal=0(0.0%) T0=1236154(60.2%)
+  G1: Bimodal=0(0.0%) T0=416923(53.1%)
+  G2: Bimodal=0(0.0%) T0=157081(63.5%)
+  G3: Bimodal=0(0.0%) T0=70750(59.3%)
+  G4: Bimodal=0(0.0%) T0=28473(65.8%)
+  G5: Bimodal=0(0.0%) T0=14607(70.8%)
+  G6: Bimodal=0(0.0%) T0=7824(74.9%)
+
+  Per-Group Tag Match Rates:
+  Group | T 0  | T 1  | T 2  | T 3  | T 4  | T 5  | T 6  | T 7  | T 8  | T 9  | T10  | T11  | T12  | T13  |
+  ------+------+------+------+------+------+------+------+------+------+------+------+------+------+------+
+  G0    | 25.8%| 41.2%| 52.9%| 64.9%| 65.6%| 75.1%| 73.5%| 75.9%| 71.8%| 70.9%| 68.1%| 63.0%| 71.0%| 61.4%|
+  G1    | 26.8%| 44.5%| 53.9%| 61.2%| 70.4%| 74.4%| 77.8%| 75.0%| 78.6%| 70.6%| 71.9%| 65.9%| 72.0%| 70.2%|
+  G2    | 18.2%| 57.7%| 47.6%| 60.7%| 77.7%| 69.7%| 68.6%| 72.0%| 72.4%| 66.9%| 61.2%| 73.2%| 72.6%| 93.7%|
+  G3    | 50.6%| 25.7%| 78.1%| 54.7%| 73.5%| 76.6%| 70.7%| 69.7%| 76.7%| 74.3%| 74.3%| 66.4%| 75.4%| 63.0%|
+  G4    | 31.5%| 51.7%| 36.6%| 85.6%| 62.8%| 73.9%| 66.8%| 81.4%| 87.8%| 87.9%| 74.1%| 72.7%| 81.3%| 99.1%|
+  G5    | 35.0%| 58.8%| 61.6%| 75.0%| 68.4%| 80.7%| 88.3%| 73.9%| 79.1%| 78.6%| 68.6%| 67.9%| 60.6%| 77.8%|
+  G6    | 88.5%|  0.0%| 61.9%| 46.2%| 86.9%| 76.6%| 90.7%| 84.6%| 90.3%| 75.5%| 53.0%| 73.4%| 88.5%| 72.0%|
+
+  Per-Group Allocation:
+  G0: attempts=93546 success=92639 (99.0%) per-table: T0=742 T1=1347 T2=1851 T3=3194 T4=3738 T5=4824 T6=6139 T7=7122 T8=8121 T9=9017 T10=10358 T11=12955 T12=22507 T13=724
+  G1: attempts=36824 success=36344 (98.7%) per-table: T0=410 T1=773 T2=1024 T3=1760 T4=2107 T5=2349 T6=2796 T7=2833 T8=3175 T9=3334 T10=3862 T11=4712 T12=6992 T13=217
+  G2: attempts=11588 success=11520 (99.4%) per-table: T0=58 T1=107 T2=171 T3=416 T4=543 T5=684 T6=847 T7=858 T8=1074 T9=1179 T10=1398 T11=1678 T12=2430 T13=77
+  G3: attempts=4674 success=4643 (99.3%) per-table: T0=17 T1=30 T2=70 T3=103 T4=176 T5=223 T6=339 T7=353 T8=418 T9=539 T10=628 T11=715 T12=993 T13=39
+  G4: attempts=2191 success=2128 (97.1%) per-table: T0=24 T1=46 T2=65 T3=81 T4=124 T5=136 T6=190 T7=166 T8=176 T9=232 T10=223 T11=260 T12=391 T13=14
+  G5: attempts=910 success=907 (99.7%) per-table: T0=10 T1=13 T2=15 T3=19 T4=41 T5=45 T6=59 T7=58 T8=83 T9=110 T10=129 T11=116 T12=202 T13=7
+  G6: attempts=420 success=420 (100.0%) per-table: T0=4 T1=4 T2=7 T3=12 T4=22 T5=30 T6=31 T7=78 T8=47 T9=40 T10=40 T11=49 T12=52 T13=4
+
+  Per-Group Occupancy (entries):
+  G0: T0=453 T1=905 T2=973 T3=1017 T4=1022 T5=2022 T6=2034 T7=2037 T8=2039 T9=2045 T10=2046 T11=2047 T12=1973 T13=730
+  G1: T0=180 T1=352 T2=468 T3=723 T4=790 T5=1104 T6=1256 T7=1271 T8=1355 T9=1353 T10=1389 T11=1511 T12=1227 T13=67
+  G2: T0=39 T1=51 T2=111 T3=292 T4=365 T5=488 T6=595 T7=590 T8=638 T9=717 T10=761 T11=867 T12=799 T13=24
+  G3: T0=11 T1=17 T2=46 T3=87 T4=137 T5=172 T6=262 T7=265 T8=294 T9=367 T10=407 T11=468 T12=488 T13=13
+  G4: T0=14 T1=30 T2=47 T3=61 T4=90 T5=96 T6=130 T7=126 T8=141 T9=170 T10=157 T11=191 T12=217 T13=3
+  G5: T0=9 T1=10 T2=13 T3=17 T4=35 T5=40 T6=51 T7=50 T8=66 T9=83 T10=96 T11=88 T12=100 T13=5
+  G6: T0=3 T1=4 T2=7 T3=10 T4=18 T5=22 T6=24 T7=34 T8=33 T9=31 T10=35 T11=35 T12=37 T13=3
+
+--- Per-Bank Stats (per table) ---
+  Table | Bank | TagHits  | SecHits  | FullHits | Prov    | ProvAcc | Alloc   | PredUpd | HystUpd | UWrites | Total
+  ------+------+----------+----------+----------+---------+---------+---------+---------+---------+---------+------
+  T 0   | B0   |     4037 |    27097 |     1215 |       0 |   0.0% |     616 |     717 |     970 |     258 |    2561
+  T 0   | B1   |     4212 |    26556 |      982 |       0 |   0.0% |     649 |     797 |    1025 |     414 |    2885
+  T 1   | B0   |     5563 |    29040 |     2515 |       0 |   0.0% |    1170 |    1441 |    2099 |     854 |    5564
+  T 1   | B1   |     5168 |    27536 |     2052 |       0 |   0.0% |    1150 |    1400 |    1920 |     783 |    5253
+  T 2   | B0   |     7346 |    31748 |     4027 |       0 |   0.0% |    1578 |    1855 |    2611 |     776 |    6820
+  T 2   | B1   |     7504 |    30328 |     3936 |       0 |   0.0% |    1625 |    1935 |    2600 |     836 |    6996
+  T 3   | B0   |    10334 |    33799 |     6640 |       0 |   0.0% |    2777 |    3332 |    4675 |    1461 |   12245
+  T 3   | B1   |    10199 |    37075 |     6482 |       0 |   0.0% |    2808 |    3354 |    4543 |    1732 |   12437
+  T 4   | B0   |    13987 |    36307 |     9369 |       0 |   0.0% |    3374 |    4072 |    5874 |    2038 |   15358
+  T 4   | B1   |    13776 |    37738 |     9519 |       0 |   0.0% |    3377 |    4039 |    5830 |    1976 |   15222
+  T 5   | B0   |    28546 |    49478 |    21029 |       0 |   0.0% |    4126 |    5337 |    8991 |    2920 |   21374
+  T 5   | B1   |    24465 |    43792 |    18529 |       0 |   0.0% |    4165 |    5335 |    8448 |    2961 |   20909
+  T 6   | B0   |    36170 |    52327 |    27465 |       0 |   0.0% |    5279 |    6664 |   10624 |    3527 |   26094
+  T 6   | B1   |    36034 |    49802 |    26092 |       0 |   0.0% |    5122 |    6478 |   11053 |    3838 |   26491
+  T 7   | B0   |    47938 |    61753 |    36852 |       0 |   0.0% |    5742 |    7280 |   12251 |    4691 |   29964
+  T 7   | B1   |    50757 |    62551 |    37548 |       0 |   0.0% |    5726 |    7300 |   11822 |    4491 |   29339
+  T 8   | B0   |    77011 |    80220 |    56786 |       0 |   0.0% |    6615 |    8642 |   15131 |    6547 |   36935
+  T 8   | B1   |    66434 |    72861 |    49227 |       0 |   0.0% |    6479 |    8234 |   14310 |    5732 |   34755
+  T 9   | B0   |    93497 |    89157 |    65984 |       0 |   0.0% |    7247 |    9154 |   16545 |    7397 |   40343
+  T 9   | B1   |    80067 |    82559 |    57268 |       0 |   0.0% |    7204 |    8885 |   16110 |    6818 |   39017
+  T10   | B0   |   130044 |   119653 |    91184 |       0 |   0.0% |    8404 |   10718 |   20013 |    8489 |   47624
+  T10   | B1   |   114356 |   100784 |    76750 |       0 |   0.0% |    8234 |   10221 |   19457 |    9032 |   46944
+  T11   | B0   |   158116 |   118387 |    97039 |       0 |   0.0% |   10150 |   12501 |   23669 |   10243 |   56563
+  T11   | B1   |   125692 |   111461 |    85761 |       0 |   0.0% |   10335 |   12414 |   22668 |   10041 |   55458
+  T12   | B0   |   154760 |   142849 |   114073 |       0 |   0.0% |   21619 |   25711 |   40997 |   13189 |  101516
+  T12   | B1   |    97808 |    85575 |    66370 |       0 |   0.0% |   11948 |   13760 |   23715 |    8479 |   57902
+  T13   | B0   |   160358 |   136732 |   110803 |       0 |   0.0% |     672 |    1445 |    4691 |    7370 |   14178
+  T13   | B1   |    52655 |    48315 |    33630 |       0 |   0.0% |     410 |     713 |    2139 |    2150 |    5412
+
+  Bank Balance (write imbalance per table):
+  Table | B0 Writes | B1 Writes | Ratio
+  ------+-----------+-----------+------
+  T 0   |      2561 |      2885 | 1.13
+  T 1   |      5564 |      5253 | 1.06
+  T 2   |      6820 |      6996 | 1.03
+  T 3   |     12245 |     12437 | 1.02
+  T 4   |     15358 |     15222 | 1.01
+  T 5   |     21374 |     20909 | 1.02
+  T 6   |     26094 |     26491 | 1.02
+  T 7   |     29964 |     29339 | 1.02
+  T 8   |     36935 |     34755 | 1.06
+  T 9   |     40343 |     39017 | 1.03
+  T10   |     47624 |     46944 | 1.01
+  T11   |     56563 |     55458 | 1.02
+  T12   |    101516 |     57902 | 1.75
+  T13   |     14178 |      5412 | 2.62
+
+  Bank Occupancy & Staleness (window=10000 branches):
+  Table | Bank | Occupied |  Occ% |   Live | Live% |  Stale | Stale%
+  ------+------+----------+-------+--------+-------+--------+-------
+  T 0   | B0   |      223 |87.11% |     16 | 7.17% |    207 |92.83%
+  T 0   | B1   |      230 |89.84% |     35 |15.22% |    195 |84.78%
+  T 1   | B0   |      459 |89.65% |     19 | 4.14% |    440 |95.86%
+  T 1   | B1   |      446 |87.11% |     19 | 4.26% |    427 |95.74%
+  T 2   | B0   |      479 |93.55% |     19 | 3.97% |    460 |96.03%
+  T 2   | B1   |      494 |96.48% |     21 | 4.25% |    473 |95.75%
+  T 3   | B0   |      508 |99.22% |     40 | 7.87% |    468 |92.13%
+  T 3   | B1   |      509 |99.41% |     42 | 8.25% |    467 |91.75%
+  T 4   | B0   |      510 |99.61% |     58 |11.37% |    452 |88.63%
+  T 4   | B1   |      512 |100.00% |     67 |13.09% |    445 |86.91%
+  T 5   | B0   |     1009 |98.54% |    122 |12.09% |    887 |87.91%
+  T 5   | B1   |     1013 |98.93% |    119 |11.75% |    894 |88.25%
+  T 6   | B0   |     1019 |99.51% |    139 |13.64% |    880 |86.36%
+  T 6   | B1   |     1015 |99.12% |    156 |15.37% |    859 |84.63%
+  T 7   | B0   |     1020 |99.61% |    184 |18.04% |    836 |81.96%
+  T 7   | B1   |     1017 |99.32% |    186 |18.29% |    831 |81.71%
+  T 8   | B0   |     1018 |99.41% |    210 |20.63% |    808 |79.37%
+  T 8   | B1   |     1021 |99.71% |    201 |19.69% |    820 |80.31%
+  T 9   | B0   |     1024 |100.00% |    208 |20.31% |    816 |79.69%
+  T 9   | B1   |     1021 |99.71% |    198 |19.39% |    823 |80.61%
+  T10   | B0   |     1024 |100.00% |    213 |20.80% |    811 |79.20%
+  T10   | B1   |     1022 |99.80% |    204 |19.96% |    818 |80.04%
+  T11   | B0   |     1023 |99.90% |    242 |23.66% |    781 |76.34%
+  T11   | B1   |     1024 |100.00% |    224 |21.88% |    800 |78.12%
+  T12   | B0   |      982 |95.90% |    213 |21.69% |    769 |78.31%
+  T12   | B1   |      991 |96.78% |    157 |15.84% |    834 |84.16%
+  T13   | B0   |      422 |41.21% |     54 |12.80% |    368 |87.20%
+  T13   | B1   |      308 |30.08% |     27 | 8.77% |    281 |91.23%
+
+=== End TageAhead Monitor ===
+
+
+=== TageAhead Parameters ===
+Tables: 14  N: 7  PathBits: 6  HistMode: PATH
+HistLen: [199,156,121,95,74,57,45,35,27,21,16,13,10,8]
+TableSize: [512,1024,1024,1024,1024,2048,2048,2048,2048,2048,2048,2048,2048,2048]
+TagWidth: [11,11,11,11,11,11,11,11,11,11,11,11,11,11]
+CtrWidth: 1  HystWidth: 2  SharedHyst: yes
+SecTag: yes  SecTagBits: 5  NumPaths: 1
+UWidth: 2  UMisp: UNTOUCHED  UClear: DECREMENT
+Fallback: Bimodal  Capacity: 8192  Reconcile: no
+Meta: width=2 cap=1024 pipe=2
+Alloc: trigger=MISPREDICT  action=STANDARD  target=AllocPressSkip  maxAlloc=1  nonConsec=no
+  SiblingPolicy=ALL  SiblingFloor=0  FarAllocDist=0
+Pressure: AccWidth=10  AllocWidth=10
+Epoch: no
+Decay: yes  Miss=TAG_OR_SEC  Op=DECREMENT  LfsrWidths=[8,8,8,8,8,8,8,8,8,8,8,8,8,8]
+LineInst: 256  ReverseTableOrder: no
+=== End Parameters ===
+
+
+=== rwram bank conflict stats ===
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=621942 (50.31% of buffered) flushed=614211
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=621942 (50.31% of buffered) flushed=614211
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=621942 (50.31% of buffered) flushed=614211
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=618214 (50.01% of buffered) flushed=617939
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=618214 (50.01% of buffered) flushed=617939
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=618214 (50.01% of buffered) flushed=617939
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=618868 (50.06% of buffered) flushed=617285
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=618868 (50.06% of buffered) flushed=617285
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=618868 (50.06% of buffered) flushed=617285
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=622230 (50.34% of buffered) flushed=613923
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=622230 (50.34% of buffered) flushed=613923
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=622230 (50.34% of buffered) flushed=613923
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=615900 (49.82% of buffered) flushed=620253
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=615900 (49.82% of buffered) flushed=620253
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=615900 (49.82% of buffered) flushed=620253
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=621563 (50.28% of buffered) flushed=614590
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=621563 (50.28% of buffered) flushed=614590
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=621563 (50.28% of buffered) flushed=614590
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=631361 (51.07% of buffered) flushed=604792
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=631361 (51.07% of buffered) flushed=604792
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=631361 (51.07% of buffered) flushed=604792
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=631361 (51.07% of buffered) flushed=604792
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=631361 (51.07% of buffered) flushed=604792
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=631361 (51.07% of buffered) flushed=604792
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=631695 (51.10% of buffered) flushed=604458
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=631695 (51.10% of buffered) flushed=604458
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=631695 (51.10% of buffered) flushed=604458
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=641792 (51.92% of buffered) flushed=594361
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=721698 (58.38% of buffered) flushed=514455
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=721698 (58.38% of buffered) flushed=514455
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=721698 (58.38% of buffered) flushed=514455
+rwram[ta_pred] writes=1236154 buffered=1236154 (100.00%) lost=721698 (58.38% of buffered) flushed=514455
+rwram[ta_hyst] writes=1236154 buffered=1236154 (100.00%) lost=721698 (58.38% of buffered) flushed=514455
+rwram[ta_u] writes=1236154 buffered=1236154 (100.00%) lost=721698 (58.38% of buffered) flushed=514455
+rwram[meta] writes=1236154 buffered=1236154 (100.00%) lost=719922 (58.24% of buffered) flushed=516231
+=================================

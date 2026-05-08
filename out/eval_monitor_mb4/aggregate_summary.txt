@@ -1,0 +1,61 @@
+======================================================================
+TAMonitor Aggregate Summary — 20 traces
+======================================================================
+
+--- Per-Trace Summary ---
+Trace                                          Windows       MPKI    misp%   alloc%
+-----                                          -------       ----    -----   ------
+502-gcc-all_16112                                   47     17.632    8.06%    14.5%
+505-mcf-1_14364                                     24     17.657   16.32%    29.0%
+508-namd-1_126793                                    9      4.972   10.82%    13.4%
+531-deepsjeng-1_53703                               42     14.806   13.02%    23.1%
+548-exchange2-1_207156                              28      6.042    4.75%     8.6%
+554-roms-1_62613                                     3      0.079    0.53%     0.5%
+dcapo-kafka-jdk8.524_0                              38      6.118    3.36%     5.6%
+gap-sssp-usroad.287_0                               39     37.250   23.14%    53.8%
+gcc-1.52513_0                                       22     14.111    7.07%    11.7%
+java16-specjbb-64k-ir1000.19011_0                   36      6.708    3.81%     8.9%
+llvm-2.25945_0                                      19     11.536    6.52%    10.1%
+lua-3.25585_0                                       17      2.632    1.29%     0.2%
+nodejs-http2_4818                                   33      9.685    5.65%     9.2%
+nodejs-octane_3483                                  37      7.404    3.78%     5.8%
+python3-pyperf-dulwich.2000_0                       31      5.404    3.39%     5.4%
+rsbench-1.730_0                                     17     42.836   31.53%    37.4%
+sampleflow-1.127768_0                               17      2.301    1.75%     0.9%
+web_130                                             56      6.836    4.03%     6.6%
+web_74                                              56      6.424    3.80%     6.2%
+zstd-1.19139_0                                      13      8.711    8.28%    22.6%
+
+--- Aggregate Stats ---
+  Traces:      20
+  Mean MPKI:   11.457
+  Median MPKI: 7.120
+  Stdev MPKI:  10.928
+  Min MPKI:    0.079
+  Max MPKI:    42.836
+
+--- Per-Column Mean (across all windows, all traces) ---
+  MPKI                  mean=12.127  std=11.693  p50=8.916  p95=38.171
+  misp%                 mean=7.811  std=7.748  p50=5.400  p95=23.785
+  alloc_ok%             mean=13.940  std=14.637  p50=9.600  p95=51.100
+  acc_avg               mean=956.712  std=237.451  p50=1022.400  p95=1023.000
+  extra%                mean=14.273  std=14.492  p50=9.800  p95=51.185
+  true_blk%             mean=92.586  std=7.881  p50=95.050  p95=99.900
+  coll%                 mean=2.451  std=2.222  p50=2.100  p95=6.570
+  Tlast_zu%             mean=28.241  std=26.297  p50=25.800  p95=75.750
+  dir_misp%             mean=54.070  std=11.144  p50=53.000  p95=73.185
+  bnd_misp%             mean=45.245  std=10.869  p50=46.900  p95=57.600
+  micro_p50_mpki        mean=32.877  std=21.387  p50=47.500  p95=52.500
+  micro_p95_mpki        mean=44.118  std=16.170  p50=52.500  p95=52.500
+  phase_delta_avg       mean=2.815  std=1.644  p50=2.865  p95=5.479
+  jaccard               mean=0.443  std=0.404  p50=0.483  p95=1.000
+  pingpong              mean=1418.866  std=2084.054  p50=627.000  p95=6581.050
+  cf_fb_only%           mean=17.979  std=4.440  p50=18.225  p95=24.740
+  cf_tage_only%         mean=21.232  std=11.964  p50=18.742  p95=48.441
+  prov_no_tag%          mean=54.508  std=15.260  p50=57.980  p95=74.232
+  prov_sec_rej%         mean=24.334  std=6.159  p50=24.373  p95=38.054
+  prov_meta_alt%        mean=1.152  std=1.741  p50=0.571  p95=4.565
+  prov_meta_pri%        mean=1.631  std=1.614  p50=1.046  p95=5.027
+  prov_no_meta%         mean=18.375  std=12.632  p50=13.341  p95=44.417
+  cf_sec_fb_acc%        mean=59.843  std=11.499  p50=58.814  p95=82.896
+  cf_sec_tage_acc%      mean=50.558  std=7.264  p50=49.794  p95=61.399

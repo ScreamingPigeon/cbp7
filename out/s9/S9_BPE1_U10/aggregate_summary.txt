@@ -1,0 +1,49 @@
+======================================================================
+TAMonitor Aggregate Summary — 8 traces
+======================================================================
+
+--- Per-Trace Summary ---
+Trace                                          Windows       MPKI    misp%   alloc%
+-----                                          -------       ----    -----   ------
+502-gcc-all_16112                                   47     20.547    9.38%    16.0%
+505-mcf-1_14364                                     24     19.090   17.61%    26.1%
+508-namd-1_126793                                    9      5.670   12.38%    12.0%
+531-deepsjeng-1_53703                               42     16.431   14.44%    25.2%
+548-exchange2-1_207156                              28      9.583    7.45%    12.6%
+554-roms-1_62613                                     3      0.314    1.73%     0.9%
+gcc-1.52513_0                                       22     16.649    8.33%    13.4%
+llvm-2.25945_0                                      19     13.784    7.81%    11.9%
+
+--- Aggregate Stats ---
+  Traces:      8
+  Mean MPKI:   12.758
+  Median MPKI: 15.108
+  Stdev MPKI:  7.027
+  Min MPKI:    0.314
+  Max MPKI:    20.547
+
+--- Per-Column Mean (across all windows, all traces) ---
+  MPKI                  mean=15.811  std=6.743  p50=16.297  p95=27.685
+  misp%                 mean=10.964  std=4.412  p50=10.700  p95=17.770
+  alloc_ok%             mean=17.639  std=7.793  p50=17.000  p95=28.505
+  acc_avg               mean=1018.095  std=23.280  p50=1022.100  p95=1022.835
+  extra%                mean=18.882  std=8.213  p50=18.050  p95=31.380
+  true_blk%             mean=90.077  std=4.704  p50=91.100  p95=97.235
+  coll%                 mean=5.128  std=3.306  p50=5.400  p95=10.335
+  Tlast_zu%             mean=94.845  std=22.111  p50=100.000  p95=100.000
+  dir_misp%             mean=48.373  std=5.980  p50=48.400  p95=57.610
+  bnd_misp%             mean=51.627  std=5.980  p50=51.600  p95=60.035
+  micro_p50_mpki        mean=49.871  std=8.781  p50=52.500  p95=52.500
+  micro_p95_mpki        mean=52.474  std=0.358  p50=52.500  p95=52.500
+  phase_delta_avg       mean=4.007  std=1.183  p50=3.910  p95=5.954
+  jaccard               mean=0.486  std=0.433  p50=0.605  p95=0.979
+  pingpong              mean=1648.057  std=1374.575  p50=1196.500  p95=5102.200
+  cf_fb_only%           mean=0.000  std=0.000  p50=0.000  p95=0.000
+  cf_tage_only%         mean=0.000  std=0.000  p50=0.000  p95=0.000
+  prov_no_tag%          mean=100.000  std=0.000  p50=100.000  p95=100.000
+  prov_sec_rej%         mean=0.000  std=0.000  p50=0.000  p95=0.000
+  prov_meta_alt%        mean=0.000  std=0.000  p50=0.000  p95=0.000
+  prov_meta_pri%        mean=0.000  std=0.000  p50=0.000  p95=0.000
+  prov_no_meta%         mean=0.000  std=0.000  p50=0.000  p95=0.000
+  cf_sec_fb_acc%        mean=0.000  std=0.000  p50=0.000  p95=0.000
+  cf_sec_tage_acc%      mean=0.000  std=0.000  p50=0.000  p95=0.000

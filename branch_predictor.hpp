@@ -20,6 +20,11 @@
 // Keep `perceptron<>` as a stable user-facing name.
 template <auto... Args> using perceptron = experiment_perceptron<Args...>;
 
+// Alias for tage<> without angle brackets (needed for make targets where <> breaks shell)
+using TageDefault = tage<>;
+// LINEINST=256 variant (LOGLB=10): matches TageAheadHC_IR block size for fair comparison
+using TageDefault256 = tage<10>;
+
 // ============================================================================
 // Competition configs: 1-cycle and 2-cycle tracks
 // ============================================================================
@@ -785,17 +790,73 @@ using S9_BPE1_GT13_9  = TageAhead<S1_BPE1_BASE(S9_TC_GT13_9)>;  // graded 13→9
 using S9_BPE1_GT14_8  = TageAhead<S1_BPE1_BASE(S9_TC_GT14_8)>;  // graded 14→8, eff 11→5
 
 // ============================================================================
+// Tage.hpp config matching TageAheadHC_IR (non-pipelined, 2-cycle P1/P2)
+// ============================================================================
+// 15 tables, 1024×5 + 2048×10, geometric 8–200, CTR=1, HYST=2, U=2
+// GradedTag<11,7>, bimodal fallback 8192, meta enabled, no SC overrider
+using Tage2Cyc_TC = SweepTableConfig<15, 1024, 11, 1, 2, 2, 8, 200, 1,
+                                      HistSeries::GEOMETRIC,
+                                      GradedTag<11, 7>,
+                                      StepSize<1024, 2048, 5>>;
+using Tage2Cyc = Tage<Tage2Cyc_TC,
+                      DefaultAllocConfig,
+                      8,      // FETCH_WIDTH (must be pow2, >= N=7)
+                      8192,   // BIMODAL_SIZE
+                      1,      // BR_P_ENTRY
+                      1,      // NUM_BANKS
+                      true,   // SHARED_TAG
+                      true,   // SHARED_U
+                      true,   // SHARED_HYS
+                      false,  // U_STOR_FF
+                      8, 2,   // DECAY_CTR, DECAY_GRAN
+                      DecayMild,
+                      DefaultResetFn,
+                      false,  // USE_FF_CACHE
+                      false,  // P1_USE_GSHARE (bimodal only, like HC_IR)
+                      8192,   // P1_TABLE_SIZE
+                      6,      // P1_HIST
+                      true, 4, // USE_META, METABITS
+                      2,      // METAPIPE
+                      2048,   // META_TABLE_SIZE
+                      false,  // USE_PATH_HIST
+                      27, 6,  // PATH_HIST_WIDTH, PATH_BITS
+                      NoOverrider>;
+
+// ============================================================================
 // TageDirect matching TageAheadHC structural params (no ahead pipeline)
 // ============================================================================
 using TD_HC_TC = td::TDTableConfig<14, 1024, 11, 1, 2, 2, 8, 200, 1,
                                     td::HistSeries::GEOMETRIC,
                                     td::UniformTag<11>,
                                     td::StepSize<1024, 2048, 5>>;
+using TD_HC2_TC = td::TDTableConfig<15, 1024, 11, 1, 2, 2, 8, 200, 1,
+                                     td::HistSeries::GEOMETRIC,
+                                     td::UniformTag<11>,
+                                     td::StepSize<1024, 2048, 5>>;
 using TD_HC = TageDirect<TD_HC_TC,
                          td::TDDefaultAllocConfig,
                          256,   // LINEINST
                          7,     // N
                          8, 2,  // DECAY_CTR (8-bit LFSR), DECAY_GRAN
+                         td::TDDecayMild,
+                         true, 8192, // P1_USE_GSHARE, P1_TABLE_SIZE
+                         6,     // P1_HIST
+                         true, 4, // USE_META, METABITS
+                         2,     // METAPIPE
+                         false, // USE_PATH_HIST
+                         27, 6, // PATH_HIST_WIDTH, PATH_BITS
+                         td::XORFold,
+                         8, 1,  // RWRAM_BANKS=8, BANK_SHIFT=1
+                         8,     // EPOCH_CTR_BITS
+                         true,  // SHARED_HYS
+                         false>; // USE_DIR_HIST
+
+// TD_HC_2: 15 tables (matching TageAheadHC_IR), LINEINST=256
+using TD_HC_2 = TageDirect<TD_HC2_TC,
+                         td::TDDefaultAllocConfig,
+                         256,   // LINEINST (matches HC_IR)
+                         7,     // N
+                         8, 2,  // DECAY_CTR, DECAY_GRAN
                          td::TDDecayMild,
                          true, 8192, // P1_USE_GSHARE, P1_TABLE_SIZE
                          6,     // P1_HIST

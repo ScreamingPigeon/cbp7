@@ -275,6 +275,16 @@ QUICK_OUT ?= out/quick
 quick-eval: $(BUILD_DIR)/cbp-$(PRED_HASH)
 	scripts/quick_eval.sh ./$(BUILD_DIR)/cbp-$(PRED_HASH) $(TRACE_DIR) $(QUICK_OUT) $(QUICK_JOBS)
 
+# Energy breakdown: logic vs fanout vs wiring vs RAM
+# Usage: make diff-energy PRED_A=TageAheadHC_IR PRED_B=example_tage
+# Single predictor: make diff-energy PRED_A=TageAheadHC_IR
+DIFF_ENERGY_JOBS ?= $(QUICK_JOBS)
+diff-energy:
+	$(PYTHON) scripts/energy_breakdown.py '$(PRED_A)' $(if $(PRED_B),'$(PRED_B)') \
+		--traces $(TRACE_DIR) --jobs $(DIFF_ENERGY_JOBS) \
+		--warmup $(WARMUP) --measure $(MEASURE) \
+		--build-dir $(BUILD_DIR)
+
 # Compare two predictors on the representative subset
 quick-eval-all: | $(BUILD_DIR)
 	@echo "=== Building and evaluating: $(PRED_A) ==="

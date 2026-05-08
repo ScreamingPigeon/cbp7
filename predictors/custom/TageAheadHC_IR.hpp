@@ -19,7 +19,8 @@ using namespace hcm;
 //   T5-13: 2048 entries (IDX=11, HYST=1024)
 // ============================================================================
 
-struct TageAheadHC_IR : predictor {
+template <u64 LINEINST_V = 256>
+struct TageAheadHC_IR_impl : predictor {
 
   // ======== Constants (hardcoded from S3_MW4_MC2048 + BPE1) ========
   static constexpr u64 NT = 15;           // number of tables
@@ -31,8 +32,8 @@ struct TageAheadHC_IR : predictor {
   static constexpr u64 U_WIDTH = 2;
   static constexpr u64 TAG_WIDTH = 11;    // UniformTag<11>
   static constexpr u64 MAXHIST = 200;
-  static constexpr u64 LINEINST = 256;
-  static constexpr u64 LOGLINEINST = 8;   // clog2(256)
+  static constexpr u64 LINEINST = LINEINST_V;
+  static constexpr u64 LOGLINEINST = []() constexpr { u64 x = LINEINST_V, r = 0; while (x > 1) { x >>= 1; r++; } return r; }();
   static constexpr u64 FB_CAPACITY = 8192;
   static constexpr u64 FB_IDX_BITS = 13;  // clog2(8192)
   static constexpr u64 FB_BH_CAPACITY = FB_CAPACITY / 2;
@@ -1183,3 +1184,7 @@ struct TageAheadHC_IR : predictor {
     last_condbr_dir = branch_dir[num_branch - 1];
   }
 };
+
+using TageAheadHC_IR    = TageAheadHC_IR_impl<256>;
+using TageAheadHC_IR_32 = TageAheadHC_IR_impl<32>;
+using TageAheadHC_IR_16 = TageAheadHC_IR_impl<16>;

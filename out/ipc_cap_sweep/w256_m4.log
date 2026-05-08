@@ -1,0 +1,56 @@
+Running 20 representative traces (8 parallel jobs)...
+  done: 554-roms-1_62613
+  done: 508-namd-1_126793
+  done: 505-mcf-1_14364
+  done: llvm-2.25945_0
+  done: gcc-1.52513_0
+  done: 548-exchange2-1_207156
+  done: java16-specjbb-64k-ir1000.19011_0
+  done: 531-deepsjeng-1_53703
+  done: dcapo-kafka-jdk8.524_0
+  done: 502-gcc-all_16112
+  done: zstd-1.19139_0
+  done: rsbench-1.730_0
+  done: sampleflow-1.127768_0
+  done: nodejs-octane_3483
+  done: nodejs-http2_4818
+  done: gap-sssp-usroad.287_0
+  done: lua-3.25585_0
+  done: web_130
+  done: web_74
+  done: python3-pyperf-dulwich.2000_0
+
+=== Quick Eval: 20/20 traces completed ===
+
+Trace                                             MPKI  EPI(fJ)    P2lat  IPC_cbp
+-----                                             ----  -------    -----  -------
+502-gcc-all_16112                               14.614     3877 0.993333    6.492
+505-mcf-1_14364                                 17.154     1809 0.993333   12.567
+508-namd-1_126793                                4.905     1114 0.993333   11.361
+531-deepsjeng-1_53703                           11.841     1984 0.993333   12.131
+548-exchange2-1_207156                           4.885     2005 0.993333   10.126
+554-roms-1_62613                                 0.191      439 0.993333    8.099
+dcapo-kafka-jdk8.524_0                           4.277     2363 0.993333    7.658
+gap-sssp-usroad.287_0                           31.613     2052 0.993333    9.952
+gcc-1.52513_0                                   10.943     3757 0.993333    6.729
+java16-specjbb-64k-ir1000.19011_0                4.001     2340 0.993333    8.841
+llvm-2.25945_0                                   8.681     3516 0.993333    7.288
+lua-3.25585_0                                    2.164     3621 0.993333    6.837
+nodejs-http2_4818                                7.158     3326 0.993333    7.107
+nodejs-octane_3483                               6.049     3465 0.993333    6.609
+python3-pyperf-dulwich.2000_0                    3.719     3180 0.993333    7.307
+rsbench-1.730_0                                 40.650     3545 0.993333    6.222
+sampleflow-1.127768_0                            3.321     2679 0.993333    7.871
+web_130                                          4.893     3080 0.993333    7.560
+web_74                                           5.147     3092 0.993333    7.349
+zstd-1.19139_0                                   7.511     1389 0.993333   11.652
+
+=== Aggregate (20 traces) ===
+  IPC_cbp:  8.086136
+  CPI_cbp:  0.087174
+  EPI(fJ):  2631.650000
+  MPI:      0.009686
+  VFS:      0.867427
+
+Full results in: out/ipc_cap_sweep/w256_m4/
+To run ALL 168 traces: mkdir -p out/full && ./run_all ./build/cbp-cap-w256_m4 ./traces out/full
