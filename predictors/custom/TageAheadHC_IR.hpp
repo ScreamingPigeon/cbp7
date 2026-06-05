@@ -61,13 +61,13 @@ struct TageAheadHC_IR_impl : predictor {
   static constexpr u64 FB_PRED_BITS = N * CTR_WIDTH; // = 7, fallback stays N-wide
   static constexpr u64 HTAG_WIDTH = TAG_WIDTH - GROUP_BITS; // = 8 (max, for pipeline regs)
 
-  // GradedTag<11,7>: T0 (short hist) → 7, T13 (long hist) → 11
-  // Formula: 7 + 4*i/13
+  // GradedTag<11,7>: T0 (long hist) → 11, T14 (short hist) → 7
+  // Formula: 11 - 4*i/13
   static constexpr std::array<u64, NT> PER_TABLE_TAG = {
-    7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11
+    11, 11, 10, 10, 10, 9, 9, 9, 8, 8, 8, 7, 7, 7, 7
   };
   static constexpr std::array<u64, NT> PER_TABLE_HTAG = {
-    4, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8
+    8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4
   };
 
   // Per-table sizes: T0 bumped to 1024 (was GradedSize<512, 2048>)
