@@ -19,7 +19,7 @@ using namespace hcm;
 //   T5-13: 2048 entries (IDX=11, HYST=1024)
 // ============================================================================
 
-template <u64 LINEINST_V = 256>
+template <u64 LINEINST_V = 256, bool UNIFORM_TAG_V = false, u64 MINHIST_V = 8>
 struct TageAheadHC_IR_impl : predictor {
 
   // ======== Constants (hardcoded from S3_MW4_MC2048 + BPE1) ========
@@ -61,14 +61,14 @@ struct TageAheadHC_IR_impl : predictor {
   static constexpr u64 FB_PRED_BITS = N * CTR_WIDTH; // = 7, fallback stays N-wide
   static constexpr u64 HTAG_WIDTH = TAG_WIDTH - GROUP_BITS; // = 8 (max, for pipeline regs)
 
-  // GradedTag<11,7>: T0 (long hist) → 11, T14 (short hist) → 7
-  // Formula: 11 - 4*i/13
-  static constexpr std::array<u64, NT> PER_TABLE_TAG = {
-    11, 11, 10, 10, 10, 9, 9, 9, 8, 8, 8, 7, 7, 7, 7
-  };
-  static constexpr std::array<u64, NT> PER_TABLE_HTAG = {
-    8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4
-  };
+  // Tag grading: UNIFORM_TAG_V=false → GradedTag<11,7> (T0 long hist → 11, T14 short → 7)
+  //              UNIFORM_TAG_V=true  → UniformTag<11> (all tables 11-bit, 8-bit htag)
+  static constexpr std::array<u64, NT> PER_TABLE_TAG = UNIFORM_TAG_V
+    ? std::array<u64, NT>{11,11,11,11,11,11,11,11,11,11,11,11,11,11,11}
+    : std::array<u64, NT>{11,11,10,10,10, 9, 9, 9, 8, 8, 8, 7, 7, 7, 7};
+  static constexpr std::array<u64, NT> PER_TABLE_HTAG = UNIFORM_TAG_V
+    ? std::array<u64, NT>{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8}
+    : std::array<u64, NT>{ 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4};
 
   // Per-table sizes: T0 bumped to 1024 (was GradedSize<512, 2048>)
   static constexpr std::array<u64, NT> TABLE_SIZE = {
@@ -77,7 +77,7 @@ struct TageAheadHC_IR_impl : predictor {
   };
   // Per-table history lengths: geometric_hist<14>(8, 200)
   static constexpr std::array<u64, NT> HIST_LEN =
-      ta::geometric_hist<NT>(8, 200);
+      ta::geometric_hist<NT>(MINHIST_V, 200);
   // Per-table IDX bits
   static constexpr std::array<u64, NT> IDX_BITS = {
     10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11
@@ -1185,6 +1185,8 @@ struct TageAheadHC_IR_impl : predictor {
   }
 };
 
-using TageAheadHC_IR    = TageAheadHC_IR_impl<256>;
-using TageAheadHC_IR_32 = TageAheadHC_IR_impl<32>;
-using TageAheadHC_IR_16 = TageAheadHC_IR_impl<16>;
+using TageAheadHC_IR      = TageAheadHC_IR_impl<256, false, 8>;
+using TageAheadHC_IR_U11  = TageAheadHC_IR_impl<256, true,  8>;
+using TageAheadHC_IR_M2   = TageAheadHC_IR_impl<256, false, 2>;
+using TageAheadHC_IR_32   = TageAheadHC_IR_impl<32,  false, 8>;
+using TageAheadHC_IR_16   = TageAheadHC_IR_impl<16,  false, 8>;
