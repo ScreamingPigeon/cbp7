@@ -1,6 +1,8 @@
 #include "predictors/always_taken.hpp"
 #include "predictors/bimodal.hpp"
 #include "predictors/bimodalN.hpp"
+#include "predictors/bimodalA.hpp"
+#include "predictors/bimodalB.hpp"
 #include "predictors/custom/Tage.hpp"
 #include "predictors/custom/TageAhead.hpp"
 #include "predictors/custom/TageAheadHC.hpp"
@@ -28,6 +30,14 @@ using TageDefault256 = tage<10>;
 // Matches TageAheadHC_IR storage/floorplan for wire-cost-vs-design isolation.
 //   tage<LOGLB=10, NUMG=15, LOGG=10, LOGB=12, TAGW=11, GHIST=200, LOGP1=14, GHIST1=6, SHARED_HYS=false>
 using TageDefaultRABT = tage<6, 15, 10, 12, 11, 200, 14, 6, false>;
+
+// Standalone bimodal-only predictors to isolate indexing impact (no TAGE,
+// no overrider, no history). Apples-to-apples comparison of:
+//   BimodalA: tage<>-style per-line-offset tables, block-PC indexed
+//   BimodalB: RABT-style single shared table, instruction-PC indexed,
+//             bit selected by conditional-branch ordinal within block.
+using BimodalA_TageStyle = bimodalA<6, 12>;   // LOGLB=6 (LINEINST=16), LOGB=12; 16 × 256 × 1b = 4 Kbit (+ hyst)
+using BimodalB_RABTStyle = bimodalB<13, 7>;   // LOGB=13 (8192 entries), N=7; 8192 × 7b = 57 Kbit (+ hyst)
 
 // ============================================================================
 // Competition configs: 1-cycle and 2-cycle tracks

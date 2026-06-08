@@ -513,23 +513,28 @@ def main():
         import matplotlib.pyplot as plt
         import numpy as np
 
-        fig, (ax_cdf, ax_pdf) = plt.subplots(1, 2, figsize=(14, 5))
+        fig, (ax_count, ax_pdf) = plt.subplots(1, 2, figsize=(14, 5))
         palette = plt.cm.tab10.colors
+        # Shared bin grid across predictors so the line plot stays comparable
+        all_d = np.concatenate([np.asarray(m["_hub_dists_um"]) for _, _, m in results])
+        bins = np.linspace(0, float(all_d.max()), 41) if all_d.size else np.linspace(0, 1, 41)
+        centers = 0.5 * (bins[1:] + bins[:-1])
         for i, (name, _, m) in enumerate(results):
-            d = np.array(m["_hub_dists_um"])
-            d_sorted = np.sort(d)
-            cdf = np.arange(1, len(d_sorted)+1) / len(d_sorted)
+            d = np.asarray(m["_hub_dists_um"])
             color = palette[i % len(palette)]
-            ax_cdf.plot(d_sorted, cdf, "-", color=color, linewidth=2,
-                        label=f"{name} (n={len(d)})")
-            ax_pdf.hist(d, bins=40, color=color, alpha=0.45,
+            # CDF-shaped curve, but y = absolute cumulative count of wires
+            d_sorted = np.sort(d)
+            cum_count = np.arange(1, len(d_sorted) + 1)
+            ax_count.plot(d_sorted, cum_count, "-", color=color, linewidth=2,
+                          label=f"{name} (n={len(d)})")
+            ax_pdf.hist(d, bins=bins, color=color, alpha=0.45,
                         label=f"{name}", edgecolor=color, linewidth=1)
 
-        ax_cdf.set_xlabel("RAM → register-hub Manhattan distance (μm)")
-        ax_cdf.set_ylabel("CDF")
-        ax_cdf.set_title("CDF of RAM → register-hub wire lengths")
-        ax_cdf.grid(True, alpha=0.3)
-        ax_cdf.legend(fontsize=9, loc="lower right")
+        ax_count.set_xlabel("RAM → register-hub Manhattan distance (μm)")
+        ax_count.set_ylabel("Cumulative # wires (≤ x)")
+        ax_count.set_title("Cumulative wire-count vs length")
+        ax_count.grid(True, alpha=0.3)
+        ax_count.legend(fontsize=9, loc="lower right")
 
         ax_pdf.set_xlabel("RAM → register-hub Manhattan distance (μm)")
         ax_pdf.set_ylabel("count")

@@ -7,9 +7,10 @@ Produces three figures:
               extrapolated from per_trace_power.py 20-trace fractions to the
               full 168-trace EPI distribution.
 
-  best-worst  Top-10 best + top-10 worst EPI deltas per trace (full eval),
-              horizontal bars colored by inst/cycle to reveal the LINEINST
-              amortization story (low-density loops → high inst/cycle → win).
+  best-worst  Top-5 best + top-5 worst EPI deltas per trace (full eval),
+              shown as per-trace stacked component estimates for 2 or 3
+              predictors. Components use 20-trace fractions applied to each
+              full-eval per-trace EPI.
 
   scaling     Three scatter panels of structural metrics vs wiring EPI:
               storage, Σ hub Manhattan, and #wires.
@@ -26,6 +27,7 @@ Usage:
   python3 scripts/comparative_analysis.py [--mode {breakdown,best-worst,scaling,all}]
                                           [--out-dir DIR]
                                           [--name-a NAME] [--name-b NAME]
+                                          [--best-worst-names NAME NAME [NAME]]
 """
 
 import argparse
@@ -37,6 +39,7 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -57,7 +60,7 @@ PREDICTORS = {
         "ptp_csv":    "out/ptp_TageDefaultRABT_quick.csv",
         "panel":      "out/ptp_TageDefaultRABT_panel.txt",
         "floorplan":  "out/floorplans/TageDefaultRABT.gv",
-        "full_eval":  None,  # no full eval available
+        "full_eval":  "full_out/default_tage_rabt",
     },
     "TageAheadHC_IR": {
         "label":      "RABT (MINHIST=8)",
@@ -101,6 +104,41 @@ def component_fractions(ptp_rows):
         for k in fracs:
             fracs[k].append(float(r[f"epi_{k}"]) / b)
     return {k: (np.mean(v) if v else 0.0) for k, v in fracs.items()}
+
+
+def component_fraction_by_trace(ptp_rows):
+    """Returns trace_name -> component fractions of baseline EPI."""
+    if not ptp_rows:
+        return None
+    out = {}
+    for r in ptp_rows:
+        b = float(r["epi_baseline"])
+        if b <= 0:
+            continue
+        out[r["trace"]] = {
+            k: float(r[f"epi_{k}"]) / b
+            for k in ("ram_logic", "fanout", "wiring", "other")
+        }
+    return out
+
+
+def predictor_tone(idx, count):
+    if count <= 1:
+        return 0.0
+    return np.linspace(0.45, -0.25, count)[idx]
+
+
+def apply_tone(color, tone):
+    rgb = np.array(mcolors.to_rgb(color))
+    if tone >= 0:
+        rgb = rgb + (1.0 - rgb) * tone
+    else:
+        rgb = rgb * (1.0 + tone)
+    return mcolors.to_hex(np.clip(rgb, 0.0, 1.0))
+
+
+def toned_color(color, pred_idx, pred_count):
+    return apply_tone(color, predictor_tone(pred_idx, pred_count))
 
 
 def load_full_eval(directory):
@@ -234,73 +272,127 @@ def fig_breakdown(name_a, name_b, out_path):
     print(f"  → {out_path}")
 
 
-# ── Fig 2: Best/worst per-trace EPI deltas (full eval) ──────────────────────
+# ── Fig 2: Best/worst per-trace component breakdowns ────────────────────────
 
-def fig_best_worst(name_a, name_b, top_n, out_path):
-    pa, pb = PREDICTORS[name_a], PREDICTORS[name_b]
-    fa = load_full_eval(pa["full_eval"])
-    fb = load_full_eval(pb["full_eval"])
-    if not (fa and fb):
-        print(f"[best-worst] missing full eval for {name_a} or {name_b}", file=sys.stderr)
+def fig_best_worst(names, top_n, out_path):
+    if len(names) < 2 or len(names) > 3:
+        print("[best-worst] pass 2 or 3 predictors", file=sys.stderr)
         return
-    common = sorted(set(fa) & set(fb))
+    preds = []
+    for name in names:
+        p = PREDICTORS[name]
+        full = load_full_eval(p["full_eval"])
+        ptp_rows = load_ptp_csv(p["ptp_csv"])
+        trace_fracs = component_fraction_by_trace(ptp_rows)
+        mean_fracs = component_fractions(ptp_rows)
+        if not (full and trace_fracs and mean_fracs):
+            print(f"[best-worst] missing inputs for {name}", file=sys.stderr)
+            return
+        preds.append({
+            "name": name,
+            "label": p["label"],
+            "full": full,
+            "trace_fracs": trace_fracs,
+            "mean_fracs": mean_fracs,
+        })
 
-    # Δ = B - A (positive: B is worse / more energy than A)
-    rows = []
+    common = set(preds[0]["full"].keys())
+    for p in preds[1:]:
+        common &= set(p["full"].keys())
+    if not common:
+        print("[best-worst] no common full-eval traces", file=sys.stderr)
+        return
+
+    # Δ = last - first (positive: last predictor uses more energy)
+    first, last = preds[0], preds[-1]
+    ranked = []
     for t in common:
-        va, vb = fa[t], fb[t]
-        d = vb["epi"] - va["epi"]
-        cyc_a = va["npred"] + va["extra"]
-        cyc_b = vb["npred"] + vb["extra"]
-        ipc_b = vb["ninstr"] / cyc_b if cyc_b else 0.0
-        rows.append({"trace": t, "delta": d, "epi_a": va["epi"], "epi_b": vb["epi"],
-                     "ipc_b": ipc_b})
-    rows.sort(key=lambda r: r["delta"])
-    best  = rows[:top_n]                  # B wins (most negative delta)
-    worst = rows[-top_n:][::-1]           # B loses (most positive delta)
+        ranked.append({
+            "trace": t,
+            "delta": last["full"][t]["epi"] - first["full"][t]["epi"],
+        })
+    ranked.sort(key=lambda r: r["delta"])
+    selected = ranked[:top_n] + ranked[-top_n:]
+    selected_traces = [r["trace"] for r in selected]
+    split_at = len(ranked[:top_n])
 
-    # Stack: best on top, worst on bottom of a single figure
-    fig, (ax_b, ax_w) = plt.subplots(2, 1, figsize=(12, 10), sharex=False)
-    cmap = plt.cm.viridis
-    ipc_vals = [r["ipc_b"] for r in best + worst]
-    ipc_min, ipc_max = min(ipc_vals), max(ipc_vals)
-    def color_for(ipc):
-        return cmap((ipc - ipc_min) / max(ipc_max - ipc_min, 1e-9))
+    comps = ["ram_logic", "fanout", "wiring"]
+    colors = {"ram_logic": "#4C72B0", "fanout": "#DD8452", "wiring": "#55A467"}
+    labels = {"ram_logic": "RAM + Logic", "fanout": "Fanout", "wiring": "Wiring"}
 
-    def draw(ax, rows, title):
-        rows = list(rows)
-        names = [r["trace"].split("_")[0].split(".")[0][:22] for r in rows]
-        deltas = [r["delta"] for r in rows]
-        ipcs   = [r["ipc_b"] for r in rows]
-        colors = [color_for(i) for i in ipcs]
-        y = np.arange(len(rows))
-        ax.barh(y, deltas, color=colors, edgecolor="black", linewidth=0.3)
-        ax.set_yticks(y)
-        ax.set_yticklabels(names, fontsize=8)
-        ax.invert_yaxis()
-        ax.axvline(0, color="black", linewidth=0.6)
-        ax.set_xlabel("Δ EPI (fJ/inst):  {} − {}".format(pb["label"], pa["label"]),
-                      fontsize=10)
-        ax.set_title(title, fontsize=11)
-        ax.grid(axis="x", alpha=0.3)
-        # Annotate each bar with inst/cycle
-        for yi, (d, ipc) in enumerate(zip(deltas, ipcs)):
-            ax.text(d * 1.02 if d >= 0 else d * 0.98, yi, f"{ipc:.1f} ic",
-                    va="center",
-                    ha="left" if d >= 0 else "right",
-                    fontsize=7, color="black", alpha=0.9)
+    def estimate_components(pred, trace):
+        fracs = pred["trace_fracs"].get(trace, pred["mean_fracs"])
+        total = pred["full"][trace]["epi"]
+        vals = [total * fracs[c] for c in comps]
+        frac_sum = sum(fracs[c] for c in comps)
+        if frac_sum > 0:
+            scale = total / sum(vals) if sum(vals) else 0.0
+            vals = [v * scale for v in vals]
+        return vals
 
-    draw(ax_b, best,  f"Top {top_n} traces where {pb['label']} WINS (most negative Δ EPI)")
-    draw(ax_w, worst, f"Top {top_n} traces where {pb['label']} LOSES (most positive Δ EPI)")
+    fig, ax = plt.subplots(figsize=(14, 6.5))
+    x = np.arange(len(selected_traces))
+    group_w = 0.82
+    bar_w = group_w / len(preds)
+    offsets = [(-group_w / 2) + (i + 0.5) * bar_w for i in range(len(preds))]
 
-    # Colorbar for inst/cycle
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=ipc_min, vmax=ipc_max))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=[ax_b, ax_w], orientation="vertical",
-                        fraction=0.02, pad=0.04)
-    cbar.set_label(f"{pb['label']} inst / prediction-cycle (LINEINST amortization)",
-                   fontsize=9)
+    for i, pred in enumerate(preds):
+        bottoms = np.zeros(len(selected_traces))
+        for comp in comps:
+            vals = np.array([
+                estimate_components(pred, t)[comps.index(comp)]
+                for t in selected_traces
+            ])
+            ax.bar(x + offsets[i], vals, bar_w, bottom=bottoms,
+                   color=toned_color(colors[comp], i, len(preds)),
+                   edgecolor="black", linewidth=0.35,
+                   label=labels[comp] if i == 0 else None)
+            bottoms += vals
+        for xi, total in zip(x + offsets[i], bottoms):
+            ax.text(xi, total + max(bottoms) * 0.015, f"{total:.0f}",
+                    ha="center", va="bottom", fontsize=7, rotation=90)
 
+    if split_at and split_at < len(selected_traces):
+        ax.axvline(split_at - 0.5, color="black", linewidth=0.8, alpha=0.55)
+        ymax = ax.get_ylim()[1]
+        ax.text((split_at - 1) / 2, ymax * 0.98,
+                f"Top {top_n}: improved / increased least",
+                ha="center", va="top", fontsize=9, fontweight="bold")
+        ax.text(split_at + (len(selected_traces) - split_at - 1) / 2, ymax * 0.98,
+                f"Top {top_n}: increased most",
+                ha="center", va="top", fontsize=9, fontweight="bold")
+
+    trace_labels = [t[:24] for t in selected_traces]
+    ax.set_xticks(x)
+    ax.set_xticklabels(trace_labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Estimated EPI breakdown (fJ / instruction)", fontsize=10)
+    ax.set_title("Per-trace power breakdown for best/worst full-eval EPI deltas\n"
+                 f"ranked by {last['label']} − {first['label']}",
+                 fontsize=11)
+    ax.grid(axis="y", alpha=0.3)
+
+    comp_handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors[c], edgecolor="black",
+                      linewidth=0.35, label=labels[c])
+        for c in comps
+    ]
+    comp_legend = ax.legend(handles=comp_handles, title="Power category",
+                            loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                            fontsize=8, title_fontsize=8)
+    ax.add_artist(comp_legend)
+
+    pred_handles = [
+        plt.Rectangle((0, 0), 1, 1,
+                      facecolor=toned_color("#666666", i, len(preds)),
+                      edgecolor="black",
+                      linewidth=0.35, label=p["label"])
+        for i, p in enumerate(preds)
+    ]
+    ax.legend(handles=pred_handles, title="Predictor",
+              loc="upper left", bbox_to_anchor=(1.01, 0.78),
+              fontsize=8, title_fontsize=8)
+
+    fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"  → {out_path}")
 
@@ -380,11 +472,14 @@ def main():
                     help="primary predictor A (breakdown / best-worst)")
     ap.add_argument("--name-b", default="TageAheadHC_IR_M2",
                     help="primary predictor B (breakdown / best-worst)")
+    ap.add_argument("--best-worst-names", nargs="+", default=None,
+                    help="2 or 3 predictors for figure 2; first is baseline, "
+                         "last is used for trace ranking")
     ap.add_argument("--scaling-names", nargs="+",
                     default=["TageDefault", "TageDefaultRABT",
                              "TageAheadHC_IR", "TageAheadHC_IR_M2"],
                     help="predictors to include in scaling fig")
-    ap.add_argument("--top-n", type=int, default=10,
+    ap.add_argument("--top-n", type=int, default=5,
                     help="best/worst trace count per side")
     ap.add_argument("--out-dir", default="out/comparative")
     args = ap.parse_args()
@@ -397,7 +492,8 @@ def main():
                       str(Path(args.out_dir) / "fig1_breakdown.png"))
     if args.mode in ("best-worst", "all"):
         print(f"Fig 2: best/worst top-{args.top_n} traces")
-        fig_best_worst(args.name_a, args.name_b, args.top_n,
+        best_worst_names = args.best_worst_names or [args.name_a, args.name_b]
+        fig_best_worst(best_worst_names, args.top_n,
                        str(Path(args.out_dir) / "fig2_best_worst.png"))
     if args.mode in ("scaling", "all"):
         print("Fig 3: scaling")
