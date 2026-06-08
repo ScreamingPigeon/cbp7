@@ -9,7 +9,7 @@ trace set, then decomposes EPI per trace into:
   Wiring    = EPI(FREE_FANOUT)         - RAM+Logic
   Other     = EPI(baseline)            - RAM+Logic - Fanout - Wiring
 
-Also computes EPPC (Energy Per Prediction Cycle) = energy / (npred + extra),
+Also computes EPC (Energy Per Prediction Cycle) = energy / (npred + extra),
 which normalizes out MPKI-driven block-stretching effects on EPI.
 
 Also dumps the HARCOM panel info (-DDEBUG_PRINT) and floorplan PDF once.
@@ -282,15 +282,15 @@ def main():
         other     = epi_b - ram_logic - fanout - wiring
 
         cycles = npred + extra
-        # convert EPI (fJ/instr) to energy (fJ), then to EPPC (fJ/cycle)
+        # convert EPI (fJ/instr) to energy (fJ), then to EPC (fJ/cycle)
         if cycles > 0:
-            eppc_base   = epi_b  * ninstr / cycles
-            eppc_ram    = ram_logic * ninstr / cycles
-            eppc_fanout = fanout * ninstr / cycles
-            eppc_wiring = wiring * ninstr / cycles
-            eppc_other  = other  * ninstr / cycles
+            epc_base   = epi_b  * ninstr / cycles
+            epc_ram    = ram_logic * ninstr / cycles
+            epc_fanout = fanout * ninstr / cycles
+            epc_wiring = wiring * ninstr / cycles
+            epc_other  = other  * ninstr / cycles
         else:
-            eppc_base = eppc_ram = eppc_fanout = eppc_wiring = eppc_other = 0.0
+            epc_base = epc_ram = epc_fanout = epc_wiring = epc_other = 0.0
 
         mpki = 1000.0 * misp / ninstr if ninstr > 0 else 0.0
         rows.append({
@@ -304,11 +304,11 @@ def main():
             "epi_fanout": fanout,
             "epi_wiring": wiring,
             "epi_other": other,
-            "eppc_baseline": eppc_base,
-            "eppc_ram_logic": eppc_ram,
-            "eppc_fanout": eppc_fanout,
-            "eppc_wiring": eppc_wiring,
-            "eppc_other": eppc_other,
+            "epc_baseline": epc_base,
+            "epc_ram_logic": epc_ram,
+            "epc_fanout": epc_fanout,
+            "epc_wiring": epc_wiring,
+            "epc_other": epc_other,
         })
 
     # 5. Write CSV
@@ -330,8 +330,8 @@ def main():
     tot_cycles = sum(r["npred"] + r["extra"] for r in rows)
     def w_epi(key):
         return sum(r[key] * r["ninstr"] for r in rows) / tot_inst
-    def w_eppc(key):
-        return sum(r[key.replace("eppc", "epi")] * r["ninstr"]
+    def w_epc(key):
+        return sum(r[key.replace("epc", "epi")] * r["ninstr"]
                    for r in rows) / tot_cycles
 
     base  = w_epi("epi_baseline")
@@ -340,23 +340,23 @@ def main():
     wir   = w_epi("epi_wiring")
     oth   = w_epi("epi_other")
 
-    eppc_base = w_eppc("eppc_baseline")
-    eppc_ram  = w_eppc("eppc_ram_logic")
-    eppc_fan  = w_eppc("eppc_fanout")
-    eppc_wir  = w_eppc("eppc_wiring")
-    eppc_oth  = w_eppc("eppc_other")
+    epc_base = w_epc("epc_baseline")
+    epc_ram  = w_epc("epc_ram_logic")
+    epc_fan  = w_epc("epc_fanout")
+    epc_wir  = w_epc("epc_wiring")
+    epc_oth  = w_epc("epc_other")
 
     print(f"\n{'='*60}")
     print(f"  Aggregate (instruction-weighted, {len(rows)} traces)")
     print(f"{'='*60}")
-    print(f"  {'Component':<14} {'EPI (fJ/inst)':>16} {'EPPC (fJ/cyc)':>16}")
+    print(f"  {'Component':<14} {'EPI (fJ/inst)':>16} {'EPC (fJ/cyc)':>16}")
     print(f"  {'-'*14} {'-'*16} {'-'*16}")
     for label, e, ep in [
-        ("Baseline",  base, eppc_base),
-        ("RAM+Logic", ram,  eppc_ram),
-        ("Fanout",    fan,  eppc_fan),
-        ("Wiring",    wir,  eppc_wir),
-        ("Other",     oth,  eppc_oth),
+        ("Baseline",  base, epc_base),
+        ("RAM+Logic", ram,  epc_ram),
+        ("Fanout",    fan,  epc_fan),
+        ("Wiring",    wir,  epc_wir),
+        ("Other",     oth,  epc_oth),
     ]:
         pct = 100.0 * e / base if base else 0.0
         bar = "█" * int(pct / 2)

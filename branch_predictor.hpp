@@ -24,6 +24,10 @@ template <auto... Args> using perceptron = experiment_perceptron<Args...>;
 using TageDefault = tage<>;
 // LINEINST=256 variant (LOGLB=10): matches TageAheadHC_IR block size for fair comparison
 using TageDefault256 = tage<10>;
+// RABT-scaled tage<>: 15 tables × 1024 entries, LINEINST=256, MAXHIST=200
+// Matches TageAheadHC_IR storage/floorplan for wire-cost-vs-design isolation.
+//   tage<LOGLB=10, NUMG=15, LOGG=10, LOGB=12, TAGW=11, GHIST=200, LOGP1=14, GHIST1=6, SHARED_HYS=false>
+using TageDefaultRABT = tage<6, 15, 10, 12, 11, 200, 14, 6, false>;
 
 // ============================================================================
 // Competition configs: 1-cycle and 2-cycle tracks

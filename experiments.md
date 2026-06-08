@@ -1169,3 +1169,152 @@ forcing longer inter-bank wires that switch every prediction cycle.
   the wires between them are.
 
 Script: `scripts/per_trace_power.py --predictor <P> [--trace <T>|--quick|--full]`
+
+---
+
+## Power Investigation: RABT vs example TAGE — full decomposition (2026-06-08)
+
+Built three analysis scripts:
+- `scripts/per_trace_power.py` — EPI decomposition via HARCOM `FREE_WIRING`/`FREE_FANOUT` rebuilds; adds EPC (Energy Per prediction Cycle).
+- `scripts/dump_floorplan.py` — builds with `-DFLOORPLAN`, dumps per-predictor `floorplan.gv`.
+- `scripts/wire_length_analyzer.py` — parses `.gv`, computes Σ all-pair Manhattan distance.
+
+### Starting puzzle
+
+| Predictor | Storage | EPI (fJ/inst) | Ratio |
+|---|---|---|---|
+| TageDefault | 288 Kbit | 1183 | 1.0× |
+| TageAheadHC_IR_M2 | 617 Kbit | 2560 | **2.16×** |
+
+Storage 2.14×, energy 2.16× — looks proportional. But the decomposition is not.
+
+### EPI decomposition (20-trace quick, instruction-weighted)
+
+| Component | tage<> | M2 | Δ% |
+|---|---|---|---|
+| Baseline | 1183 | 2560 | +119% |
+| RAM+Logic | 663 | 766 | **+16%** |
+| Fanout | 27 | 23 | −12% |
+| **Wiring** | **487** | **1765** | **+267%** |
+
+**93% of the +1410 fJ/inst gap is wiring.** RAM+logic essentially flat.
+
+### Panel data (storage vs power)
+
+| Metric | tage<> | RABT |
+|---|---|---|
+| Storage | 288 Kbit | 617 Kbit (2.14×) |
+| Transistors | 2.01M | 4.26M (2.12×) |
+| SRAM area | 0.0132 mm² | 0.0265 mm² (2.01×) |
+| Static power | 0.41 mW | 0.90 mW (2.20×) |
+| **Dynamic power** | **25.6 mW** | **85.9 mW** (3.36×) |
+
+Static tracks transistors; dynamic far outpaces storage growth.
+
+### EPC reveals true structural cost
+
+EPI is inflated by mispredicts (each forces an extra block-end cycle).
+EPC = energy / (npred + extra) is MPKI-agnostic.
+
+| | EPI ratio | EPC ratio |
+|---|---|---|
+| RABT / tage<> | 2.16× | **3.36×** |
+
+RABT's structural per-cycle cost is 3.36×; EPI hides part of this via wider block amortization:
+
+| | Mean inst/cycle (167 traces) |
+|---|---|
+| tage<> (LINEINST=16) | 6.41 |
+| RABT (LINEINST=256) | 10.76 |
+
+RABT amortizes its expensive cycles over 1.68× more retired instructions.
+Top FP traces (fp_28, 554-roms) hit ~65 inst/cycle on RABT vs ~14 on tage<>.
+
+### Matched-storage control: TageDefaultRABT
+
+Added `using TageDefaultRABT = tage<6, 15, 10, 12, 11, 200, 14, 6, false>` —
+tage<> scaled to RABT's NUMG=15 and 1024-entry tables (~matched storage).
+
+Wiring on 502-gcc-all_16112:
+
+| | Storage | Wiring (fJ/inst) |
+|---|---|---|
+| tage<> NUMG=8 | 288 Kbit | 632 |
+| tage<>@RABT NUMG=15 | ~290 Kbit | 1010 |
+| RABT M2 NUMG=15 | 617 Kbit | 2644 |
+
+Scaling tage<>'s table count 8→15 at matched storage: +378 fJ/inst (1.6×).
+RABT at same NUMG=15 is **2.6× higher** — architectural, not topology.
+
+### Architectural cause (subagent)
+
+| Predictor | Banking | sec_tag | RAM census |
+|---|---|---|---|
+| tage<> | 4-way (hyst/u only) | none | ~30 logical |
+| RABT | 8-way (pred/hyst/u) | yes (15 × 5-bit) | ~390 instances |
+
+### Wire-length analysis (`floorplan.gv` parsing)
+
+| Predictor | N_RAMs | area mm² | bbox mm² | **Σ pair (mm)** |
+|---|---|---|---|---|
+| TageDefault | 144 | 0.0132 | 0.0190 | **894** |
+| TageDefaultRABT | 214 | 0.0131 | 0.0186 | **1848** |
+| TageAheadHC_IR_M2 | 408 | 0.0265 | 0.0349 | **10065** |
+
+(HARCOM auto-banks even "monolithic" tage<> RAMs into sub-arrays; N_RAMs > logical table count, but relative growth tells the story.)
+
+### KEY INSIGHT: length × activity decomposition
+
+Comparing length ratios to wire-energy ratios:
+
+**TageDefault → TageDefaultRABT** (NUMG 8 → 15, matched storage):
+- Σ length ratio: **2.07×** | Wiring energy ratio: **2.07×** | ✓ identical, pure geometry.
+
+**TageDefault → RABT M2** (NUMG 8 → 15 + banking + sec_tag):
+- Σ length ratio: **11.3×** | Wiring energy ratio: **3.63×**
+- Implied activity factor ratio: 3.63 / 11.3 = **0.32**
+
+**RABT's per-wire activity is ~1/3 of tage<>'s.** The 8-way banking spreads each
+access over 8 sub-banks (only 1 returns data; 7/8 of wires idle per cycle).
+Banking deliberately trades **activity for length**:
+- 11× more wire length × 1/3 activity ≈ 3.6× wire energy.
+
+### The integrated story
+
+RABT's 2.16× energy premium is ~entirely wiring (+267% wiring vs +16% RAM+Logic).
+Of the wiring growth:
+- **Half** is geometric scaling (NUMG 8 → 15 at matched storage doubles length AND
+  energy, verified by TageDefaultRABT control).
+- **Half** is 8-way banking + sec_tag arrays, which inflate RAM count 30 → 390
+  and total wire length 11×; activity dilution (1/3) partially offsets but net is
+  still 1.8× more wiring energy than a same-NUMG non-banked baseline.
+- Wider 256-inst blocks recoup ~half the structural penalty (EPI 2.16× from
+  EPC 3.36×) by amortizing each expensive prediction cycle.
+
+### Subagent-ranked wiring-reduction techniques (by ROI)
+
+1. **Drop `ta_rwram` banking 8 → 4** on pred/hyst/u — ~50-line sed.
+   Expected: **25-35% total wiring**. Low risk (`stat_lost` already tracks
+   conflict pressure).
+2. Force low-MAXN on tag/sec/hyst `sram_bestM` — 1 alias. Prevent auto-banking.
+3. **Fuse 5-bit sec_tag into tag_ram** — ~80-line refactor. Halves tag-array
+   RAM count, kills 15 sets of address-distribution wires. **10-15% wiring**.
+4. `panel::region` per-table clustering — ~30 lines, energy-only. **~10%**.
+5. Shared address `distribute()` for fold-index fanouts — ~100 lines. 5-10%
+   (overlaps with #4).
+6. Reduce NUMG itself — architectural, accuracy-coupled (Task 7).
+
+**Recommended order**: 1 → 2 → 3 → 4 → 5 → 6. Items 1-2 are pure sweeps with
+revert-on-regression. Item 3 is the most architecturally interesting (kills
+sec_tag-driven wire pair explosion). Item 6 reserved for after Task 7
+accuracy investigation.
+
+### Scripts produced
+
+- `scripts/per_trace_power.py` — per-trace EPI/EPC decomposition.
+- `scripts/plot_per_trace_power.py` — stacked bar / line per-trace comparison
+  between two predictor CSVs; supports `--metric {epi,epc}`.
+- `scripts/dump_floorplan.py` — builds with `-DFLOORPLAN`, emits per-predictor
+  `out/floorplans/{name}.gv`.
+- `scripts/wire_length_analyzer.py` — parses `.gv`, reports
+  N_RAMs / Σ area / bbox / Σ all-pair Manhattan / Σ NN.
