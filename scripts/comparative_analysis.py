@@ -348,10 +348,6 @@ def fig_best_worst(names, top_n, out_path):
                    edgecolor="black", linewidth=0.35,
                    label=labels[comp] if i == 0 else None)
             bottoms += vals
-        for xi, total in zip(x + offsets[i], bottoms):
-            ax.text(xi, total + max(bottoms) * 0.015, f"{total:.0f}",
-                    ha="center", va="bottom", fontsize=7, rotation=90)
-
     if split_at and split_at < len(selected_traces):
         ax.axvline(split_at - 0.5, color="black", linewidth=0.8, alpha=0.55)
         ymax = ax.get_ylim()[1]
@@ -366,8 +362,7 @@ def fig_best_worst(names, top_n, out_path):
     ax.set_xticks(x)
     ax.set_xticklabels(trace_labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Estimated EPI breakdown (fJ / instruction)", fontsize=10)
-    ax.set_title("Per-trace power breakdown for best/worst full-eval EPI deltas\n"
-                 f"ranked by {last['label']} − {first['label']}",
+    ax.set_title(f"Best/Worst Trace Power: {last['label']} vs {first['label']}",
                  fontsize=11)
     ax.grid(axis="y", alpha=0.3)
 
@@ -472,14 +467,15 @@ def main():
                     help="primary predictor A (breakdown / best-worst)")
     ap.add_argument("--name-b", default="TageAheadHC_IR_M2",
                     help="primary predictor B (breakdown / best-worst)")
-    ap.add_argument("--best-worst-names", nargs="+", default=None,
+    ap.add_argument("--best-worst-names", nargs="+",
+                    default=["TageDefault", "TageDefaultRABT", "TageAheadHC_IR"],
                     help="2 or 3 predictors for figure 2; first is baseline, "
                          "last is used for trace ranking")
     ap.add_argument("--scaling-names", nargs="+",
                     default=["TageDefault", "TageDefaultRABT",
                              "TageAheadHC_IR", "TageAheadHC_IR_M2"],
                     help="predictors to include in scaling fig")
-    ap.add_argument("--top-n", type=int, default=5,
+    ap.add_argument("--top-n", type=int, default=8,
                     help="best/worst trace count per side")
     ap.add_argument("--out-dir", default="out/comparative")
     args = ap.parse_args()
@@ -492,8 +488,7 @@ def main():
                       str(Path(args.out_dir) / "fig1_breakdown.png"))
     if args.mode in ("best-worst", "all"):
         print(f"Fig 2: best/worst top-{args.top_n} traces")
-        best_worst_names = args.best_worst_names or [args.name_a, args.name_b]
-        fig_best_worst(best_worst_names, args.top_n,
+        fig_best_worst(args.best_worst_names, args.top_n,
                        str(Path(args.out_dir) / "fig2_best_worst.png"))
     if args.mode in ("scaling", "all"):
         print("Fig 3: scaling")
