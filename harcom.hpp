@@ -3835,6 +3835,12 @@ namespace hcm {
       return location;
     }
 
+  public:
+    // Public read-only accessor for the value's site (RAM ID where this value
+    // is geometrically located). Used by predictor introspection / DUMP_SITES.
+    u64 hcm_location() const { return location; }
+  private:
+
     auto get_vt() & // lvalue
     {
       return std::tuple {get(),time()}; // list initialization, get() executes before time()

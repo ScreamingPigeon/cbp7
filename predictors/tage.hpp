@@ -15,6 +15,11 @@
 #include <unordered_set>
 #endif
 
+#if defined(TAGE_MONITOR) || defined(DUMP_SITES) || defined(TAGE_VERBOSE)
+#include <fstream>
+#include <iostream>
+#endif
+
 using namespace hcm;
 
 template <u64 LOGLB = 6, u64 NUMG = 8, u64 LOGG = 11, u64 LOGB = 12,
@@ -295,6 +300,43 @@ struct tage : predictor {
       std::cerr << "WARNING: the tag function and index function are not "
                    "different enough\n";
     }
+#endif
+#ifdef DUMP_SITES
+    std::ofstream f("sites.txt");
+    f << "# register/value name → HARCOM site() (= RAM ID)\n";
+    f << "true_block " << true_block.hcm_location() << "\n";
+    f << "global_history1 " << global_history1.hcm_location() << "\n";
+    f << "index1 " << index1.hcm_location() << "\n";
+    f << "p1 " << p1.hcm_location() << "\n";
+    f << "bindex " << bindex.hcm_location() << "\n";
+    f << "notumask " << notumask.hcm_location() << "\n";
+    f << "p2 " << p2.hcm_location() << "\n";
+    f << "uctr " << uctr.hcm_location() << "\n";
+    f << "block_entry " << block_entry.hcm_location() << "\n";
+    for (u64 i = 0; i < LINEINST; i++) {
+      f << "readp1[" << i << "] " << readp1[i].hcm_location() << "\n";
+      f << "readb[" << i << "] " << readb[i].hcm_location() << "\n";
+      f << "match[" << i << "] " << match[i].hcm_location() << "\n";
+      f << "match1[" << i << "] " << match1[i].hcm_location() << "\n";
+      f << "match2[" << i << "] " << match2[i].hcm_location() << "\n";
+      f << "pred1[" << i << "] " << pred1[i].hcm_location() << "\n";
+      f << "pred2[" << i << "] " << pred2[i].hcm_location() << "\n";
+      f << "newly_alloc[" << i << "] " << newly_alloc[i].hcm_location() << "\n";
+      f << "branch_offset[" << i << "] " << branch_offset[i].hcm_location() << "\n";
+      f << "branch_dir[" << i << "] " << branch_dir[i].hcm_location() << "\n";
+    }
+    for (u64 i = 0; i < NUMG; i++) {
+      f << "gindex[" << i << "] " << gindex[i].hcm_location() << "\n";
+      f << "htag[" << i << "] " << htag[i].hcm_location() << "\n";
+      f << "readt[" << i << "] " << readt[i].hcm_location() << "\n";
+      f << "readc[" << i << "] " << readc[i].hcm_location() << "\n";
+      f << "readh[" << i << "] " << readh[i].hcm_location() << "\n";
+      f << "readu[" << i << "] " << readu[i].hcm_location() << "\n";
+    }
+    for (u64 i = 0; i < METAPIPE; i++)
+      f << "meta[" << i << "] " << meta[i].hcm_location() << "\n";
+    f.close();
+    std::cerr << "[DUMP_SITES] wrote sites.txt\n";
 #endif
   }
 

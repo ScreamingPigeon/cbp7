@@ -96,12 +96,10 @@ def analyze(path):
     rams = parse_gv(path)
     if not rams:
         return None
-    coords = [(r["x"], r["y"]) for r in rams]
     n = len(rams)
 
-    # Areas in um² → convert to mm² (×1e-6)
+    # Areas in um² → mm² (×1e-6)
     sum_area_um2 = sum(r["w"] * r["h"] for r in rams)
-    # bbox: use full rect extent (center ± w/2 etc)
     xmins = [r["x"] - r["w"]/2 for r in rams]
     xmaxs = [r["x"] + r["w"]/2 for r in rams]
     ymins = [r["y"] - r["h"]/2 for r in rams]
@@ -110,23 +108,40 @@ def analyze(path):
     bbox_h_um = max(ymaxs) - min(ymins)
     bbox_um2  = bbox_w_um * bbox_h_um
 
-    # Distances in um → mm (×1e-3)
-    sum_pair_um = sum_all_pair_manhattan(coords)
-    sum_nn_um   = nn_manhattan(coords)
-
-    n_pairs = n * (n - 1) // 2
-    mean_pair_um = sum_pair_um / n_pairs if n_pairs else 0.0
+    # Per-RAM → register-hub (RAM 0) Manhattan distance.
+    # Since all registers site at the first RAM (id=0), this captures the
+    # structural cost of any register-to-RAM transport in HARCOM's model.
+    hub = next((r for r in rams if r["id"] == 0), rams[0])
+    hub_dists_um = [abs(r["x"] - hub["x"]) + abs(r["y"] - hub["y"])
+                    for r in rams if not (r["id"] == hub["id"])]
+    n_wires    = len(hub_dists_um)
+    sum_hub_um = sum(hub_dists_um)
+    mean_um    = sum_hub_um / n_wires if n_wires else 0.0
+    sorted_d   = sorted(hub_dists_um)
+    median_um  = sorted_d[n_wires // 2] if n_wires else 0.0
+    max_um     = sorted_d[-1] if n_wires else 0.0
+    min_um     = sorted_d[0] if n_wires else 0.0
+    # 90th / 99th percentile
+    def pct(p):
+        idx = max(0, min(n_wires - 1, int(round(p/100.0 * (n_wires - 1)))))
+        return sorted_d[idx] if n_wires else 0.0
+    p90 = pct(90); p99 = pct(99)
 
     return {
         "n_rams":       n,
+        "n_wires":      n_wires,
         "sum_area_mm2": sum_area_um2 / 1e6,
         "bbox_mm2":     bbox_um2 / 1e6,
         "bbox_w_mm":    bbox_w_um / 1e3,
         "bbox_h_mm":    bbox_h_um / 1e3,
-        "sum_pair_mm":  sum_pair_um / 1e3,
-        "sum_nn_mm":    sum_nn_um / 1e3,
-        "n_pairs":      n_pairs,
-        "mean_pair_um": mean_pair_um,
+        "sum_hub_mm":   sum_hub_um / 1e3,
+        "mean_hub_um":  mean_um,
+        "median_hub_um": median_um,
+        "p90_hub_um":   p90,
+        "p99_hub_um":   p99,
+        "max_hub_um":   max_um,
+        "min_hub_um":   min_um,
+        "_hub_dists_um": hub_dists_um,  # for plotting
     }
 
 
@@ -134,10 +149,144 @@ def predictor_name(path):
     return Path(path).stem
 
 
+# ── Site / register-placement analysis ──────────────────────────────────────
+
+def load_sites(sites_path):
+    """Parse sites.txt: returns list of (name, site_id)."""
+    out = []
+    with open(sites_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.rsplit(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                out.append((parts[0], int(parts[1])))
+            except ValueError:
+                continue
+    return out
+
+
+# Map per-table register name → which RAM(s) it would naturally live near.
+# Returns (table_index, role) or None if not a per-table register.
+PER_TABLE_REG_RE = re.compile(r"^(\w+?)\[(\d+)\]")
+
+
+# Family → ("rabt" | "tage", role-suffix-or-label)
+#   - RABT: per-table label is 't<i>_<role>' (e.g. t3_pred, t3_tag, t3_sec)
+#   - tage<>: per-table is array indexing into a single labeled head
+#             (e.g. gindex[3] → 3rd entry of the "tags" array)
+_FAMILIES = {
+    # ---- RABT ----
+    "prefetch_pred":     ("rabt", "pred"),
+    "prefetch_hyst":     ("rabt", "hyst"),
+    "prefetch_u":        ("rabt", "u"),
+    "prefetch_tag_hit":  ("rabt", "tag"),
+    "prefetch_ctag":     ("rabt", "tag"),
+    "prefetch_idx":      ("rabt", "tag"),
+    "prefetch_sec":      ("rabt", "sec"),
+    "prefetch_group_id": ("rabt", "tag"),
+    # ---- tage<> (per-table registers indexed by table id, NUMG-wide) ----
+    "gindex":            ("tage", "tags"),
+    "htag":              ("tage", "tags"),
+    "readt":             ("tage", "tags"),
+    "readc":             ("tage", "gpred"),
+    "readh":             ("tage", "ghyst"),
+    "readu":             ("tage", "u"),
+}
+
+
+def _owning_ram_role(reg_name):
+    """Return (kind, table_idx, role_or_label) or None.
+    kind: 'rabt' (RABT-style 't<i>_<role>' label lookup) or
+          'tage' (tage<>-style — use labeled array head as proxy)."""
+    m = PER_TABLE_REG_RE.match(reg_name)
+    if not m:
+        return None
+    family, idx = m.group(1), int(m.group(2))
+    fam = _FAMILIES.get(family)
+    if fam is None:
+        return None
+    return (fam[0], idx, fam[1])
+
+
+def _build_label_index(rams):
+    """Return dict label_suffix -> (x, y, rect_id) for fast lookup."""
+    out = {}
+    for r in rams:
+        if r["label"]:
+            out[r["label"]] = (r["x"], r["y"], r["id"])
+    return out
+
+
+def analyze_sites(gv_path, sites_path):
+    """Returns dict with:
+        site_histogram: {site_id: count}
+        hub_site:       most-common site_id (the register hub)
+        relevant_rows:  list of dicts with current vs counterfactual distance per per-table register
+        total_current_um:  Σ Manhattan from hub to natural-owner over relevant regs
+        total_counterfactual_um:  Σ over relevant regs (≈ 0, since intra-table)
+    """
+    rams = parse_gv(gv_path)
+    label_idx = _build_label_index(rams)
+    sites = load_sites(sites_path)
+
+    # Site histogram
+    from collections import Counter
+    hist = Counter(s for _, s in sites)
+    hub_site = max(hist, key=hist.get) if hist else 0
+    # Coordinate of the hub RAM
+    hub_coord = next(((r["x"], r["y"]) for r in rams if r["id"] == hub_site), None)
+
+    rows = []
+    total_current = 0.0
+    total_counter = 0.0
+    for name, site in sites:
+        owner = _owning_ram_role(name)
+        if owner is None:
+            continue
+        kind, idx, role = owner
+        if kind == "rabt":
+            target_label = f"t{idx}_{role}"
+        else:  # 'tage' — labeled array head as proxy for i-th member
+            target_label = role
+        if target_label not in label_idx:
+            continue
+        tx, ty, _ = label_idx[target_label]
+        # Current: site → owner-RAM
+        sx, sy = next(((r["x"], r["y"]) for r in rams if r["id"] == site), (None, None))
+        if sx is None:
+            continue
+        d_current = abs(sx - tx) + abs(sy - ty)
+        # Counterfactual: register sites at the owner RAM → 0 distance
+        d_counter = 0.0
+        total_current += d_current
+        total_counter += d_counter
+        rows.append({
+            "register":  name,
+            "site":      site,
+            "target":    target_label,
+            "d_current_um": d_current,
+            "d_counter_um": d_counter,
+        })
+
+    return {
+        "site_histogram":  dict(hist),
+        "hub_site":        hub_site,
+        "hub_coord":       hub_coord,
+        "relevant_rows":   rows,
+        "total_current_um": total_current,
+        "total_counterfactual_um": total_counter,
+    }
+
+
 def fmt_row(name, m):
-    return (f"  {name:<28} {m['n_rams']:>6}  {m['sum_area_mm2']:>10.4f}"
-            f"  {m['bbox_mm2']:>10.4f}  {m['sum_pair_mm']:>12.1f}"
-            f"  {m['sum_nn_mm']:>10.1f}  {m['mean_pair_um']:>10.1f}")
+    return (f"  {name:<28} {m['n_wires']:>7}  {m['sum_area_mm2']:>9.4f}"
+            f"  {m['sum_hub_mm']:>10.2f}  {m['mean_hub_um']:>9.1f}"
+            f"  {m['median_hub_um']:>9.1f}  {m['p90_hub_um']:>8.1f}"
+            f"  {m['p99_hub_um']:>8.1f}  {m['max_hub_um']:>8.1f}")
 
 
 def _table_group(label):
@@ -149,7 +298,7 @@ def _table_group(label):
     return m.group(1) if m else "misc"
 
 
-def render_bundles(gv_path, out_path, mode="bundle", top_n=200):
+def render_bundles(gv_path, out_path, mode="bundle", top_n=200, hub_info=None):
     """Render the floorplan with wire bundles overlaid.
     mode:
         bundle  — aggregate by table-prefix; one line per table-pair, thickness ∝ Σ length
@@ -185,32 +334,27 @@ def render_bundles(gv_path, out_path, mode="bundle", top_n=200):
 
     # Wires
     if mode == "bundle":
-        # Aggregate inter-group lengths and group centroids
-        group_members = defaultdict(list)
+        # Starburst: draw a line from every RAM to the register hub.
+        # If no hub info passed, fall back to RAM 0 by coordinate of first rect.
+        if hub_info and hub_info.get("hub_coord"):
+            hx, hy = hub_info["hub_coord"]
+        else:
+            hx, hy = rams[0]["x"], rams[0]["y"]
+
+        # Color by Manhattan distance (longer = more saturated)
+        max_d = max(abs(r["x"]-hx) + abs(r["y"]-hy) for r in rams) or 1.0
+        n_wires = 0
         for r in rams:
-            group_members[_table_group(r["label"])].append((r["x"], r["y"]))
-        centroids = {g: (sum(x for x, _ in pts)/len(pts),
-                         sum(y for _, y in pts)/len(pts))
-                     for g, pts in group_members.items()}
-        inter = defaultdict(float)  # (g1, g2) -> Σ Manhattan
-        for i in range(n):
-            gi = _table_group(rams[i]["label"])
-            for j in range(i+1, n):
-                gj = _table_group(rams[j]["label"])
-                if gi == gj:
-                    continue
-                key = (gi, gj) if gi < gj else (gj, gi)
-                inter[key] += (abs(rams[i]["x"]-rams[j]["x"])
-                               + abs(rams[i]["y"]-rams[j]["y"]))
-        if inter:
-            max_len = max(inter.values())
-            for (g1, g2), length in inter.items():
-                x1, y1 = centroids[g1]
-                x2, y2 = centroids[g2]
-                lw = 0.5 + 5.0 * (length / max_len)
-                ax.plot([x1, x2], [y1, y2], "-",
-                        color="black", linewidth=lw, alpha=0.35)
-        title_suffix = f"bundle-by-table ({len(inter)} bundles)"
+            if r["x"] == hx and r["y"] == hy:
+                continue  # skip the hub itself
+            d = abs(r["x"]-hx) + abs(r["y"]-hy)
+            frac = d / max_d
+            ax.plot([hx, r["x"]], [hy, r["y"]], "-",
+                    color=(1.0, 0.4 + 0.3*(1-frac), 0.2),  # orange→red by distance
+                    linewidth=0.4 + 1.0*frac, alpha=0.4 + 0.3*frac,
+                    zorder=2)
+            n_wires += 1
+        title_suffix = f"RAM ↔ register-hub wires ({n_wires})"
     elif mode == "top":
         pairs = []
         for i in range(n):
@@ -238,9 +382,25 @@ def render_bundles(gv_path, out_path, mode="bundle", top_n=200):
     else:
         title_suffix = "(no wires)"
 
-    # Legend for table groups
+    # Highlight register-hub RAM
+    if hub_info and hub_info.get("hub_coord"):
+        hx, hy = hub_info["hub_coord"]
+        n_regs = sum(hub_info["site_histogram"].values())
+        ax.plot(hx, hy, "*", color="yellow", markersize=24,
+                markeredgecolor="black", markeredgewidth=1.5,
+                label=f"Register hub: RAM {hub_info['hub_site']} ({n_regs} regs)",
+                zorder=10)
+
+    # Legend for table groups + hub marker
     handles = [Rectangle((0, 0), 1, 1, facecolor=color_map[g], edgecolor="black",
                          label=g) for g in groups]
+    if hub_info and hub_info.get("hub_coord"):
+        from matplotlib.lines import Line2D
+        n_regs = sum(hub_info["site_histogram"].values())
+        handles.append(Line2D([0], [0], marker="*", color="w",
+                              markerfacecolor="yellow",
+                              markeredgecolor="black", markersize=14,
+                              label=f"hub ({n_regs} regs)"))
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.0, 1.0),
               fontsize=8, ncol=1, frameon=True)
 
@@ -263,6 +423,13 @@ def main():
     ap.add_argument("--csv", default=None, help="optional CSV output path")
     ap.add_argument("--render", action="store_true",
                     help="also render PNG floorplans with wire bundles overlaid")
+    ap.add_argument("--sites", action="store_true",
+                    help="load {name}.sites.txt next to each .gv; mark register hub"
+                         " on the floorplan; report current vs counterfactual"
+                         " distance for per-table prefetch_*[i] registers")
+    ap.add_argument("--plot-dist", action="store_true",
+                    help="overlay CDF + histogram of RAM→hub Manhattan distances "
+                         "for all input predictors → out/floorplans/wire_dist.png")
     ap.add_argument("--render-mode", choices=["bundle", "top", "all"], default="bundle",
                     help="how to draw wires: bundle (inter-table aggregate, default),"
                          " top (longest N pairs), all (every pair, slow)")
@@ -284,11 +451,12 @@ def main():
         print("No floorplans parsed", file=sys.stderr)
         sys.exit(1)
 
-    # Table to stdout
-    print("Wire-length structural comparison")
+    # Table to stdout: per-RAM → register-hub wire-length distribution
+    print("Wire-length distribution (RAM → register-hub)")
     print("=" * 110)
-    print(f"  {'predictor':<28} {'N_RAMs':>6}  {'area mm²':>10}"
-          f"  {'bbox mm²':>10}  {'Σ pair mm':>12}  {'Σ NN mm':>10}  {'mean μm':>10}")
+    print(f"  {'predictor':<28} {'#wires':>7}  {'area mm²':>9}"
+          f"  {'Σ hub mm':>10}  {'mean μm':>9}  {'median μm':>9}"
+          f"  {'p90 μm':>8}  {'p99 μm':>8}  {'max μm':>8}")
     print("  " + "-" * 108)
     for name, _, m in results:
         print(fmt_row(name, m))
@@ -299,16 +467,88 @@ def main():
         base_name, _, base = results[0]
         print(f"  Ratios vs {base_name}:")
         for name, _, m in results[1:]:
-            print(f"    {name:<28}  N_RAMs ×{m['n_rams']/base['n_rams']:.2f}"
+            print(f"    {name:<28}  #wires ×{m['n_wires']/base['n_wires']:.2f}"
                   f"  area ×{m['sum_area_mm2']/base['sum_area_mm2']:.2f}"
-                  f"  Σ pair ×{m['sum_pair_mm']/base['sum_pair_mm']:.2f}"
-                  f"  Σ NN ×{m['sum_nn_mm']/base['sum_nn_mm']:.2f}")
+                  f"  Σ hub ×{m['sum_hub_mm']/base['sum_hub_mm']:.2f}"
+                  f"  mean ×{m['mean_hub_um']/base['mean_hub_um']:.2f}")
+
+    # Sites analysis (per-predictor)
+    sites_results = {}
+    if args.sites:
+        print("\nRegister-hub / per-table register distance analysis")
+        print("=" * 110)
+        for name, p, _ in results:
+            sites_path = Path(p).with_suffix("").with_suffix(".sites.txt")
+            if not sites_path.exists():
+                sites_path = Path(p).parent / f"{name}.sites.txt"
+            if not sites_path.exists():
+                print(f"  {name}: no sites file at {sites_path}", file=sys.stderr)
+                continue
+            sa = analyze_sites(p, str(sites_path))
+            sites_results[name] = sa
+            hub_hist = sa["site_histogram"]
+            total_regs = sum(hub_hist.values())
+            n_sites = len(hub_hist)
+            n_relevant = len(sa["relevant_rows"])
+            print(f"\n  {name}")
+            print(f"    Total named registers:    {total_regs}")
+            print(f"    Unique site IDs occupied: {n_sites}")
+            print(f"    Register-hub site:        RAM {sa['hub_site']}"
+                  f"  (holds {hub_hist[sa['hub_site']]} regs)")
+            if n_relevant:
+                cur_mm = sa["total_current_um"] / 1e3
+                cnt_mm = sa["total_counterfactual_um"] / 1e3
+                print(f"    Per-table prefetch regs matched: {n_relevant}")
+                print(f"    Σ current-site → owner Manhattan:   {cur_mm:>8.2f} mm")
+                print(f"    Σ counterfactual (intra-table):     {cnt_mm:>8.2f} mm")
+                print(f"    Wire-length recoverable by reorder: "
+                      f"{(cur_mm - cnt_mm):>8.2f} mm  "
+                      f"({100*(cur_mm-cnt_mm)/cur_mm if cur_mm else 0:.1f}% of current)")
+            else:
+                print(f"    No per-table prefetch_*[i] registers matched naming heuristic")
+
+    if args.plot_dist:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        fig, (ax_cdf, ax_pdf) = plt.subplots(1, 2, figsize=(14, 5))
+        palette = plt.cm.tab10.colors
+        for i, (name, _, m) in enumerate(results):
+            d = np.array(m["_hub_dists_um"])
+            d_sorted = np.sort(d)
+            cdf = np.arange(1, len(d_sorted)+1) / len(d_sorted)
+            color = palette[i % len(palette)]
+            ax_cdf.plot(d_sorted, cdf, "-", color=color, linewidth=2,
+                        label=f"{name} (n={len(d)})")
+            ax_pdf.hist(d, bins=40, color=color, alpha=0.45,
+                        label=f"{name}", edgecolor=color, linewidth=1)
+
+        ax_cdf.set_xlabel("RAM → register-hub Manhattan distance (μm)")
+        ax_cdf.set_ylabel("CDF")
+        ax_cdf.set_title("CDF of RAM → register-hub wire lengths")
+        ax_cdf.grid(True, alpha=0.3)
+        ax_cdf.legend(fontsize=9, loc="lower right")
+
+        ax_pdf.set_xlabel("RAM → register-hub Manhattan distance (μm)")
+        ax_pdf.set_ylabel("count")
+        ax_pdf.set_title("Histogram of RAM → register-hub wire lengths")
+        ax_pdf.grid(True, alpha=0.3)
+        ax_pdf.legend(fontsize=9)
+
+        fig.tight_layout()
+        out_png = Path(args.render_out_dir) / "wire_dist.png"
+        Path(args.render_out_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_png, dpi=130)
+        print(f"\nDistribution plot → {out_png}")
 
     if args.render:
         print("\nRendering wire-bundle overlays:")
-        for _, p, _ in results:
+        for name, p, _ in results:
             out_png = Path(args.render_out_dir) / (Path(p).stem + f"_wires_{args.render_mode}.png")
-            render_bundles(p, str(out_png), mode=args.render_mode, top_n=args.top_n)
+            render_bundles(p, str(out_png), mode=args.render_mode, top_n=args.top_n,
+                           hub_info=sites_results.get(name))
 
     if args.csv:
         Path(args.csv).parent.mkdir(parents=True, exist_ok=True)

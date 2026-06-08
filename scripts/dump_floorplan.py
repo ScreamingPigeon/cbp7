@@ -31,7 +31,9 @@ import hashlib
 
 # floorplan.gv is only emitted when harcom is built with -DFLOORPLAN
 # (see harcom.hpp:3636 and cbp.hpp:165). We pass it via EXTRA_COMMON_FLAGS.
-FLOORPLAN_FLAG = "-DFLOORPLAN"
+# DUMP_SITES triggers per-predictor site() dumps for register/value endpoints
+# (sites.txt). See TageAheadHC_IR.hpp / tage.hpp constructors.
+FLOORPLAN_FLAG = "-DFLOORPLAN -DDUMP_SITES"
 
 
 def pred_hash(predictor, extra_common=FLOORPLAN_FLAG, extra_cbp=""):
@@ -73,10 +75,12 @@ def dump_one(predictor, build_dir, trace, warmup, measure, out_dir, jobs):
     if binary is None:
         return False
 
-    # Wipe any stale floorplan.gv so we fail loudly if this run doesn't produce one
-    gv = Path("floorplan.gv")
-    if gv.exists():
-        gv.unlink()
+    # Wipe stale artifacts so we fail loudly if this run doesn't produce them
+    gv    = Path("floorplan.gv")
+    sites = Path("sites.txt")
+    for p in (gv, sites):
+        if p.exists():
+            p.unlink()
 
     name = Path(trace).name.replace("_trace.gz", "")
     print(f"[{predictor}] running ({warmup} warmup, {measure} measure)...", flush=True)
@@ -92,10 +96,19 @@ def dump_one(predictor, build_dir, trace, warmup, measure, out_dir, jobs):
         return False
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    dest = Path(out_dir) / f"{predictor}.gv"
-    shutil.copy2(gv, dest)
-    size_kb = dest.stat().st_size / 1024
-    print(f"[{predictor}] → {dest}  ({size_kb:.1f} KiB)")
+    dest_gv = Path(out_dir) / f"{predictor}.gv"
+    shutil.copy2(gv, dest_gv)
+    print(f"[{predictor}] → {dest_gv}  ({dest_gv.stat().st_size/1024:.1f} KiB)")
+
+    if sites.exists():
+        dest_sites = Path(out_dir) / f"{predictor}.sites.txt"
+        shutil.copy2(sites, dest_sites)
+        n_entries = sum(1 for line in open(dest_sites)
+                        if line.strip() and not line.startswith("#"))
+        print(f"[{predictor}] → {dest_sites}  ({n_entries} sites)")
+    else:
+        print(f"[{predictor}] (no sites.txt — predictor may not have DUMP_SITES block)",
+              file=sys.stderr)
     return True
 
 

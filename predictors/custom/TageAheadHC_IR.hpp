@@ -3,6 +3,9 @@
 #include "../../cbp.hpp"
 #include "../../harcom.hpp"
 #include "custom_common.hpp"
+#ifdef DUMP_SITES
+#include <fstream>
+#endif
 
 using namespace hcm;
 
@@ -372,6 +375,49 @@ struct TageAheadHC_IR_impl : predictor {
   static constexpr std::array<u64, NT> HYST_IDX_BITS = {
     9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
   };
+
+  // ======== Site dump (one-shot, -DDUMP_SITES) ========
+  // Writes name → site_id pairs for every named register / value at construction
+  // time. Site IDs correspond to RAM IDs in floorplan.gv. The wire-length
+  // analyzer can overlay these on the floorplan to show actual data endpoints,
+  // not just RAM-to-RAM pair geometry.
+#ifdef DUMP_SITES
+  TageAheadHC_IR_impl() {
+    std::ofstream f("sites.txt");
+    f << "# register/value name → HARCOM site() (= RAM ID)\n";
+    f << "# all values constructed before any RAM declaration get site 0\n";
+    f << "prefetch_fb " << prefetch_fb.hcm_location() << "\n";
+    f << "prefetch_fb_idx " << prefetch_fb_idx.hcm_location() << "\n";
+    f << "prefetch_pc " << prefetch_pc.hcm_location() << "\n";
+    f << "true_block " << true_block.hcm_location() << "\n";
+    f << "last_condbr_dir " << last_condbr_dir.hcm_location() << "\n";
+    f << "block_entry " << block_entry.hcm_location() << "\n";
+    f << "curr_sec_tag " << curr_sec_tag.hcm_location() << "\n";
+    for (u64 i = 0; i < N; i++)
+      f << "branch_dir[" << i << "] " << branch_dir[i].hcm_location() << "\n";
+    for (u64 i = 0; i < NT; i++) {
+      f << "prefetch_tag_hit[" << i << "] " << prefetch_tag_hit[i].hcm_location() << "\n";
+      f << "prefetch_pred[" << i << "] "    << prefetch_pred[i].hcm_location()    << "\n";
+      f << "prefetch_sec[" << i << "] "     << prefetch_sec[i].hcm_location()     << "\n";
+      f << "prefetch_idx[" << i << "] "     << prefetch_idx[i].hcm_location()     << "\n";
+      f << "prefetch_hyst[" << i << "] "    << prefetch_hyst[i].hcm_location()    << "\n";
+      f << "prefetch_u[" << i << "] "       << prefetch_u[i].hcm_location()       << "\n";
+      f << "prefetch_ctag[" << i << "] "    << prefetch_ctag[i].hcm_location()    << "\n";
+      f << "prefetch_group_id[" << i << "] "<< prefetch_group_id[i].hcm_location()<< "\n";
+    }
+    for (u64 i = 0; i < N; i++)
+      f << "pred[" << i << "] " << pred[i].hcm_location() << "\n";
+    for (u64 b = 0; b < META_BANKS; b++)
+      for (u64 p = 0; p < META_PIPE; p++) {
+        f << "meta_pipe[" << b << "][" << p << "] "
+          << meta_pipe[b][p].hcm_location() << "\n";
+        f << "meta_idx_pipe[" << b << "][" << p << "] "
+          << meta_idx_pipe[b][p].hcm_location() << "\n";
+      }
+    f.close();
+    std::cerr << "[DUMP_SITES] wrote sites.txt\n";
+  }
+#endif
 
   // ======== Helpers ========
   val<1> line_end() { return (block_entry + block_size) == hard<LINEINST>{}; }

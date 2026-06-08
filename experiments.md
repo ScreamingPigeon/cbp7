@@ -1318,3 +1318,99 @@ accuracy investigation.
   `out/floorplans/{name}.gv`.
 - `scripts/wire_length_analyzer.py` — parses `.gv`, reports
   N_RAMs / Σ area / bbox / Σ all-pair Manhattan / Σ NN.
+
+### Register-location dump: every register sites at RAM 0 (2026-06-08)
+
+Followup to the wire-length analysis. To check whether HARCOM is actually
+charging register-to-RAM wire traffic at the right coordinates, added a
+`-DDUMP_SITES` instrumentation block to both `TageAheadHC_IR` and `tage<>`
+constructors. Each writes `sites.txt` with `name → site_id` for every named
+register/value (prefetch_*, pred[], match[], readt/c/h/u[], meta_pipe, etc.).
+
+Required exposing one method in HARCOM:
+
+```cpp
+// harcom.hpp, class val
+u64 hcm_location() const { return location; }  // public read-only accessor
+```
+
+`scripts/dump_floorplan.py` now passes `-DFLOORPLAN -DDUMP_SITES` and captures
+`out/floorplans/{Predictor}.sites.txt` alongside the `.gv`.
+
+**Result across all four configs**:
+
+| Predictor | Named registers/values | Unique site IDs | All at site 0? |
+|---|---|---|---|
+| TageDefault | 178 | 1 | ✓ |
+| TageDefaultRABT | 207 | 1 | ✓ |
+| TageAheadHC_IR | 150 | 1 | ✓ |
+| TageAheadHC_IR_M2 | 150 | 1 | ✓ |
+
+**Cause**: C++ class fields are constructed in declaration order. Both
+predictors declare all `reg<>` / `arr<reg<>>` fields BEFORE any `ram` field.
+At register construction time, `panel.rams` is empty, so HARCOM's
+`register_location()` returns 0 unconditionally (harcom.hpp:3376-3380):
+
+```cpp
+u64 register_location() const {
+    if (rams.empty()) return 0;
+    return std::max(current_region->ramid, rams.back()->id);
+}
+```
+
+**Implication**: every register read/write is modeled as a wire from RAM 0's
+coordinate to the destination RAM's coordinate. For `prefetch_pred[14]` writes
+into `t14_pred`, that is a corner-to-corner Manhattan distance — even though
+in real hardware the register could have been physically placed near table 14.
+
+The all-pair Manhattan visualization is therefore correct geometrically (HARCOM
+genuinely charges that distance) but the underlying placement is suboptimal:
+the same wire we're billing for "RAM 0 ↔ RAM 14" data transport actually
+carries a mix of RAM-to-RAM and register-mediated-from-RAM-0 signal traffic.
+
+**Open question**: does reordering fields (declare each table's RAMs first,
+then declare that table's pipeline registers) reduce wire energy materially?
+Smaller blast radius to test on tage<> first.
+
+### Wire-length distribution (RAM → register-hub) (2026-06-08)
+
+Refocused `scripts/wire_length_analyzer.py` on the metric that actually maps to
+HARCOM's energy charge: per-RAM Manhattan distance to the register hub (RAM 0,
+where every register sites due to field declaration order — see prior section).
+
+Σ all-pair Manhattan dropped from the report; it represented unused structural
+infrastructure, not actual signal traffic.
+
+| Predictor | #wires | area mm² | Σ hub mm | mean μm | median | p90 | p99 | max |
+|---|---|---|---|---|---|---|---|---|
+| TageDefault         | 143 | 0.0132 | 10.36 | 72.4 | 68.2 | 117 | 144 | 149 |
+| TageDefaultRABT     | 213 | 0.0131 | 17.10 | 80.3 | 82.2 | 116 | 140 | 145 |
+| TageAheadHC_IR(_M2) | 407 | 0.0265 | 51.90 | **127.5** | 126.2 | 213 | 263 | **273** |
+
+**Ratios vs TageDefault**:
+
+| | #wires | Σ hub | mean wire |
+|---|---|---|---|
+| TageDefaultRABT (matched storage, NUMG=15) | 1.49× | **1.65×** | 1.11× |
+| RABT M2 (matched NUMG=15, ~2× storage) | 2.85× | **5.01×** | 1.76× |
+
+**Decomposition**:
+- TageDefault → TageDefaultRABT: NUMG 8 → 15 at matched storage adds wires
+  (#wires +49%) at nearly-constant mean wire length (+11%). Σ hub +65%.
+- TageDefaultRABT → RABT M2 (matched NUMG=15): 8-way banking + sec_tag arrays
+  inflate #wires another 1.9× and mean wire length 1.6× (bigger floorplan).
+  Σ hub +3.0×.
+
+So the *banking + sec_tag + bigger floorplan* surcharge at matched NUMG and
+~doubled storage is **3.0× wire length**. The *NUMG scaling alone* (no banking)
+is 1.65× — exactly proportional to wire count growth.
+
+**Tail behavior**: RABT's p99/max wire is 263/273 μm vs TageDefault's 144/149 μm.
+The worst-case wires nearly double — these come from t14_* RAMs in the far
+corner needing to reach the hub at t0_tag. The misplaced register problem hurts
+the tail disproportionately.
+
+Outputs (`--render --sites` and `--plot-dist`):
+- `out/floorplans/{Predictor}_wires_bundle.png` — floorplan with starburst of
+  RAM→hub wires colored by length
+- `out/floorplans/wire_dist.png` — CDF + histogram of all four predictors
