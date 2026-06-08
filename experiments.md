@@ -1052,3 +1052,120 @@ Key observations:
 - Even traces with IPC ~8-10 (web_74, web_130, python3) get 7-14% IPC cuts
 
 Results in `out/ipc_cap_sweep/{config}/`. Baseline in `full_out/hc_ir_fo_fix/`.
+
+---
+
+## Accuracy Gap Investigation: TageAheadHC_IR vs tage<> (2026-06-05)
+
+**Goal**: Understand why TageAheadHC_IR has ~4 MPKI more than tage<> on accuracy.
+All experiments below use quick-eval (20 traces). HC_IR baseline = fo_fix config
+(VFS=0.878, MPI=0.01081).
+
+### Suspects ruled out
+
+| Suspect | Test | Result |
+|---------|------|--------|
+| LINEINST (256 vs 16) | TageAheadHC_IR_16 | No effect (~0.2 MPKI diff) |
+| History update method | Code inspection | Identical 6 path bits per block |
+| Tag ordering bug | PER_TABLE_TAG was reversed (T0=long hist got narrow tag) | See below |
+| Tag width (graded vs uniform) | TageAheadHC_IR_U11 | Marginal, U11 wins 16/20 traces |
+| MAXHIST=200 vs 100 | TageAheadHC_IR_M2H100 | Neutral/slightly worse: MPI 0.008535 vs 0.008428 |
+| GROUP_BITS fragmentation | group_frag_analyzer on gcc trace | Capacity multiplier 1.09x — not significant |
+
+### Tag ordering fix (2026-06-05)
+
+**Bug**: `PER_TABLE_TAG = {7,7,7,7,8,...,11}` was intended as "short history → narrow tag"
+but `geometric_hist` fills in reverse: T0 = longest history. So long-history tables
+had the narrowest tags — exactly backwards.
+
+**Fix**: Reversed to `{11,11,10,10,10,9,9,9,8,8,8,7,7,7,7}`.
+
+Result vs old HC_IR baseline (U11):
+
+| Config | VFS | MPI |
+|--------|-----|-----|
+| HC_IR (wrong ordering) | 0.878 | 0.01081 |
+| HC_IR reversed graded | ~0.898 | ~0.00953 |
+| HC_IR U11 (uniform) | 0.8987 | 0.009536 |
+
+U11 wins 16/20 traces over graded after fix. **U11 adopted as default tag config.**
+
+### MINHIST=2 — major win (2026-06-05)
+
+tage<> covers MINHIST=2; HC_IR used MINHIST=8, completely missing short-history
+patterns. Added `TageAheadHC_IR_M2 = TageAheadHC_IR_impl<256, false, 2, 200>`.
+
+| Trace | HC_IR baseline | M2 | Delta |
+|-------|---------------|-----|-------|
+| 502-gcc | 14.6 | 12.707 | −1.9 |
+| 505-mcf | 17.2 | 14.896 | −2.3 |
+| 531-deepsjeng | 11.8 | 9.744 | −2.1 |
+| gap-sssp | 31.6 | 24.299 | **−7.3** |
+| rsbench | 40.7 | 37.509 | −3.2 |
+| sampleflow | 3.3 | 2.057 | −1.2 |
+
+**Aggregate: VFS 0.878 → 0.919 (+0.041), MPI −22%.** M2 wins 17/20 traces vs U11.
+`TageAheadHC_IR_M2` is the new best config.
+
+### tage<> baseline (20 traces, quick-eval)
+
+| Trace | tage<> | HC_IR M2 | Gap |
+|-------|--------|----------|-----|
+| 502-gcc | 9.033 | 12.707 | +3.67 |
+| 505-mcf | 8.520 | 14.896 | +6.38 |
+| gap-sssp | 19.409 | 24.299 | +4.89 |
+| rsbench | 32.966 | 37.509 | +4.54 |
+| zstd | 2.939 | 8.050 | +5.11 |
+| **Mean** | **6.00** | **8.43** | **+2.43** |
+
+tage<> wins all 20 traces. Note: tage<> P2lat=1.86 cycles vs HC_IR 0.99; EPI ~1200 fJ
+vs ~2600 fJ. Despite worse latency, tage<>'s accuracy advantage is large.
+
+### Remaining suspects (active)
+
+1. **NUMG=8 vs NT=15** — tage<> has 8 tables densely spaced over [2,100]; HC_IR M2
+   has 15 tables spaced for [2,200] with 2 effectively dead (>100). The geometric
+   spacing in [2,100] is mismatched for HC_IR. **Next to test**: NT=8 variant.
+2. **P1 fallback: bimodal vs per-slot gshare** — tage<> P1 is 16 *separate*
+   1024-entry gshare tables (one per branch offset, 6-bit history correlation).
+   HC_IR P1 is a single 8192-entry bimodal with no history (FB_PRED_BITS=7).
+   Per-slot gshare captures simple repeating patterns (loop alternation, stride-2)
+   that bimodal misses entirely. More credible suspect than initially assessed.
+   **Next to test**: upgrade HC_IR fallback to per-slot gshare.
+3. **Shared hysteresis** — HC_IR HYST_SIZE=TABLE_SIZE/2; tage<> per-entry.
+
+**Note**: tage<> U_WIDTH=1-bit per entry (RESET_UBITS epoch reset), HC_IR U_WIDTH=2-bit.
+HC_IR has more u-precision, so u-counter width is not a cause of worse accuracy.
+
+---
+
+## Energy Breakdown: TageDefault vs TageAheadHC_IR_M2 (2026-06-07)
+
+Built `scripts/per_trace_power.py` — per-trace logic/RAM/fanout/wiring decomposition
+using HARCOM `FREE_WIRING` / `FREE_FANOUT` flag-combo rebuilds. Also computes
+EPPC (Energy Per Prediction Cycle) = energy / (npred + extra), which normalizes
+out MPKI-driven block-stretching and isolates structural per-cycle cost.
+
+Run on 502-gcc-all_16112 (single trace):
+
+| Component | TageDefault | M2 | Delta | Ratio |
+|-----------|-------------|-----|-------|-------|
+| RAM+Logic | 870 | 1137 | +267 | 1.3× |
+| Fanout    |  36 |   35 |    0 | 1.0× |
+| **Wiring**| **632** | **2644** | **+2012** | **4.2×** |
+| Baseline  | 1538 | 3816 | +2278 | 2.5× |
+
+EPPC tells the same story per cycle (M2 17794 fJ/cyc wiring vs tage<> 3153 fJ/cyc).
+
+**Finding**: M2's 2.5× total energy gap vs tage<> is **almost entirely wiring**.
+Wiring share went 41% → 69% of total energy. Driven by M2's 15 tables (vs tage<>'s 8)
+forcing longer inter-bank wires that switch every prediction cycle.
+
+**Implications**:
+- The proposed NT=8 reduction (remaining-suspects task 1) addresses BOTH accuracy
+  (mismatched [2,100] coverage) and energy (wiring scales with table count).
+- Floorplan inspection (`out/floorplan.pdf`) may reveal layout improvements.
+- RAM+Logic delta is small (1.3×) — extra tables aren't the dominant compute cost,
+  the wires between them are.
+
+Script: `scripts/per_trace_power.py --predictor <P> [--trace <T>|--quick|--full]`

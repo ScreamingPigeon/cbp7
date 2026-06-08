@@ -19,7 +19,7 @@ using namespace hcm;
 //   T5-13: 2048 entries (IDX=11, HYST=1024)
 // ============================================================================
 
-template <u64 LINEINST_V = 256, bool UNIFORM_TAG_V = false, u64 MINHIST_V = 8>
+template <u64 LINEINST_V = 256, bool UNIFORM_TAG_V = false, u64 MINHIST_V = 8, u64 MAXHIST_V = 200>
 struct TageAheadHC_IR_impl : predictor {
 
   // ======== Constants (hardcoded from S3_MW4_MC2048 + BPE1) ========
@@ -31,7 +31,7 @@ struct TageAheadHC_IR_impl : predictor {
   static constexpr u64 HYST_WIDTH = 2;
   static constexpr u64 U_WIDTH = 2;
   static constexpr u64 TAG_WIDTH = 11;    // UniformTag<11>
-  static constexpr u64 MAXHIST = 200;
+  static constexpr u64 MAXHIST = MAXHIST_V;
   static constexpr u64 LINEINST = LINEINST_V;
   static constexpr u64 LOGLINEINST = []() constexpr { u64 x = LINEINST_V, r = 0; while (x > 1) { x >>= 1; r++; } return r; }();
   static constexpr u64 FB_CAPACITY = 8192;
@@ -75,9 +75,9 @@ struct TageAheadHC_IR_impl : predictor {
     1024, 1024, 1024, 1024, 1024,
     2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048
   };
-  // Per-table history lengths: geometric_hist<14>(8, 200)
+  // Per-table history lengths
   static constexpr std::array<u64, NT> HIST_LEN =
-      ta::geometric_hist<NT>(MINHIST_V, 200);
+      ta::geometric_hist<NT>(MINHIST_V, MAXHIST_V);
   // Per-table IDX bits
   static constexpr std::array<u64, NT> IDX_BITS = {
     10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11
@@ -1185,8 +1185,9 @@ struct TageAheadHC_IR_impl : predictor {
   }
 };
 
-using TageAheadHC_IR      = TageAheadHC_IR_impl<256, false, 8>;
-using TageAheadHC_IR_U11  = TageAheadHC_IR_impl<256, true,  8>;
-using TageAheadHC_IR_M2   = TageAheadHC_IR_impl<256, false, 2>;
-using TageAheadHC_IR_32   = TageAheadHC_IR_impl<32,  false, 8>;
-using TageAheadHC_IR_16   = TageAheadHC_IR_impl<16,  false, 8>;
+using TageAheadHC_IR        = TageAheadHC_IR_impl<256, false,  8, 200>;
+using TageAheadHC_IR_U11    = TageAheadHC_IR_impl<256, true,   8, 200>;
+using TageAheadHC_IR_M2     = TageAheadHC_IR_impl<256, false,  2, 200>;
+using TageAheadHC_IR_M2H100 = TageAheadHC_IR_impl<256, false,  2, 100>;
+using TageAheadHC_IR_32     = TageAheadHC_IR_impl<32,  false,  8, 200>;
+using TageAheadHC_IR_16     = TageAheadHC_IR_impl<16,  false,  8, 200>;

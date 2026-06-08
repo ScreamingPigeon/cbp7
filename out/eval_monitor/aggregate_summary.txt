@@ -5,57 +5,57 @@ TAMonitor Aggregate Summary — 20 traces
 --- Per-Trace Summary ---
 Trace                                          Windows       MPKI    misp%   alloc%
 -----                                          -------       ----    -----   ------
-502-gcc-all_16112                                   47     17.828    8.15%    14.6%
-505-mcf-1_14364                                     24     17.745   16.36%    28.9%
-508-namd-1_126793                                    9      4.971   10.89%    13.6%
-531-deepsjeng-1_53703                               42     15.267   13.42%    23.8%
-548-exchange2-1_207156                              28      6.932    5.42%     9.8%
-554-roms-1_62613                                     3      0.119    0.63%     0.5%
-dcapo-kafka-jdk8.524_0                              38      6.533    3.59%     6.1%
-gap-sssp-usroad.287_0                               39     37.383   23.24%    54.0%
-gcc-1.52513_0                                       22     14.514    7.27%    11.9%
-java16-specjbb-64k-ir1000.19011_0                   36      6.919    3.94%     9.1%
-llvm-2.25945_0                                      19     12.036    6.82%    10.5%
-lua-3.25585_0                                       17      2.644    1.31%     0.2%
-nodejs-http2_4818                                   33      9.957    5.82%     9.4%
-nodejs-octane_3483                                  37      7.631    3.89%     6.0%
-python3-pyperf-dulwich.2000_0                       31      5.705    3.58%     5.7%
-rsbench-1.730_0                                     17     42.503   31.29%    37.2%
-sampleflow-1.127768_0                               17      2.102    1.60%     1.0%
-web_130                                             56      7.174    4.24%     6.9%
-web_74                                              56      6.558    3.88%     6.3%
-zstd-1.19139_0                                      13      8.298    7.95%    22.9%
+502-gcc-all_16112                                   47     22.743   10.38%    18.1%
+505-mcf-1_14364                                     24     21.078   19.42%    34.3%
+508-namd-1_126793                                    9      5.874   12.93%    16.5%
+531-deepsjeng-1_53703                               42     20.425   17.92%    30.9%
+548-exchange2-1_207156                              28     14.205   10.79%    19.0%
+554-roms-1_62613                                     3      0.267    1.40%     0.9%
+dcapo-kafka-jdk8.524_0                              38      8.193    4.48%     7.4%
+gap-sssp-usroad.287_0                               39     38.009   23.63%    55.3%
+gcc-1.52513_0                                       22     19.175    9.60%    15.5%
+java16-specjbb-64k-ir1000.19011_0                   36     11.031    6.27%    14.4%
+llvm-2.25945_0                                      19     17.069    9.63%    14.7%
+lua-3.25585_0                                       17      2.966    1.58%     0.2%
+nodejs-http2_4818                                   33     12.947    7.56%    12.0%
+nodejs-octane_3483                                  37      9.772    4.95%     7.2%
+python3-pyperf-dulwich.2000_0                       31      7.782    4.88%     7.7%
+rsbench-1.730_0                                     17     48.161   35.43%    43.2%
+sampleflow-1.127768_0                               17      3.122    2.38%     1.4%
+web_130                                             56     10.157    5.99%     9.5%
+web_74                                              56      8.216    4.87%     7.7%
+zstd-1.19139_0                                      13      8.597    7.82%    22.0%
 
 --- Aggregate Stats ---
   Traces:      20
-  Mean MPKI:   11.641
-  Median MPKI: 7.402
-  Stdev MPKI:  10.865
-  Min MPKI:    0.119
-  Max MPKI:    42.503
+  Mean MPKI:   14.489
+  Median MPKI: 10.594
+  Stdev MPKI:  11.732
+  Min MPKI:    0.267
+  Max MPKI:    48.161
 
 --- Per-Column Mean (across all windows, all traces) ---
-  MPKI                  mean=12.377  std=11.709  p50=9.401  p95=38.136
-  misp%                 mean=7.964  std=7.740  p50=5.800  p95=23.785
-  alloc_ok%             mean=14.212  std=14.638  p50=10.050  p95=51.270
-  acc_avg               mean=956.106  std=239.704  p50=1022.400  p95=1023.000
-  extra%                mean=14.522  std=14.488  p50=10.400  p95=51.270
-  true_blk%             mean=92.381  std=7.859  p50=94.700  p95=99.900
-  coll%                 mean=2.422  std=2.142  p50=2.300  p95=6.800
-  Tlast_zu%             mean=80.308  std=39.767  p50=100.000  p95=100.000
-  dir_misp%             mean=54.885  std=11.625  p50=53.300  p95=76.955
-  bnd_misp%             mean=44.258  std=11.227  p50=46.550  p95=57.200
-  micro_p50_mpki        mean=33.510  std=21.372  p50=47.500  p95=52.500
-  micro_p95_mpki        mean=44.349  std=16.064  p50=52.500  p95=52.500
-  phase_delta_avg       mean=2.873  std=1.665  p50=2.980  p95=5.638
+  MPKI                  mean=15.519  std=12.524  p50=14.104  p95=41.601
+  misp%                 mean=9.940  std=8.369  p50=8.400  p95=23.440
+  alloc_ok%             mean=17.366  std=15.450  p50=14.550  p95=51.770
+  acc_avg               mean=949.408  std=246.404  p50=1022.100  p95=1023.000
+  extra%                mean=17.924  std=15.147  p50=14.900  p95=51.770
+  true_blk%             mean=91.473  std=7.590  p50=93.000  p95=99.700
+  coll%                 mean=0.314  std=0.335  p50=0.300  p95=0.900
+  Tlast_zu%             mean=57.660  std=19.436  p50=61.900  p95=81.755
+  dir_misp%             mean=49.413  std=10.550  p50=49.500  p95=60.985
+  bnd_misp%             mean=50.416  std=10.558  p50=50.450  p95=61.385
+  micro_p50_mpki        mean=38.082  std=19.752  p50=52.500  p95=52.500
+  micro_p95_mpki        mean=46.875  std=13.730  p50=52.500  p95=52.500
+  phase_delta_avg       mean=3.315  std=1.658  p50=3.445  p95=5.940
   jaccard               mean=0.443  std=0.404  p50=0.483  p95=1.000
-  pingpong              mean=1396.228  std=2055.137  p50=618.000  p95=6515.100
-  cf_fb_only%           mean=18.065  std=4.529  p50=18.299  p95=25.146
-  cf_tage_only%         mean=21.237  std=11.969  p50=18.543  p95=49.258
-  prov_no_tag%          mean=0.000  std=0.000  p50=0.000  p95=0.000
-  prov_sec_rej%         mean=0.000  std=0.000  p50=0.000  p95=0.000
-  prov_meta_alt%        mean=3.004  std=2.263  p50=2.399  p95=7.270
-  prov_meta_pri%        mean=0.600  std=1.101  p50=0.233  p95=2.370
-  prov_no_meta%         mean=96.396  std=2.701  p50=97.220  p95=98.700
-  cf_sec_fb_acc%        mean=0.000  std=0.000  p50=0.000  p95=0.000
-  cf_sec_tage_acc%      mean=0.000  std=0.000  p50=0.000  p95=0.000
+  pingpong              mean=1972.846  std=2659.257  p50=942.500  p95=8951.100
+  cf_fb_only%           mean=16.922  std=4.464  p50=17.361  p95=23.529
+  cf_tage_only%         mean=21.833  std=11.107  p50=19.595  p95=48.781
+  prov_no_tag%          mean=28.888  std=15.628  p50=28.865  p95=52.332
+  prov_sec_rej%         mean=29.389  std=10.081  p50=29.471  p95=47.463
+  prov_meta_alt%        mean=10.093  std=8.072  p50=7.769  p95=27.552
+  prov_meta_pri%        mean=1.484  std=1.612  p50=0.948  p95=4.331
+  prov_no_meta%         mean=30.146  std=13.802  p50=26.102  p95=55.016
+  cf_sec_fb_acc%        mean=58.823  std=10.217  p50=57.592  p95=79.346
+  cf_sec_tage_acc%      mean=57.766  std=7.892  p50=56.377  p95=73.179

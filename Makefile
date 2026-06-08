@@ -32,7 +32,7 @@ REGION_SHIFT ?= 12
 PRED_HASH := $(shell echo '$(PREDICTOR_TYPE)|$(EXTRA_COMMON_FLAGS)|$(EXTRA_CBP_FLAGS)' | md5sum | cut -c1-8)
 
 
-.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis eval-monitor eval-monitor-vis compare compare-all quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report debug-print run-debug-print cbp-1c cbp-2c cbp-both quick-eval-1c quick-eval-2c quick-eval-both debug-print-1c debug-print-2c run-debug-print-1c run-debug-print-2c psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
+.PHONY: all help cbp reference predictor-config run-cbp run-reference trace-analyze run-trace-analyze ahead-block-analyze run-ahead-block-analyze cbp-profile-acc cbp-profile-acc-regions cbp-profile-analyze cbp-profile-analyze-regions cbp-monitor monitor-vis eval-monitor eval-monitor-vis compare compare-all group-frag-analyze run-group-frag-analyze quick-eval quick-eval-all test-tage-compile gsweep gsweep-report sweep sweep-report gradient gradient-report debug-print run-debug-print cbp-1c cbp-2c cbp-both quick-eval-1c quick-eval-2c quick-eval-both debug-print-1c debug-print-2c run-debug-print-1c run-debug-print-2c psweep-init psweep-generate psweep-timing psweep-eval psweep-run psweep-resume psweep-report save list-saved clean clean-cbp clean-monitor clean-profile clean-reference clean-out
 
 all: cbp reference
 
@@ -65,6 +65,7 @@ help:
 	@echo "  make run-block-analyze          Run block analyzer (BLOCK_FW, BLOCK_BANKS, BLOCK_INSTR)"
 	@echo "  make ahead-block-analyze        Build ahead block analyzer (N-capped blocks, secondary tag)"
 	@echo "  make run-ahead-block-analyze    Run ahead analyzer (AHEAD_LINEINST, AHEAD_N, AHEAD_BANKS, AHEAD_INSTR)"
+	@echo "  make run-group-frag-analyze     Run group fragmentation analyzer (FRAG_LINEINST, FRAG_N, FRAG_INSTR)"
 	@echo "  make predictor-config           Generate $(PREDICTOR_MK) from $(PARAMS_FILE)"
 	@echo "  make save                   Bookmark current cbp binary (SAVE_NAME=label)"
 	@echo "  make list-saved             List bookmarked binaries"
@@ -127,6 +128,17 @@ AHEAD_BANKS ?= 8
 AHEAD_INSTR ?= 0
 run-ahead-block-analyze: $(BUILD_DIR)/ahead-block-analyze | out
 	./$(BUILD_DIR)/ahead-block-analyze $(TRACE) $(AHEAD_LINEINST) $(AHEAD_N) $(AHEAD_BANKS) $(AHEAD_INSTR) | tee out/ahead_block_analysis.txt
+
+$(BUILD_DIR)/group-frag-analyze: trace_files/group_frag_analyzer.cpp trace_files/trace_reader.hpp | $(BUILD_DIR)
+	$(CXX) $(COMMON_FLAGS) $(EXTRA_COMMON_FLAGS) -Wall -Wextra -Itrace_files -o $@ trace_files/group_frag_analyzer.cpp -lz
+
+group-frag-analyze: $(BUILD_DIR)/group-frag-analyze
+
+FRAG_LINEINST ?= 256
+FRAG_N ?= 7
+FRAG_INSTR ?= 0
+run-group-frag-analyze: $(BUILD_DIR)/group-frag-analyze | out
+	./$(BUILD_DIR)/group-frag-analyze $(TRACE) $(FRAG_LINEINST) $(FRAG_N) $(FRAG_INSTR) | tee out/group_frag_analysis.txt
 
 run-cbp: $(BUILD_DIR)/cbp-$(PRED_HASH)
 	./$(BUILD_DIR)/cbp-$(PRED_HASH) $(TRACE) $(TRACE_NAME) $(WARMUP) $(MEASURE)

@@ -44,7 +44,19 @@ using TageDefault256 = tage<10>;
       1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
       0, 10, 10
 
-using TageAhead1C = TageAhead<TA1C_BASE(TAAllocPressSkip)>;
+using TageAhead1C    = TageAhead<TA1C_BASE(TAAllocPressSkip)>;
+
+// M2 behavioral model: MINH=2 (matches TageAheadHC_IR_M2) for monitor analysis
+#define TA1C_BASE_M2(ALLOC_CFG)                                                \
+  TATableConfig<15, 1024, 11, 2, 200, 1, ta::HistSeries::GEOMETRIC,           \
+                ta::UniformTag<11>, ta::GradedSize<512, 2048>>,                \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                               \
+      7, false,                                                                \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,     \
+      1024, 2, 256, true, HistUpdate::PATH, ALLOC_CFG, SiblingPolicy::ALL,    \
+      0, 10, 10
+using TageAhead1C_M2 = TageAhead<TA1C_BASE_M2(TAAllocPressSkip)>;
 
 // BR_P_ENTRY sweep: test per-group tag encoding
 #define TA1C_BPE(BPE, INTLV, ALLOC_CFG)                                       \
