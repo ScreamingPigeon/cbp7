@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""Plot per-trace power breakdown comparing two predictors.
+"""Plot per-trace power breakdown comparing N predictors (N >= 2).
 
-Reads two CSVs produced by per_trace_power.py and renders either:
-  - stacked bar (default): two stacked bars per trace, one per predictor
-  - line:                  one line per component per predictor
+Reads N CSVs produced by per_trace_power.py and renders either:
+  - stacked bar (default): one stacked bar per (trace, predictor)
+  - line:                  one line per (component, predictor)
 
 Usage:
-  python3 scripts/plot_per_trace_power.py A.csv B.csv [options]
+  python3 scripts/plot_per_trace_power.py A.csv B.csv [C.csv ...] [options]
 
 Options:
-  --mode {bar,line}    Plot style (default: bar)
-  --metric {epi,epc}  Use EPI (fJ/inst) or EPC (fJ/cyc) (default: epi)
-  --out PATH           Output image (default: out/per_trace_power.png)
-  --label-a NAME       Legend label for A (default: derived from filename)
-  --label-b NAME       Legend label for B (default: derived from filename)
-  --sort {trace,delta} Sort traces by name or by B-A baseline delta (default: trace)
-  --width INCHES       Figure width (default: 18)
-  --height INCHES      Figure height (default: 6)
+  --mode {bar,line}     Plot style (default: bar)
+  --metric {epi,epc}    Use EPI (fJ/inst) or EPC (fJ/cyc) (default: epi)
+  --out PATH            Output image (default: out/per_trace_power.png)
+  --labels NAME ...     Legend labels, one per CSV (default: derived from filename)
+  --sort {trace,delta}  Sort by name, or by (last - first) baseline delta
+  --width INCHES        Figure width (default: 18)
+  --height INCHES       Figure height (default: 6)
 """
 
 import argparse
@@ -26,7 +25,9 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 
 COMPONENTS = ["ram_logic", "fanout", "wiring"]
@@ -40,6 +41,8 @@ COLORS = {
     "fanout":    "#DD8452",   # orange
     "wiring":    "#55A467",   # green
 }
+LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1))]
+MARKERS = ["o", "s", "^", "D", "v", "P", "X"]
 
 
 def load_csv(path, metric):
@@ -58,35 +61,77 @@ def load_csv(path, metric):
 
 def default_label(path):
     name = Path(path).stem
-    # strip common prefixes/suffixes
     for s in ("ptp_", "_quick", "_full"):
         name = name.replace(s, "")
     return name
 
 
-def plot_bar(traces, a, b, label_a, label_b, ax, ylabel):
+def predictor_tone(idx, count):
+    """Positive values lighten toward white; negative values darken toward black."""
+    if count <= 1:
+        return 0.0
+    return np.linspace(0.45, -0.25, count)[idx]
+
+
+def apply_tone(color, tone):
+    rgb = np.array(mcolors.to_rgb(color))
+    if tone >= 0:
+        rgb = rgb + (1.0 - rgb) * tone
+    else:
+        rgb = rgb * (1.0 + tone)
+    return mcolors.to_hex(np.clip(rgb, 0.0, 1.0))
+
+
+def component_color(comp, pred_idx, pred_count):
+    return apply_tone(COLORS[comp], predictor_tone(pred_idx, pred_count))
+
+
+def predictor_color(pred_idx, pred_count):
+    return apply_tone("#666666", predictor_tone(pred_idx, pred_count))
+
+
+def add_split_legends(ax, predictors, include_baseline=False):
+    n = len(predictors)
+    comp_handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=COLORS[c], edgecolor="black",
+                      linewidth=0.3, label=COMPONENT_LABELS[c])
+        for c in COMPONENTS
+    ]
+    if include_baseline:
+        comp_handles.append(Line2D([0], [0], color="black", linestyle=":",
+                                   linewidth=1.5, label="Baseline total"))
+    comp_legend = ax.legend(handles=comp_handles, title="Power category",
+                            loc="upper left", fontsize=8, title_fontsize=8)
+    ax.add_artist(comp_legend)
+
+    pred_handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=predictor_color(i, n),
+                      edgecolor="black", linewidth=0.3, label=label)
+        for i, (label, _) in enumerate(predictors)
+    ]
+    ax.legend(handles=pred_handles, title="Predictor",
+              loc="upper right", fontsize=8, title_fontsize=8)
+
+
+def plot_bar(traces, predictors, ax, ylabel):
+    """predictors: list of (label, data_dict)."""
     n = len(traces)
+    N = len(predictors)
     x = np.arange(n)
-    w = 0.4
-    for offset, data, hatch in [(-w/2, a, ""), (w/2, b, "//")]:
+    # Total group width = 0.85 of slot; each bar = 0.85 / N
+    group_w = 0.85
+    w = group_w / N
+    offsets = [(-group_w/2) + (i + 0.5) * w for i in range(N)]
+
+    for i, ((label, data), offset) in enumerate(zip(predictors, offsets)):
         bottoms = np.zeros(n)
         for comp in COMPONENTS:
             vals = np.array([data[t][comp] for t in traces])
             ax.bar(x + offset, vals, w, bottom=bottoms,
-                   color=COLORS[comp], hatch=hatch, edgecolor="black",
+                   color=component_color(comp, i, N), edgecolor="black",
                    linewidth=0.3)
             bottoms += vals
-    # Legend: components + predictor hatches
-    comp_handles = [plt.Rectangle((0, 0), 1, 1, color=COLORS[c],
-                                  label=COMPONENT_LABELS[c]) for c in COMPONENTS]
-    pred_handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor="white", edgecolor="black",
-                      hatch="",   label=label_a),
-        plt.Rectangle((0, 0), 1, 1, facecolor="white", edgecolor="black",
-                      hatch="//", label=label_b),
-    ]
-    ax.legend(handles=comp_handles + pred_handles, ncol=3,
-              loc="upper right", fontsize=8)
+    add_split_legends(ax, predictors)
     ax.set_xticks(x)
     ax.set_xticklabels([t.split("_")[0].split(".")[0][:15] for t in traces],
                        rotation=45, ha="right", fontsize=8)
@@ -94,26 +139,26 @@ def plot_bar(traces, a, b, label_a, label_b, ax, ylabel):
     ax.grid(axis="y", alpha=0.3)
 
 
-def plot_line(traces, a, b, label_a, label_b, ax, ylabel):
+def plot_line(traces, predictors, ax, ylabel):
     n = len(traces)
+    N = len(predictors)
     x = np.arange(n)
-    for comp in COMPONENTS:
-        va = np.array([a[t][comp] for t in traces])
-        vb = np.array([b[t][comp] for t in traces])
-        ax.plot(x, va, "-o",  color=COLORS[comp], linewidth=1.5,
-                markersize=4, label=f"{COMPONENT_LABELS[comp]} ({label_a})")
-        ax.plot(x, vb, "--s", color=COLORS[comp], linewidth=1.5,
-                markersize=4, label=f"{COMPONENT_LABELS[comp]} ({label_b})")
-    # Baseline as faint reference
-    ba = np.array([a[t]["baseline"] for t in traces])
-    bb = np.array([b[t]["baseline"] for t in traces])
-    ax.plot(x, ba, ":", color="black", alpha=0.5, label=f"Total {label_a}")
-    ax.plot(x, bb, ":", color="gray",  alpha=0.7, label=f"Total {label_b}")
+    for i, (label, data) in enumerate(predictors):
+        ls = LINESTYLES[i % len(LINESTYLES)]
+        mk = MARKERS[i % len(MARKERS)]
+        for comp in COMPONENTS:
+            vals = np.array([data[t][comp] for t in traces])
+            ax.plot(x, vals, ls, marker=mk, color=component_color(comp, i, N),
+                    linewidth=1.5, markersize=4)
+        base = np.array([data[t]["baseline"] for t in traces])
+        ax.plot(x, base, ":", color="black",
+                alpha=0.3 + 0.4 * (i / max(N - 1, 1)))
+
     ax.set_xticks(x)
     ax.set_xticklabels([t.split("_")[0].split(".")[0][:15] for t in traces],
                        rotation=45, ha="right", fontsize=8)
     ax.set_ylabel(ylabel)
-    ax.legend(ncol=2, fontsize=7, loc="upper right")
+    add_split_legends(ax, predictors, include_baseline=True)
     ax.grid(axis="y", alpha=0.3)
 
 
@@ -121,70 +166,102 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv_a")
-    ap.add_argument("csv_b")
+    ap.add_argument("csvs", nargs="+",
+                    help="2 or more CSVs produced by per_trace_power.py")
     ap.add_argument("--mode",   choices=["bar", "line"], default="bar")
     ap.add_argument("--metric", choices=["epi", "epc"], default="epi")
     ap.add_argument("--out",    default="out/per_trace_power.png")
-    ap.add_argument("--label-a")
-    ap.add_argument("--label-b")
+    ap.add_argument("--labels", nargs="+", default=None,
+                    help="legend labels (one per CSV); default: derived from filename")
     ap.add_argument("--sort",   choices=["trace", "delta"], default="trace")
     ap.add_argument("--width",  type=float, default=18)
     ap.add_argument("--height", type=float, default=6)
     args = ap.parse_args()
 
-    a = load_csv(args.csv_a, args.metric)
-    b = load_csv(args.csv_b, args.metric)
+    if len(args.csvs) < 2:
+        ap.error("need at least 2 CSVs")
+    if args.labels and len(args.labels) != len(args.csvs):
+        ap.error(f"--labels expects {len(args.csvs)} entries, got {len(args.labels)}")
 
-    common = sorted(set(a.keys()) & set(b.keys()))
+    # Load all CSVs
+    datasets = [load_csv(p, args.metric) for p in args.csvs]
+    labels = (args.labels if args.labels
+              else [default_label(p) for p in args.csvs])
+    predictors = list(zip(labels, datasets))
+
+    # Common traces = intersection
+    common = set(datasets[0].keys())
+    for d in datasets[1:]:
+        common &= set(d.keys())
     if not common:
-        print("No common traces between the two CSVs", file=sys.stderr)
+        print("No common traces across all CSVs", file=sys.stderr)
         sys.exit(1)
-    only_a = set(a.keys()) - set(b.keys())
-    only_b = set(b.keys()) - set(a.keys())
-    if only_a or only_b:
-        print(f"Skipping non-overlapping traces: A-only={len(only_a)} B-only={len(only_b)}",
+    common = sorted(common)
+    skipped = sum(len(set(d.keys()) - set(common)) for d in datasets)
+    if skipped:
+        print(f"Skipping {skipped} non-overlapping (predictor, trace) entries",
               file=sys.stderr)
 
     if args.sort == "delta":
-        common.sort(key=lambda t: b[t]["baseline"] - a[t]["baseline"], reverse=True)
+        first, last = datasets[0], datasets[-1]
+        common.sort(key=lambda t: last[t]["baseline"] - first[t]["baseline"],
+                    reverse=True)
     traces = common
-
-    label_a = args.label_a or default_label(args.csv_a)
-    label_b = args.label_b or default_label(args.csv_b)
 
     units = "fJ/instruction" if args.metric == "epi" else "fJ/prediction-cycle"
     ylabel = f"Energy ({units})"
 
     fig, ax = plt.subplots(figsize=(args.width, args.height))
     if args.mode == "bar":
-        plot_bar(traces, a, b, label_a, label_b, ax, ylabel)
+        plot_bar(traces, predictors, ax, ylabel)
     else:
-        plot_line(traces, a, b, label_a, label_b, ax, ylabel)
+        plot_line(traces, predictors, ax, ylabel)
     ax.set_title("Power Breakdown")
 
     fig.tight_layout()
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=130)
-    print(f"→ {args.out}  ({len(traces)} traces, mode={args.mode}, metric={args.metric})")
+    print(f"→ {args.out}  ({len(traces)} traces, "
+          f"mode={args.mode}, metric={args.metric}, N={len(predictors)})")
 
-    # Terminal diff: per-category average across traces
+    # Terminal table: per-component mean across traces, one column per predictor
     units = "fJ/inst" if args.metric == "epi" else "fJ/cyc"
     n = len(traces)
     print(f"\n  Mean over {n} traces ({units})")
-    w_label = max(len(label_a), len(label_b), 12)
-    print(f"  {'Component':<12} {label_a:>{w_label}} {label_b:>{w_label}} "
-          f"{'Δ':>10} {'Δ%':>8}")
-    print(f"  {'-'*12} {'-'*w_label} {'-'*w_label} {'-'*10} {'-'*8}")
-    for key, label in [("baseline", "Baseline")] + \
-                      [(c, COMPONENT_LABELS[c]) for c in COMPONENTS]:
-        va = sum(a[t][key] for t in traces) / n
-        vb = sum(b[t][key] for t in traces) / n
-        d  = vb - va
-        dp = (d / va * 100.0) if va else 0.0
-        sign = "+" if d >= 0 else ""
-        print(f"  {label:<12} {va:>{w_label}.1f} {vb:>{w_label}.1f} "
-              f"{sign}{d:>9.1f} {sign}{dp:>7.1f}%")
+    w_label = max(max(len(l) for l in labels), 12)
+    header = f"  {'Component':<12} " + " ".join(f"{l:>{w_label}}" for l in labels)
+    print(header)
+    print("  " + "-" * 12 + " " + " ".join("-" * w_label for _ in labels))
+    mean_rows = {}
+    for key, prn in [("baseline", "Baseline")] + \
+                    [(c, COMPONENT_LABELS[c]) for c in COMPONENTS]:
+        vals = [sum(d[t][key] for t in traces) / n for _, d in predictors]
+        mean_rows[key] = vals
+        print(f"  {prn:<12} " + " ".join(f"{v:>{w_label}.1f}" for v in vals))
+
+    print(f"\n  Fraction of baseline mean")
+    print(header)
+    print("  " + "-" * 12 + " " + " ".join("-" * w_label for _ in labels))
+    for key, prn in [("baseline", "Baseline")] + \
+                    [(c, COMPONENT_LABELS[c]) for c in COMPONENTS]:
+        vals = [
+            mean_rows[key][i] / mean_rows["baseline"][i]
+            if mean_rows["baseline"][i] else 0.0
+            for i in range(len(predictors))
+        ]
+        print(f"  {prn:<12} " + " ".join(f"{v:>{w_label}.4f}" for v in vals))
+
+    # Ratios vs first predictor
+    if len(predictors) > 1:
+        print(f"\n  Ratios vs {labels[0]}:")
+        for (label, data), idx in [(p, i) for i, p in enumerate(predictors[1:], 1)]:
+            row = f"    {label:<{w_label}}  "
+            for key, prn in [("baseline", "Baseline")] + \
+                            [(c, COMPONENT_LABELS[c]) for c in COMPONENTS]:
+                v0 = sum(predictors[0][1][t][key] for t in traces) / n
+                v  = sum(data[t][key] for t in traces) / n
+                row += f"{prn[:4]} ×{v/v0 if v0 else 0:.2f}  "
+            print(row)
 
 
 if __name__ == "__main__":
