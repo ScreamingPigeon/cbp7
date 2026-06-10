@@ -3,11 +3,16 @@
 # eval_monitor.sh — Run TAMonitor on the representative trace subset.
 #
 # Usage:
-#   ./scripts/eval_monitor.sh <binary> [trace_dir] [out_dir] [jobs]
+#   ./scripts/eval_monitor.sh <binary> [trace_dir] [out_dir] [jobs] [--all-traces]
+#
+# Options:
+#   --all-traces, -a  Use every *_trace.gz file in trace_dir instead of the
+#                     representative subset.
 #
 # Produces per-trace files:
-#   <out_dir>/<trace>_csv.txt      — windowed CSV (stdout from monitor)
-#   <out_dir>/<trace>_summary.txt  — end-of-trace summary (stderr from monitor)
+#   <out_dir>/<trace>_score.txt    — scoring line (stdout from monitor)
+#   <out_dir>/<trace>_csv.txt      — windowed CSV (from monitor stderr)
+#   <out_dir>/<trace>_summary.txt  — end-of-trace summary (from monitor stderr)
 #
 # Then runs aggregate_monitor.py to produce:
 #   <out_dir>/aggregate_csv.txt    — per-window mean across traces
@@ -15,10 +20,43 @@
 
 set -euo pipefail
 
-EXEC="${1:?Usage: $0 <binary> [trace_dir] [out_dir] [jobs]}"
-TRACE_DIR="${2:-./traces}"
-OUT_DIR="${3:-out/eval_monitor}"
-MAXJOBS="${4:-$(nproc)}"
+USE_ALL_TRACES=0
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --all-traces|-a)
+            USE_ALL_TRACES=1
+            ;;
+        --)
+            shift
+            while [[ $# -gt 0 ]]; do
+                POSITIONAL+=("$1")
+                shift
+            done
+            break
+            ;;
+        -*)
+            echo "ERROR: unknown option: $1" >&2
+            echo "Usage: $0 <binary> [trace_dir] [out_dir] [jobs] [--all-traces]" >&2
+            exit 2
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if [[ ${#POSITIONAL[@]} -lt 1 || ${#POSITIONAL[@]} -gt 4 ]]; then
+    echo "Usage: $0 <binary> [trace_dir] [out_dir] [jobs] [--all-traces]" >&2
+    exit 2
+fi
+
+EXEC="${POSITIONAL[0]}"
+TRACE_DIR="${POSITIONAL[1]:-./traces}"
+OUT_DIR="${POSITIONAL[2]:-out/eval_monitor}"
+MAXJOBS="${POSITIONAL[3]:-$(nproc)}"
 
 WARMINST=1000000
 SIMINST=40000000
@@ -47,6 +85,16 @@ REPR_TRACES=(
     "lua-3.25585_0_trace.gz"
 )
 
+if [[ $USE_ALL_TRACES -eq 1 ]]; then
+    mapfile -t REPR_TRACES < <(
+        find "${TRACE_DIR}" -maxdepth 1 -type f -name '*_trace.gz' -printf '%f\n' | sort
+    )
+    if [[ ${#REPR_TRACES[@]} -eq 0 ]]; then
+        echo "ERROR: no *_trace.gz files found in ${TRACE_DIR}" >&2
+        exit 1
+    fi
+fi
+
 # Verify traces
 MISSING=0
 for t in "${REPR_TRACES[@]}"; do
@@ -61,7 +109,11 @@ fi
 
 mkdir -p "${OUT_DIR}"
 
-echo "Running monitor on ${#REPR_TRACES[@]} representative traces (${MAXJOBS} parallel jobs)..."
+if [[ $USE_ALL_TRACES -eq 1 ]]; then
+    echo "Running monitor on all ${#REPR_TRACES[@]} traces in ${TRACE_DIR} (${MAXJOBS} parallel jobs)..."
+else
+    echo "Running monitor on ${#REPR_TRACES[@]} representative traces (${MAXJOBS} parallel jobs)..."
+fi
 
 printf '%s\n' "${REPR_TRACES[@]}" | \
     xargs -P "${MAXJOBS}" -I{} bash -c '

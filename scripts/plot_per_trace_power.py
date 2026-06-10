@@ -14,6 +14,8 @@ Options:
   --out PATH            Output image (default: out/per_trace_power.png)
   --labels NAME ...     Legend labels, one per CSV (default: derived from filename)
   --sort {trace,delta}  Sort by name, or by (last - first) baseline delta
+  --full-extrapolate    Print an additional mean table extrapolated to the
+                        full eval set using avg quick-trace component ratios
   --width INCHES        Figure width (default: 18)
   --height INCHES       Figure height (default: 6)
 """
@@ -44,6 +46,18 @@ COLORS = {
 LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 1)), (0, (1, 1))]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X"]
 
+# Full 168-trace eval directories for the checked-in per_trace_power CSVs.
+FULL_EVAL_DIRS = {
+    "TageDefault":        "full_out/default_tage",
+    "TageDefaultRABT":    "full_out/default_tage_rabt",
+    "TageAheadHC_IR":     "full_out/hc_ir_fo_fix",
+    "TageAheadHC_IR_M2":  "out/full_m2",
+}
+
+COL_NAME = 0
+COL_NINSTR = 1
+COL_EPI = 11
+
 
 def load_csv(path, metric):
     """Returns dict trace_name -> {component: value, baseline: value}."""
@@ -64,6 +78,51 @@ def default_label(path):
     for s in ("ptp_", "_quick", "_full"):
         name = name.replace(s, "")
     return name
+
+
+def predictor_key(path):
+    """Internal predictor key derived from the per_trace_power CSV filename."""
+    return default_label(path)
+
+
+def load_full_eval_epi(directory):
+    """Returns (instruction-weighted mean EPI, n_traces) from a full eval dir."""
+    if directory is None or not Path(directory).is_dir():
+        return None
+    total_instr = 0.0
+    total_energy = 0.0
+    n = 0
+    for path in Path(directory).glob("*.out"):
+        line = path.read_text().splitlines()
+        if not line:
+            continue
+        parts = line[0].split(",")
+        if len(parts) <= COL_EPI:
+            continue
+        try:
+            ninstr = float(parts[COL_NINSTR])
+            epi = float(parts[COL_EPI])
+        except ValueError:
+            continue
+        total_instr += ninstr
+        total_energy += ninstr * epi
+        n += 1
+    if total_instr <= 0 or n == 0:
+        return None
+    return total_energy / total_instr, n
+
+
+def average_component_ratios(data, traces):
+    """Mean of per-trace component/baseline ratios for each power category."""
+    ratios = {}
+    for comp in COMPONENTS:
+        vals = [
+            data[t][comp] / data[t]["baseline"]
+            for t in traces
+            if data[t]["baseline"] > 0
+        ]
+        ratios[comp] = sum(vals) / len(vals) if vals else 0.0
+    return ratios
 
 
 def predictor_tone(idx, count):
@@ -174,6 +233,9 @@ def main():
     ap.add_argument("--labels", nargs="+", default=None,
                     help="legend labels (one per CSV); default: derived from filename")
     ap.add_argument("--sort",   choices=["trace", "delta"], default="trace")
+    ap.add_argument("--full-extrapolate", action="store_true",
+                    help="print an additional table using instruction-weighted "
+                         "full-eval baseline EPI times avg quick component ratios")
     ap.add_argument("--width",  type=float, default=18)
     ap.add_argument("--height", type=float, default=6)
     args = ap.parse_args()
@@ -185,6 +247,7 @@ def main():
 
     # Load all CSVs
     datasets = [load_csv(p, args.metric) for p in args.csvs]
+    keys = [predictor_key(p) for p in args.csvs]
     labels = (args.labels if args.labels
               else [default_label(p) for p in args.csvs])
     predictors = list(zip(labels, datasets))
@@ -262,6 +325,45 @@ def main():
                 v  = sum(data[t][key] for t in traces) / n
                 row += f"{prn[:4]} ×{v/v0 if v0 else 0:.2f}  "
             print(row)
+
+    if args.full_extrapolate:
+        extrapolated = []
+        for key, (label, data) in zip(keys, predictors):
+            full = load_full_eval_epi(FULL_EVAL_DIRS.get(key))
+            if full is None:
+                print(f"\n  WARNING: no full eval data for {label} ({key})",
+                      file=sys.stderr)
+                continue
+            full_epi, n_full = full
+            avg_ratios = average_component_ratios(data, traces)
+            row = {
+                "label": label,
+                "n_full": n_full,
+                "baseline": full_epi,
+                **{comp: full_epi * avg_ratios[comp] for comp in COMPONENTS},
+            }
+            extrapolated.append(row)
+
+        if extrapolated:
+            print(f"\n  Full-extrapolated mean ({units})")
+            print("  Baseline = instruction-weighted full-eval EPI; "
+                  "components = baseline × avg quick component/baseline ratio")
+            w_label = max(max(len(r["label"]) for r in extrapolated), 12)
+            header = f"  {'Component':<12} " + " ".join(
+                f"{r['label']:>{w_label}}" for r in extrapolated)
+            print(header)
+            print("  " + "-" * 12 + " " + " ".join(
+                "-" * w_label for _ in extrapolated))
+            for key, prn in [("baseline", "Baseline")] + \
+                            [(c, COMPONENT_LABELS[c]) for c in COMPONENTS]:
+                print(f"  {prn:<12} " + " ".join(
+                    f"{r[key]:>{w_label}.1f}" for r in extrapolated))
+
+            print(f"\n  Full trace counts")
+            print("  " + " ".join(
+                f"{r['label']:>{w_label}}" for r in extrapolated))
+            print("  " + " ".join(
+                f"{r['n_full']:>{w_label}d}" for r in extrapolated))
 
 
 if __name__ == "__main__":

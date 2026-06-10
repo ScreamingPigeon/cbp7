@@ -1743,6 +1743,13 @@ struct TageAhead : predictor {
     }
     if (!static_cast<u64>(do_train))
       mon.record_train_skip();
+    // Attribute block mispredict to the first wrong branch's provider.
+    if (static_cast<u64>(mispredict)) {
+      std::array<bool, N> actual_dir_arr{};
+      for (u64 r = 0; r < num_branch && r < N; r++)
+        actual_dir_arr[r] = static_cast<u64>(branch_dir[r]);
+      mon.record_block_misp_cause(num_branch, actual_dir_arr);
+    }
 #endif
 #ifdef TAGE_MONITOR
     // TODO: No idea why this even is here

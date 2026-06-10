@@ -79,6 +79,16 @@ PREDICTORS = {
 }
 
 
+def publication_predictor_label(label):
+    labels = {
+        "example TAGE": "example TAGE",
+        "tage<>@RABT (NUMG=15)": "scaled TAGE",
+        "RABT (MINHIST=8)": "RABT",
+        "RABT M2": "RABT",
+    }
+    return labels.get(label, label)
+
+
 # CSV column indices from cbp.hpp run output
 COL_NAME, COL_NINSTR, COL_NPRED, COL_EXTRA, COL_MISP, COL_EPI = 0, 1, 4, 5, 8, 11
 
@@ -352,18 +362,17 @@ def fig_best_worst(names, top_n, out_path):
         ax.axvline(split_at - 0.5, color="black", linewidth=0.8, alpha=0.55)
         ymax = ax.get_ylim()[1]
         ax.text((split_at - 1) / 2, ymax * 0.98,
-                f"Top {top_n}: improved / increased least",
-                ha="center", va="top", fontsize=9, fontweight="bold")
+                f"Top {top_n}: increased least",
+                ha="center", va="top", fontsize=14, fontweight="bold")
         ax.text(split_at + (len(selected_traces) - split_at - 1) / 2, ymax * 0.98,
                 f"Top {top_n}: increased most",
-                ha="center", va="top", fontsize=9, fontweight="bold")
+                ha="center", va="top", fontsize=14, fontweight="bold")
 
-    trace_labels = [t[:24] for t in selected_traces]
+    trace_labels = [t.split("_")[0].split(".")[0][:15] for t in selected_traces]
     ax.set_xticks(x)
-    ax.set_xticklabels(trace_labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Estimated EPI breakdown (fJ / instruction)", fontsize=10)
-    ax.set_title(f"Best/Worst Trace Power: {last['label']} vs {first['label']}",
-                 fontsize=11)
+    ax.tick_params(labelsize=14)
+    ax.set_xticklabels(trace_labels, rotation=45, ha="right", fontsize=14)
+    ax.set_ylabel("Estimated EPI breakdown (fJ / instruction)", fontsize=18)
     ax.grid(axis="y", alpha=0.3)
 
     comp_handles = [
@@ -372,20 +381,24 @@ def fig_best_worst(names, top_n, out_path):
         for c in comps
     ]
     comp_legend = ax.legend(handles=comp_handles, title="Power category",
-                            loc="upper left", bbox_to_anchor=(1.01, 1.0),
-                            fontsize=8, title_fontsize=8)
+                            loc="upper left", bbox_to_anchor=(0.01, 0.94),
+                            bbox_transform=ax.transAxes,
+                            prop={"size": 14},
+                            title_fontsize=14)
     ax.add_artist(comp_legend)
 
     pred_handles = [
         plt.Rectangle((0, 0), 1, 1,
                       facecolor=toned_color("#666666", i, len(preds)),
                       edgecolor="black",
-                      linewidth=0.35, label=p["label"])
+                      linewidth=0.35, label=publication_predictor_label(p["label"]))
         for i, p in enumerate(preds)
     ]
     ax.legend(handles=pred_handles, title="Predictor",
-              loc="upper left", bbox_to_anchor=(1.01, 0.78),
-              fontsize=8, title_fontsize=8)
+              loc="upper left", bbox_to_anchor=(0.01, 0.72),
+              bbox_transform=ax.transAxes,
+              prop={"size": 14},
+              title_fontsize=14)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -475,7 +488,7 @@ def main():
                     default=["TageDefault", "TageDefaultRABT",
                              "TageAheadHC_IR", "TageAheadHC_IR_M2"],
                     help="predictors to include in scaling fig")
-    ap.add_argument("--top-n", type=int, default=8,
+    ap.add_argument("--top-n", type=int, default=5,
                     help="best/worst trace count per side")
     ap.add_argument("--out-dir", default="out/comparative")
     args = ap.parse_args()

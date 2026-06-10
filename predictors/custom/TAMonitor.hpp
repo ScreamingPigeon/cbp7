@@ -237,6 +237,18 @@ struct TAMonitor {
     u64 prov_tage_no_meta = 0;
     u64 prov_tage_no_meta_correct = 0;
 
+    // Block-mispredict cause attribution: count of block mispredictions
+    // whose TRIGGER branch (first wrong branch in the block) was routed
+    // through each provider category. Sum equals total block mispredicts
+    // (modulo blocks where the trigger could not be identified).
+    u64 cause_no_tag_match = 0;
+    u64 cause_sec_tag_reject = 0;
+    u64 cause_tage_meta_alt = 0;
+    u64 cause_tage_meta_pri = 0;
+    u64 cause_tage_no_meta = 0;
+    u64 cause_phantom_slot = 0;  // all committed slots correct; phantom slot k>=num_branch predicted TAKEN
+    u64 cause_unattributed = 0;  // mispredict signaled but no wrong branch found and no phantom
+
     // Counterfactual: for sec-tag-rejected branches, would the tag-only
     // provider have been correct? (i.e. what we lose by sec-tag filtering)
     u64 cf_sec_tag_only_total = 0;
@@ -417,6 +429,13 @@ struct TAMonitor {
   std::array<bool, N> shadow_has_tage_provider{};
   std::array<bool, N> shadow_tag_only_pred{};
   std::array<u64, N> shadow_meta_bank{};
+
+  // Phantom-slot tracking: predictor commits per-slot directions for all N
+  // slots at predict1, but only num_branch slots actually commit. If the
+  // first slot beyond num_branch is predicted TAKEN, the predicted next-block
+  // PC is derived from a phantom slot the dynamic block doesn't realize.
+  // Recorded once per block from update_cycle. true = phantom slot taken.
+  bool shadow_pred_phantom_taken = false;
 
   // Per-PC diagnostics
   std::unordered_map<u64, PCDiag> pc_diag;
@@ -645,6 +664,41 @@ struct TAMonitor {
   // Feature 24: record fallback prediction per branch (call from TageAhead)
   void record_fb_prediction(u64 rank, bool fb_taken) {
     if (rank < N) shadow_fb_pred[rank] = fb_taken;
+  }
+
+  // Attribute a block mispredict to its trigger (first wrong) branch's
+  // provider category. Call exactly once per mispredicted block, AFTER
+  // record_outcome has been called for all branches in the block (so the
+  // shadow state for each branch is up to date — actually shadow state is
+  // populated at predict time, so order doesn't matter, but the canonical
+  // call site is right after the record_outcome loop in update_cycle).
+  // num_branch_committed must be the number of branches the predictor saw
+  // before the block ended.
+  void record_block_misp_cause(u64 num_branch_committed,
+                               const std::array<bool, N> &actual_dir) {
+    // Find first rank where shadow_pred disagrees with actual.
+    u64 trigger = num_branch_committed;
+    for (u64 r = 0; r < num_branch_committed && r < N; r++) {
+      if (shadow_pred[r] != actual_dir[r]) { trigger = r; break; }
+    }
+    auto bump = [&](Counters &c) {
+      if (trigger >= num_branch_committed) {
+        c.cause_unattributed++;
+        return;
+      }
+      if (!shadow_any_tag_hit[trigger]) {
+        c.cause_no_tag_match++;
+      } else if (!shadow_has_tage_provider[trigger]) {
+        c.cause_sec_tag_reject++;
+      } else if (shadow_meta_overrode[trigger]) {
+        if (shadow_meta_chose_alt[trigger]) c.cause_tage_meta_alt++;
+        else                                c.cause_tage_meta_pri++;
+      } else {
+        c.cause_tage_no_meta++;
+      }
+    };
+    bump(cum);
+    bump(win);
   }
 
   void record_outcome(u64 rank, bool actual_taken, bool mispredict) {
@@ -1168,6 +1222,7 @@ struct TAMonitor {
       os << "pingpong,";
       os << "cf_fb_only%,cf_tage_only%,";
       os << "prov_no_tag%,prov_sec_rej%,prov_meta_alt%,prov_meta_pri%,prov_no_meta%,";
+      os << "cause_no_tag%,cause_sec_rej%,cause_meta_alt%,cause_meta_pri%,cause_no_meta%,cause_unattrib%,cause_fb_total%,";
       os << "cf_sec_fb_acc%,cf_sec_tage_acc%,";
       os << "ben_rej%,ben_incr%,ben_decr%,ben_ctr_avg";
       if constexpr (NUM_META_BANKS > 1) {
@@ -1266,6 +1321,18 @@ struct TAMonitor {
        << "," << pct(w.prov_tage_meta_alt, w_prov_total)
        << "," << pct(w.prov_tage_meta_pri, w_prov_total)
        << "," << pct(w.prov_tage_no_meta, w_prov_total);
+    // Block-mispredict cause attribution (denominator = mispredict count)
+    u64 w_cause_total = w.cause_no_tag_match + w.cause_sec_tag_reject +
+                        w.cause_tage_meta_alt + w.cause_tage_meta_pri +
+                        w.cause_tage_no_meta + w.cause_unattributed;
+    u64 w_cause_fb = w.cause_no_tag_match + w.cause_sec_tag_reject;
+    os << "," << pct(w.cause_no_tag_match, w_cause_total)
+       << "," << pct(w.cause_sec_tag_reject, w_cause_total)
+       << "," << pct(w.cause_tage_meta_alt, w_cause_total)
+       << "," << pct(w.cause_tage_meta_pri, w_cause_total)
+       << "," << pct(w.cause_tage_no_meta, w_cause_total)
+       << "," << pct(w.cause_unattributed, w_cause_total)
+       << "," << pct(w_cause_fb, w_cause_total);
     // Sec-tag counterfactual accuracy
     os << "," << pct(w.cf_sec_fb_correct, w.cf_sec_tag_only_total)
        << "," << pct(w.cf_sec_tag_only_correct, w.cf_sec_tag_only_total);
@@ -1433,6 +1500,31 @@ struct TAMonitor {
     os << "  TAGE provider, no meta:    " << c.prov_tage_no_meta << " ("
        << pct(c.prov_tage_no_meta, prov_total) << "%)  acc="
        << pct(c.prov_tage_no_meta_correct, c.prov_tage_no_meta) << "%\n";
+
+    // Block-mispredict cause attribution: which provider category was
+    // responsible for the FIRST wrong branch in each mispredicted block.
+    // Sums to the total block-mispredict count (plus any unattributed).
+    u64 cause_total = c.cause_no_tag_match + c.cause_sec_tag_reject +
+                      c.cause_tage_meta_alt + c.cause_tage_meta_pri +
+                      c.cause_tage_no_meta + c.cause_unattributed;
+    os << "\nBlock-mispredict Cause Attribution:\n";
+    os << "  No tag match (FB only):    " << c.cause_no_tag_match << " ("
+       << pct(c.cause_no_tag_match, cause_total) << "%)\n";
+    os << "  Sec-tag rejected (FB):     " << c.cause_sec_tag_reject << " ("
+       << pct(c.cause_sec_tag_reject, cause_total) << "%)\n";
+    os << "  TAGE provider, meta->alt:  " << c.cause_tage_meta_alt << " ("
+       << pct(c.cause_tage_meta_alt, cause_total) << "%)\n";
+    os << "  TAGE provider, meta->pri:  " << c.cause_tage_meta_pri << " ("
+       << pct(c.cause_tage_meta_pri, cause_total) << "%)\n";
+    os << "  TAGE provider, no meta:    " << c.cause_tage_no_meta << " ("
+       << pct(c.cause_tage_no_meta, cause_total) << "%)\n";
+    if (c.cause_unattributed > 0) {
+      os << "  Unattributed:              " << c.cause_unattributed << " ("
+         << pct(c.cause_unattributed, cause_total) << "%)\n";
+    }
+    u64 fb_caused = c.cause_no_tag_match + c.cause_sec_tag_reject;
+    os << "  FB-caused total:           " << fb_caused << " ("
+       << pct(fb_caused, cause_total) << "%)\n";
 
     // Counterfactual: sec-tag rejection cost
     if (c.cf_sec_tag_only_total > 0) {

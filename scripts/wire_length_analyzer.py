@@ -149,6 +149,17 @@ def predictor_name(path):
     return Path(path).stem
 
 
+def cumulative_plot_label(name):
+    """Publication-facing labels for the cumulative wire-count plot."""
+    labels = {
+        "TageDefault": "example TAGE",
+        "TageDefaultRABT": "scaled TAGE",
+        "TageAheadHC_IR": "RABT",
+        "TageAheadHC_IR_M2": "RABT",
+    }
+    return labels.get(name, name)
+
+
 # ── Site / register-placement analysis ──────────────────────────────────────
 
 def load_sites(sites_path):
@@ -428,8 +439,8 @@ def main():
                          " on the floorplan; report current vs counterfactual"
                          " distance for per-table prefetch_*[i] registers")
     ap.add_argument("--plot-dist", action="store_true",
-                    help="overlay CDF + histogram of RAM→hub Manhattan distances "
-                         "for all input predictors → out/floorplans/wire_dist.png")
+                    help="plot RAM→hub Manhattan distance cumulative counts and "
+                         "histograms for all input predictors")
     ap.add_argument("--render-mode", choices=["bundle", "top", "all"], default="bundle",
                     help="how to draw wires: bundle (inter-table aggregate, default),"
                          " top (longest N pairs), all (every pair, slow)")
@@ -513,12 +524,14 @@ def main():
         import matplotlib.pyplot as plt
         import numpy as np
 
-        fig, (ax_count, ax_pdf) = plt.subplots(1, 2, figsize=(14, 5))
+        out_dir = Path(args.render_out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
         palette = plt.cm.tab10.colors
         # Shared bin grid across predictors so the line plot stays comparable
         all_d = np.concatenate([np.asarray(m["_hub_dists_um"]) for _, _, m in results])
         bins = np.linspace(0, float(all_d.max()), 41) if all_d.size else np.linspace(0, 1, 41)
-        centers = 0.5 * (bins[1:] + bins[:-1])
+
+        fig_count, ax_count = plt.subplots(figsize=(7, 5))
         for i, (name, _, m) in enumerate(results):
             d = np.asarray(m["_hub_dists_um"])
             color = palette[i % len(palette)]
@@ -526,27 +539,34 @@ def main():
             d_sorted = np.sort(d)
             cum_count = np.arange(1, len(d_sorted) + 1)
             ax_count.plot(d_sorted, cum_count, "-", color=color, linewidth=2,
-                          label=f"{name} (n={len(d)})")
-            ax_pdf.hist(d, bins=bins, color=color, alpha=0.45,
-                        label=f"{name}", edgecolor=color, linewidth=1)
+                          label=cumulative_plot_label(name))
 
         ax_count.set_xlabel("RAM → register-hub Manhattan distance (μm)")
         ax_count.set_ylabel("Cumulative # wires (≤ x)")
-        ax_count.set_title("Cumulative wire-count vs length")
         ax_count.grid(True, alpha=0.3)
         ax_count.legend(fontsize=9, loc="lower right")
+        fig_count.tight_layout()
+        out_count = out_dir / "wire_dist_count.png"
+        fig_count.savefig(out_count, dpi=130)
+        plt.close(fig_count)
 
+        fig_hist, ax_pdf = plt.subplots(figsize=(7, 5))
+        for i, (name, _, m) in enumerate(results):
+            d = np.asarray(m["_hub_dists_um"])
+            color = palette[i % len(palette)]
+            ax_pdf.hist(d, bins=bins, color=color, alpha=0.45,
+                        label=f"{name}", edgecolor=color, linewidth=1)
         ax_pdf.set_xlabel("RAM → register-hub Manhattan distance (μm)")
         ax_pdf.set_ylabel("count")
-        ax_pdf.set_title("Histogram of RAM → register-hub wire lengths")
         ax_pdf.grid(True, alpha=0.3)
         ax_pdf.legend(fontsize=9)
+        fig_hist.tight_layout()
+        out_hist = out_dir / "wire_dist_hist.png"
+        fig_hist.savefig(out_hist, dpi=130)
+        plt.close(fig_hist)
 
-        fig.tight_layout()
-        out_png = Path(args.render_out_dir) / "wire_dist.png"
-        Path(args.render_out_dir).mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_png, dpi=130)
-        print(f"\nDistribution plot → {out_png}")
+        print(f"\nCumulative wire-count plot → {out_count}")
+        print(f"Histogram plot → {out_hist}")
 
     if args.render:
         print("\nRendering wire-bundle overlays:")

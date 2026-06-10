@@ -714,6 +714,33 @@ using S9_TC_GT11_7_8B = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::G
                                       ta::uniform_array<u64, 15>(1),
                                       ta::uniform_array<u64, 15>(8)>;
 using TA1C_BPE1_8B_GT117 = TageAhead<S1_BPE1_8B_BASE(S9_TC_GT11_7_8B)>;
+
+// HC_IR / RABT_bim parameter match: BPE=1, NT=15, GradedTag<11,7>,
+// T0-T4=1024 / T5-T14=2048, META_WIDTH=4, META_CAP=2048, META_BANKS=2,
+// FB_BIM_HYST enabled (HC_IR_IR.hpp:315). Differs from TA1C_BPE1_8B_MB2
+// on META_*, tag style, T0 size, and FBH.
+struct HCIRSize {
+  constexpr u64 operator()(u64 i, [[maybe_unused]] u64 n) const {
+    return i < 5 ? 1024 : 2048;
+  }
+};
+using S9_TC_HCIR = TATableConfig<15, 1024, 11, 8, 200, 1, ta::HistSeries::GEOMETRIC,
+                                 ta::GradedTag<11, 7>, HCIRSize,
+                                 ta::uniform_array<u64, 15>(1),
+                                 ta::uniform_array<u64, 15>(8)>;
+#define S1_HCIR_BASE(TABLE_CFG)                                                \
+  TABLE_CFG,                                                                   \
+      7, 6, 5, true, 1, ta::Xor3SecTagHash5, 1,                                \
+      1, false,                                                                \
+      2, 2,                                                                    \
+      UMispPolicy::UNTOUCHED, UClearPolicy::DECREMENT, 8192, false, 6, 2,      \
+      2048, 4, 256, true, HistUpdate::PATH, TAAllocPressSkip,                  \
+      SiblingPolicy::ALL, 0, 10, 10,                                           \
+      true, DecayMiss::TAG_OR_SEC, DecayOp::DECREMENT,                         \
+      ta::uniform_array<u64, 15>(8), ta::FixedDecayThresh<8>, false,           \
+      ta::DefaultEpochTrigger, false, true, false, true, 0, false, ta::SecTagAll
+using TA_HCIR_Match = TageAhead<S1_HCIR_BASE(S9_TC_HCIR), 1, 0, false, 2>;
+
 // SEC_TAG sweep: 3-bit and 4-bit (baseline is 5-bit)
 #define S1_BPE1_8B_SEC3(TABLE_CFG)                                             \
   TABLE_CFG,                                                                   \
