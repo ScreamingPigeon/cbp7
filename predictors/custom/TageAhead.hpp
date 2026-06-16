@@ -956,7 +956,14 @@ struct TageAhead : predictor {
     // NOTE: @prakhar @claude audit
     branch_dir.fanout(hard<3>{}); // true_block + hist_input + actual_dir
 #ifdef TAGE_MONITOR
-    arr<val<1>, N> old_pred = [&](u64 i) -> val<1> { return val<1>{pred[i]}; };
+    // Eager software capture into a std::array so the values are guaranteed
+    // to be from block B (pre-scatter), regardless of when the array is read.
+    // This is consumed by the monitor record_prediction loops in both the
+    // NUM_GROUPS==1 path (~line 1533) and the NUM_GROUPS>1 path (~line 1448),
+    // and by the phantom-slot capture (~line 1751).
+    std::array<bool, N> old_pred_b{};
+    for (u64 i = 0; i < N; i++)
+      old_pred_b[i] = static_cast<u64>(pred[i]);
 #endif
 
 #ifdef TAGE_MONITOR
@@ -1445,7 +1452,10 @@ struct TageAhead : predictor {
           static_loop<N>([&]<u64 I>() {
             if constexpr (BRANCH_TO_GROUP[I] == G) {
               static constexpr u64 POS = BRANCH_IN_GROUP[I];
-              bool pred_taken = static_cast<u64>(pred[I]);
+              // Use pre-scatter capture: pred[I] above has been overwritten
+              // at line 1398 with block B+1's prediction; old_pred_b[I] is
+              // the block-B value we actually want to record.
+              bool pred_taken = old_pred_b[I];
               bool tag_only_taken = (tag_only_pred_val >> POS) & 1;
               mon.record_prediction(I, m1v, m2v, meta_overrode, meta_chose,
                                     pred_taken, any_tag_hit_g, has_tage,
@@ -1461,7 +1471,9 @@ struct TageAhead : predictor {
             static_loop<N>([&]<u64 I>() {
               if constexpr (BRANCH_TO_GROUP[I] == G) {
                 nb++;
-                if (static_cast<u64>(pred[I]) == static_cast<u64>(branch_dir[I]))
+                // pred[I] is post-scatter (block B+1); use old_pred_b[I] to
+                // count correctly against block B's actual directions.
+                if (old_pred_b[I] == static_cast<u64>(branch_dir[I]))
                   nc++;
               }
             });
@@ -1530,7 +1542,9 @@ struct TageAhead : predictor {
           static_cast<u64>(provider_weak) &&
           ((static_cast<u64>(match2) & ((1ULL << NT) - 1)) != 0);
       bool meta_chose = static_cast<u64>(use_alt);
-      bool pred_taken = static_cast<u64>(pred[r]);
+      // pred[r] was overwritten by the scatter at line 1489 with block B+1's
+      // prediction. Use the pre-scatter capture old_pred_b[r] for block B.
+      bool pred_taken = old_pred_b[r];
       bool tag_only_taken = (mon_tag_only_pred >> r) & 1;
       mon.record_prediction(r, static_cast<u64>(match1),
                             static_cast<u64>(match2), meta_overrode, meta_chose,
@@ -1544,7 +1558,9 @@ struct TageAhead : predictor {
         u64 prov_index = static_cast<u64>(val<MAX_IDX_BITS>{current_idx[prov]});
         u64 nc = 0;
         for (u64 r = 0; r < num_branch; r++)
-          if (static_cast<u64>(pred[r]) == static_cast<u64>(branch_dir[r]))
+          // pred[r] is post-scatter (block B+1); compare block-B's
+          // prediction (old_pred_b[r]) against block-B's actual direction.
+          if (old_pred_b[r] == static_cast<u64>(branch_dir[r]))
             nc++;
         mon.record_provider_entry(prov, prov_index, num_branch, nc);
         // Per-bank: which bank provided?
@@ -1743,6 +1759,21 @@ struct TageAhead : predictor {
     }
     if (!static_cast<u64>(do_train))
       mon.record_train_skip();
+    // Capture the phantom-slot prediction BEFORE record_block_misp_cause:
+    // the first slot beyond num_branch that the predictor committed to.
+    // If num_branch == N (block consumed all slots), no phantom slot exists.
+    bool phantom_taken = false;
+    if (num_branch < N) {
+      // pred[num_branch] is post-scatter (block B+1's prediction at this
+      // slot). For "did block B predict TAKEN at the phantom slot beyond
+      // its committed branches?" we want the pre-scatter capture.
+      phantom_taken = old_pred_b[num_branch];
+    }
+    mon.record_phantom_slot(phantom_taken);
+    // Feature 27: slot-PC diversity per block-start key. Uses train_block_pc
+    // (the block-start PC of the block currently being resolved).
+    mon.record_slot_pc_diversity(mon.train_block_pc, num_branch,
+                                  static_cast<u64>(mispredict));
     // Attribute block mispredict to the first wrong branch's provider.
     if (static_cast<u64>(mispredict)) {
       std::array<bool, N> actual_dir_arr{};

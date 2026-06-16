@@ -153,6 +153,15 @@ struct TAMonitor {
     // Feature 12: per block-position breakdown
     std::array<u64, MAX_RANK> pos_total{};
     std::array<u64, MAX_RANK> pos_misp{};
+    // Per-PC culpability split: when a block-level mispredict event includes
+    // this PC at some rank, was THIS PC's direction wrong (causal) or right
+    // (bystander)? pos_in_misp_blk[r] = times this PC appeared at rank r in
+    // a mispredicted block. pos_wrong_in_misp_blk[r] = times this PC's
+    // direction was wrong in such a block. Bystander rate per rank is
+    // 1 - pos_wrong/pos_in_misp. Distinguishes PCs that cause mispredicts
+    // from PCs that merely catch attribution credit at the trigger slot.
+    std::array<u64, MAX_RANK> pos_in_misp_blk{};
+    std::array<u64, MAX_RANK> pos_wrong_in_misp_blk{};
     // Feature 14: TAGE accuracy trajectory by alloc count
     std::array<u64, TRAJ_BINS> traj_tage_prov{};
     std::array<u64, TRAJ_BINS> traj_tage_correct{};
@@ -189,6 +198,12 @@ struct TAMonitor {
     u64 total_block_branches = 0;
     std::array<u64, MAX_BLOCK_INSTR> block_instr_hist{};
     std::array<u64, MAX_BLOCK_BR> block_br_hist{};
+    // Same as block_br_hist but split by block-level outcome. Reveals
+    // whether mispredicted blocks have a different num_branch distribution
+    // than correctly-predicted blocks — direct signal for block-size
+    // variability / phantom-slot vulnerability per Feature 12b.
+    std::array<u64, MAX_BLOCK_BR> block_br_hist_misp{};
+    std::array<u64, MAX_BLOCK_BR> block_br_hist_ok{};
     std::array<u64, 1024> entry_point_hist{};
     std::array<u64, 1024> exit_point_hist{};
 
@@ -247,7 +262,8 @@ struct TAMonitor {
     u64 cause_tage_meta_pri = 0;
     u64 cause_tage_no_meta = 0;
     u64 cause_phantom_slot = 0;  // all committed slots correct; phantom slot k>=num_branch predicted TAKEN
-    u64 cause_unattributed = 0;  // mispredict signaled but no wrong branch found and no phantom
+    u64 cause_target_miss = 0;   // real branches existed and matched, no phantom — implies target/BTB miss
+    u64 cause_unattributed = 0;  // edge case: num_branch_committed==0, no slots to inspect
 
     // Counterfactual: for sec-tag-rejected branches, would the tag-only
     // provider have been correct? (i.e. what we lose by sec-tag filtering)
@@ -437,6 +453,12 @@ struct TAMonitor {
   // Recorded once per block from update_cycle. true = phantom slot taken.
   bool shadow_pred_phantom_taken = false;
 
+  // Block-level mispredict flag for the CURRENT block, set in record_block
+  // and read by record_outcome's per-PC update so that bystander/causal
+  // attribution per PC×rank can distinguish "this PC was wrong in a
+  // mispredicted block" from "this PC happened to be in a mispredicted block".
+  bool cur_block_mispredict = false;
+
   // Per-PC diagnostics
   std::unordered_map<u64, PCDiag> pc_diag;
   std::unordered_map<u64, PCDiag> win_pc_diag;
@@ -467,6 +489,21 @@ struct TAMonitor {
   u64 shadow_block_pc = 0;
   u64 current_block_pc = 0;
   u64 train_block_pc = 0;
+
+  // Feature 27: Per-(block_start_PC) slot-PC diversity tracker.
+  // For each distinct block-start PC, record (a) the set of physical branch
+  // PCs that have appeared at each slot index, (b) the number of times this
+  // block-start has been observed, (c) the number of mispredicted blocks.
+  // The key question: do mispredicted blocks come from start-PCs where the
+  // slot-PC mapping is unstable (high diversity at some slot), or stable
+  // (one PC per slot)?
+  static constexpr u64 BSD_MAX_KEYS = 200000;  // memory cap
+  struct BlockSlotDiv {
+    std::array<std::unordered_set<u64>, N> slot_pcs;
+    u64 total_blocks = 0;
+    u64 misp_blocks = 0;
+  };
+  std::unordered_map<u64, BlockSlotDiv> block_slot_div;
 
   std::array<u64, N> current_pcs{};
   u64 current_num_branch = 0;
@@ -509,6 +546,7 @@ struct TAMonitor {
 
   void record_block(u64 block_entry, u64 block_size, u64 num_branch,
                      bool extra_cycle_fired) {
+    cur_block_mispredict = extra_cycle_fired;
     auto record = [&](Counters &c) {
       c.blocks++;
       c.total_block_instr += block_size;
@@ -518,8 +556,11 @@ struct TAMonitor {
         c.block_instr_hist[block_size]++;
       else
         c.block_instr_hist[MAX_BLOCK_INSTR - 1]++;
-      if (num_branch < MAX_BLOCK_BR)
+      if (num_branch < MAX_BLOCK_BR) {
         c.block_br_hist[num_branch]++;
+        if (extra_cycle_fired) c.block_br_hist_misp[num_branch]++;
+        else                    c.block_br_hist_ok[num_branch]++;
+      }
       if (block_entry < 1024)
         c.entry_point_hist[block_entry]++;
       u64 exit_pt = block_entry + block_size;
@@ -666,6 +707,29 @@ struct TAMonitor {
     if (rank < N) shadow_fb_pred[rank] = fb_taken;
   }
 
+  // Record the per-slot prediction at the first slot BEYOND num_branch — the
+  // first "phantom" slot the predictor committed to but the dynamic block
+  // didn't realize. Called from update_cycle. If num_branch == N (the block
+  // fully consumed all predicted slots), pass false (no phantom slot).
+  void record_phantom_slot(bool taken) {
+    shadow_pred_phantom_taken = taken;
+  }
+
+  // Feature 27: record one block's slot-PC instance under its block-start PC.
+  // Called from update_cycle once per block. Tracks distinct branch PCs at
+  // each slot for the same block-start key, plus block-mispredict counts.
+  void record_slot_pc_diversity(u64 block_pc, u64 num_branch,
+                                 bool block_mispred) {
+    if (block_slot_div.size() >= BSD_MAX_KEYS &&
+        block_slot_div.find(block_pc) == block_slot_div.end())
+      return;  // memory cap reached
+    auto &b = block_slot_div[block_pc];
+    b.total_blocks++;
+    if (block_mispred) b.misp_blocks++;
+    for (u64 r = 0; r < num_branch && r < N; r++)
+      b.slot_pcs[r].insert(shadow_pc[r]);
+  }
+
   // Attribute a block mispredict to its trigger (first wrong) branch's
   // provider category. Call exactly once per mispredicted block, AFTER
   // record_outcome has been called for all branches in the block (so the
@@ -683,7 +747,15 @@ struct TAMonitor {
     }
     auto bump = [&](Counters &c) {
       if (trigger >= num_branch_committed) {
-        c.cause_unattributed++;
+        // No wrong direction in committed range. Three sub-cases:
+        //   (1) phantom slot TAKEN beyond num_branch — structural cause
+        //   (2) num_branch_committed == 0 — edge case, no slots inspected
+        //   (3) otherwise: all committed directions matched, no phantom →
+        //       the divergence must be in the predicted next-PC target
+        //       itself (BTB / target prediction miss).
+        if (shadow_pred_phantom_taken)       c.cause_phantom_slot++;
+        else if (num_branch_committed == 0)  c.cause_unattributed++;
+        else                                  c.cause_target_miss++;
         return;
       }
       if (!shadow_any_tag_hit[trigger]) {
@@ -829,6 +901,14 @@ struct TAMonitor {
       if (rank < MAX_RANK) {
         d.pos_total[rank]++;
         if (mispredict) d.pos_misp[rank]++;
+        // Per-PC culpability split: works for ALL ranks in a mispredicted
+        // block (not just the trigger slot). Causal: this PC's direction
+        // was wrong AND the block mispredicted. Bystander: this PC was
+        // right AND the block mispredicted.
+        if (cur_block_mispredict) {
+          d.pos_in_misp_blk[rank]++;
+          if (!correct) d.pos_wrong_in_misp_blk[rank]++;
+        }
       }
       // Feature 15: oscillation — consecutive correct streaks
       if (correct) {
@@ -1222,7 +1302,7 @@ struct TAMonitor {
       os << "pingpong,";
       os << "cf_fb_only%,cf_tage_only%,";
       os << "prov_no_tag%,prov_sec_rej%,prov_meta_alt%,prov_meta_pri%,prov_no_meta%,";
-      os << "cause_no_tag%,cause_sec_rej%,cause_meta_alt%,cause_meta_pri%,cause_no_meta%,cause_unattrib%,cause_fb_total%,";
+      os << "cause_no_tag%,cause_sec_rej%,cause_meta_alt%,cause_meta_pri%,cause_no_meta%,cause_phantom%,cause_tgt_miss%,cause_unattrib%,cause_fb_total%,";
       os << "cf_sec_fb_acc%,cf_sec_tage_acc%,";
       os << "ben_rej%,ben_incr%,ben_decr%,ben_ctr_avg";
       if constexpr (NUM_META_BANKS > 1) {
@@ -1324,13 +1404,16 @@ struct TAMonitor {
     // Block-mispredict cause attribution (denominator = mispredict count)
     u64 w_cause_total = w.cause_no_tag_match + w.cause_sec_tag_reject +
                         w.cause_tage_meta_alt + w.cause_tage_meta_pri +
-                        w.cause_tage_no_meta + w.cause_unattributed;
+                        w.cause_tage_no_meta + w.cause_phantom_slot +
+                        w.cause_target_miss + w.cause_unattributed;
     u64 w_cause_fb = w.cause_no_tag_match + w.cause_sec_tag_reject;
     os << "," << pct(w.cause_no_tag_match, w_cause_total)
        << "," << pct(w.cause_sec_tag_reject, w_cause_total)
        << "," << pct(w.cause_tage_meta_alt, w_cause_total)
        << "," << pct(w.cause_tage_meta_pri, w_cause_total)
        << "," << pct(w.cause_tage_no_meta, w_cause_total)
+       << "," << pct(w.cause_phantom_slot, w_cause_total)
+       << "," << pct(w.cause_target_miss, w_cause_total)
        << "," << pct(w.cause_unattributed, w_cause_total)
        << "," << pct(w_cause_fb, w_cause_total);
     // Sec-tag counterfactual accuracy
@@ -1403,6 +1486,25 @@ struct TAMonitor {
     for (u64 i = 0; i < MAX_BLOCK_BR; i++)
       if (c.block_br_hist[i] > 0)
         os << i << ":" << c.block_br_hist[i] << " ";
+    os << "\n  Branches/block (mispredicted blocks): ";
+    for (u64 i = 0; i < MAX_BLOCK_BR; i++)
+      if (c.block_br_hist_misp[i] > 0)
+        os << i << ":" << c.block_br_hist_misp[i] << " ";
+    os << "\n  Branches/block (correctly predicted): ";
+    for (u64 i = 0; i < MAX_BLOCK_BR; i++)
+      if (c.block_br_hist_ok[i] > 0)
+        os << i << ":" << c.block_br_hist_ok[i] << " ";
+    {
+      double sum_misp = 0, n_misp = 0, sum_ok = 0, n_ok = 0;
+      for (u64 i = 0; i < MAX_BLOCK_BR; i++) {
+        sum_misp += i * c.block_br_hist_misp[i]; n_misp += c.block_br_hist_misp[i];
+        sum_ok   += i * c.block_br_hist_ok[i];   n_ok   += c.block_br_hist_ok[i];
+      }
+      os << "\n  Avg num_branch in misp blocks: "
+         << (n_misp > 0 ? sum_misp / n_misp : 0.0)
+         << "  (vs " << (n_ok > 0 ? sum_ok / n_ok : 0.0)
+         << " in correct blocks)";
+    }
     os << "\n  Entry point top-5: ";
     print_top_n(os, c.entry_point_hist, 5);
     os << "\n  Exit point top-5: ";
@@ -1506,7 +1608,8 @@ struct TAMonitor {
     // Sums to the total block-mispredict count (plus any unattributed).
     u64 cause_total = c.cause_no_tag_match + c.cause_sec_tag_reject +
                       c.cause_tage_meta_alt + c.cause_tage_meta_pri +
-                      c.cause_tage_no_meta + c.cause_unattributed;
+                      c.cause_tage_no_meta + c.cause_phantom_slot +
+                      c.cause_target_miss + c.cause_unattributed;
     os << "\nBlock-mispredict Cause Attribution:\n";
     os << "  No tag match (FB only):    " << c.cause_no_tag_match << " ("
        << pct(c.cause_no_tag_match, cause_total) << "%)\n";
@@ -1518,8 +1621,12 @@ struct TAMonitor {
        << pct(c.cause_tage_meta_pri, cause_total) << "%)\n";
     os << "  TAGE provider, no meta:    " << c.cause_tage_no_meta << " ("
        << pct(c.cause_tage_no_meta, cause_total) << "%)\n";
+    os << "  Phantom slot (>=num_br):   " << c.cause_phantom_slot << " ("
+       << pct(c.cause_phantom_slot, cause_total) << "%)\n";
+    os << "  Target miss (BTB/next-PC): " << c.cause_target_miss << " ("
+       << pct(c.cause_target_miss, cause_total) << "%)\n";
     if (c.cause_unattributed > 0) {
-      os << "  Unattributed:              " << c.cause_unattributed << " ("
+      os << "  Unattributed (edge case):  " << c.cause_unattributed << " ("
          << pct(c.cause_unattributed, cause_total) << "%)\n";
     }
     u64 fb_caused = c.cause_no_tag_match + c.cause_sec_tag_reject;
@@ -1958,6 +2065,51 @@ struct TAMonitor {
       }
     }
 
+    // Feature 12b: Per-PC bystander vs causal attribution
+    {
+      os << "\n--- Feature 12b: Per-PC Mispredict Culpability (top by appearances in misp blocks) ---\n";
+      os << "  Identifies PCs that catch credit at the trigger slot without\n"
+            "  being the actual cause. 'in_misp' = appearances at any rank in a\n"
+            "  mispredicted block; 'wrong' = of those, count where THIS PC's\n"
+            "  direction was wrong; 'bystander%' = 1 - wrong/in_misp.\n"
+            "  High bystander% means the PC catches attribution credit while a\n"
+            "  different slot (or a phantom slot) actually caused the divergence.\n\n";
+      std::vector<std::pair<u64, const PCDiag *>> pcs;
+      pcs.reserve(pc_diag.size());
+      for (auto &[pc, d] : pc_diag) {
+        u64 sum = 0;
+        for (u64 r = 0; r < MAX_RANK; r++) sum += d.pos_in_misp_blk[r];
+        if (sum > 0) pcs.emplace_back(sum, &d);
+      }
+      std::sort(pcs.begin(), pcs.end(),
+                [](auto &a, auto &b) { return a.first > b.first; });
+      os << "  PC                | in_misp   | wrong    | bystander% | top_rank\n";
+      os << "  ------------------+-----------+----------+------------+---------\n";
+      u64 shown = 0;
+      for (auto &[sum, dp] : pcs) {
+        if (shown >= 20) break;
+        u64 wrong_sum = 0, top_rank = 0, top_in = 0;
+        for (u64 r = 0; r < MAX_RANK; r++) {
+          wrong_sum += dp->pos_wrong_in_misp_blk[r];
+          if (dp->pos_in_misp_blk[r] > top_in) {
+            top_in = dp->pos_in_misp_blk[r];
+            top_rank = r;
+          }
+        }
+        u64 pc = 0;
+        for (auto &[k, d] : pc_diag) if (&d == dp) { pc = k; break; }
+        double bystander = sum > 0 ? 100.0 * (sum - wrong_sum) / sum : 0.0;
+        os << "  0x" << std::hex << std::setw(14) << std::left << pc
+           << std::dec << std::right
+           << " |" << std::setw(10) << sum
+           << " |" << std::setw(9) << wrong_sum
+           << " |" << std::setw(10) << std::fixed << std::setprecision(1) << bystander << "%"
+           << " | R" << top_rank
+           << "\n";
+        shown++;
+      }
+    }
+
     // Feature 13: Per-PC allocation outcome histogram
     {
       os << "\n--- Feature 13: Per-PC Allocation Outcome Histogram ---\n";
@@ -2355,6 +2507,91 @@ struct TAMonitor {
              << std::setw(5) << pct(stale, occupied) << "%\n";
           }
       }
+    }
+
+    // Feature 27: Slot-PC diversity vs mispredict correlation
+    if (!block_slot_div.empty()) {
+      os << "\n--- Feature 27: Slot-PC Diversity per Block-Start ---\n";
+      os << "  Per (block_start_PC) key, counts of distinct branch PCs at\n"
+            "  each slot index across all dynamic instances of that block.\n"
+            "  Diversity=1 means slot-i is the same physical PC every time;\n"
+            "  diversity>1 means RABT's per-slot prediction is averaging over\n"
+            "  multiple physical branches at that slot — the structural cost\n"
+            "  the ahead-pipeline pays for not knowing per-branch PCs at predict1.\n\n";
+
+      // Bucket keys by max-slot-diversity and tabulate misp rate per bucket.
+      std::array<u64, 8> div_keys{}, div_blocks{}, div_misp{};
+      for (auto &[bpc, bs] : block_slot_div) {
+        u64 max_d = 0;
+        for (u64 r = 0; r < N; r++)
+          max_d = std::max(max_d, (u64)bs.slot_pcs[r].size());
+        u64 bin = std::min<u64>(7, max_d == 0 ? 0 : max_d - 1);
+        div_keys[bin]++;
+        div_blocks[bin] += bs.total_blocks;
+        div_misp[bin] += bs.misp_blocks;
+      }
+      os << "  MaxSlotDiv | #Keys  | #Blocks  | #Mispred | MispRate\n";
+      os << "  -----------+--------+----------+----------+---------\n";
+      for (u64 b = 0; b < 8; b++) {
+        if (div_keys[b] == 0) continue;
+        os << "  " << std::setw(10) << std::left
+           << (b == 7 ? "8+" : std::to_string(b + 1))
+           << std::right
+           << " |" << std::setw(7) << div_keys[b]
+           << " |" << std::setw(9) << div_blocks[b]
+           << " |" << std::setw(9) << div_misp[b]
+           << " |" << std::setw(8) << pct(div_misp[b], div_blocks[b]) << "%\n";
+      }
+
+      // Per-slot total diversity contribution: how often does slot r show
+      // multi-PC diversity across keys?
+      os << "\n  Per-slot diversity distribution (across block-start keys):\n";
+      os << "  Slot | mean_div | max_div | keys_div>1 | keys_div=1\n";
+      os << "  -----+----------+---------+------------+-----------\n";
+      for (u64 r = 0; r < N; r++) {
+        u64 total_keys = 0, sum_d = 0, max_d = 0, keys_multi = 0, keys_single = 0;
+        for (auto &[bpc, bs] : block_slot_div) {
+          u64 d = bs.slot_pcs[r].size();
+          if (d == 0) continue;
+          total_keys++;
+          sum_d += d;
+          max_d = std::max(max_d, d);
+          if (d > 1) keys_multi++; else keys_single++;
+        }
+        if (total_keys == 0) continue;
+        os << "  R" << r << "   |"
+           << std::setw(10) << std::fixed << std::setprecision(2)
+           << (double)sum_d / total_keys
+           << " |" << std::setw(8) << max_d
+           << " |" << std::setw(11) << keys_multi
+           << " |" << std::setw(10) << keys_single << "\n";
+      }
+
+      // Top 20 keys by misp count, with their per-slot diversities.
+      std::vector<std::pair<u64, const BlockSlotDiv *>> by_misp;
+      for (auto &[bpc, bs] : block_slot_div)
+        if (bs.misp_blocks > 0) by_misp.emplace_back(bpc, &bs);
+      std::sort(by_misp.begin(), by_misp.end(),
+                [](auto &a, auto &b) { return a.second->misp_blocks > b.second->misp_blocks; });
+
+      os << "\n  Top 20 mispredicting block-starts (slot-PC diversity per slot):\n";
+      os << "  block_start_PC    | blocks  | misp    | misp%  | div@R0..R6\n";
+      os << "  ------------------+---------+---------+--------+----------\n";
+      u64 shown = 0;
+      for (auto &[bpc, bsp] : by_misp) {
+        if (shown++ >= 20) break;
+        os << "  0x" << std::hex << std::setw(14) << std::left << bpc
+           << std::dec << std::right
+           << " |" << std::setw(8) << bsp->total_blocks
+           << " |" << std::setw(8) << bsp->misp_blocks
+           << " |" << std::setw(6) << pct(bsp->misp_blocks, bsp->total_blocks) << "%"
+           << " | ";
+        for (u64 r = 0; r < N; r++)
+          os << std::setw(3) << bsp->slot_pcs[r].size();
+        os << "\n";
+      }
+      os << "  (tracker capped at " << BSD_MAX_KEYS << " keys; "
+         << block_slot_div.size() << " distinct block-starts recorded)\n";
     }
 
     os << "\n=== End TageAhead Monitor ===\n\n";
